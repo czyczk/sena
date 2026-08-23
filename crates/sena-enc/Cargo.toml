@@ -1,0 +1,9 @@
+[package]
+name = "sena-enc"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+sena-core.workspace = true
+sena-dsp.workspace = true
+sena-mux.workspace = true

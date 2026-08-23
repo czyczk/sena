@@ -1,0 +1,4 @@
+[package]
+name = "sena-core"
+version.workspace = true
+edition.workspace = true

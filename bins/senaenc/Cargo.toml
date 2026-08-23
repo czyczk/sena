@@ -1,0 +1,10 @@
+[package]
+name = "senaenc"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+sena-core.workspace = true
+sena-dsp.workspace = true
+sena-mux.workspace = true
+sena-enc.workspace = true

@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sena-core",
+    "crates/sena-dsp",
+    "crates/sena-mux",
+    "crates/sena-enc",
+    "bins/senaenc",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+sena-core = { path = "crates/sena-core" }
+sena-dsp = { path = "crates/sena-dsp" }
+sena-mux = { path = "crates/sena-mux" }
+sena-enc = { path = "crates/sena-enc" }
+rustfft = "6"
+rubato = "0.16"

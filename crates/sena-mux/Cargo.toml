@@ -1,0 +1,4 @@
+[package]
+name = "sena-mux"
+version.workspace = true
+edition.workspace = true
