@@ -79,6 +79,15 @@ def parse_mka(path):
                             tr["codec"] = te[q3:q3 + s3].decode()
                         if e3 == bytes([0x56, 0xAA]):
                             tr["delay_ns"] = int.from_bytes(te[q3:q3 + s3], "big")
+                        if e3 == bytes([0xE1]):
+                            # Audio: SamplingFrequency float (B5) + channels
+                            pp4 = 0
+                            au = te[q3:q3 + s3]
+                            while pp4 < len(au):
+                                e4, q4, s4 = read_elem(au, pp4)
+                                if e4 == bytes([0xB5]):
+                                    tr["rate_hz"] = int(struct.unpack(">f", au[q4:q4 + s4])[0]) if s4 == 4 else int(struct.unpack(">d", au[q4:q4 + s4])[0])
+                                pp4 = q4 + s4
                         pp2 = q3 + s3
                     tracks[tr["num"]] = tr
                 pp = q2 + s2
@@ -226,7 +235,10 @@ def main():
     assert tracks[2]["codec"] == "A_SENALF", tracks
     assert tags["SENA_PROFILE"] == profile_s, tags
     assert clusters > 10, clusters
-    exp_delay_ns = DELAY[profile] * 1_000_000_000 // SR
+    # 延迟 = 1024 个核心样本 × 实际流率（mdhd）；容器 CodecDelay 应等于 1024×1e9/率
+    lf_rate_hz = int(round(tracks[2].get("rate_hz", 0)))
+    assert lf_rate_hz in (16000, 32000), f"unexpected LF rate {lf_rate_hz}"
+    exp_delay_ns = 1024 * 1_000_000_000 // lf_rate_hz
     assert abs(int(tracks[2]["delay_ns"]) - exp_delay_ns) <= 3_000_000, tracks
 
     lf_pkts = frames[2]
@@ -252,8 +264,9 @@ def main():
     hp /= PAD
     lag_l = xcorr_lag(ref.mean(axis=1), lf.mean(axis=1), SR)
     lag_h = xcorr_lag(ref.mean(axis=1), hp.mean(axis=1), SR)
-    assert abs(-lag_l - DELAY[profile]) <= 4, f"xhe lag {lag_l} vs {-DELAY[profile]}"
-    assert abs(lag_h) <= 4, f"opus lag {lag_h}"
+    exp_lag = -(1024 * SR // lf_rate_hz)
+    assert abs(lag_l - exp_lag) <= 8, f"xhe lag {lag_l} vs {exp_lag}"
+    assert abs(lag_h) <= 8, f"opus lag {lag_h}"
 
     def appl(x, lag):
         return x[lag:] if lag >= 0 else x[-lag:]

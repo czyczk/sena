@@ -59,16 +59,8 @@ pub fn uint(out: &mut Vec<u8>, id: &[u8], v: u64) {
 }
 
 pub fn float(out: &mut Vec<u8>, id: &[u8], v: f64) {
-    let mut p = vec![];
-    let bits = v.to_bits();
-    let mut len = 4;
-    if bits & 0x0000_0000_FFFF_FFFF == 0 {
-        len = 4;
-    }
-    for i in (0..len).rev() {
-        p.push(((bits >> (8 * i)) & 0xFF) as u8);
-    }
-    write_element(out, id, &p);
+    let bits = (v as f32).to_bits();
+    write_element(out, id, &bits.to_be_bytes());
 }
 
 pub fn str(out: &mut Vec<u8>, id: &[u8], s: &str) {

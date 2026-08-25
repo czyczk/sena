@@ -77,7 +77,7 @@ pub struct Downsampler {
 }
 
 impl Downsampler {
-    pub fn new(input_len: usize) -> Self {
+    pub fn new(input_len: usize, out_rate: u32) -> Self {
         let params = SincInterpolationParameters {
             sinc_len: 256,
             f_cutoff: 0.95,
@@ -86,7 +86,7 @@ impl Downsampler {
             window: WindowFunction::BlackmanHarris2,
         };
         let rs = SincFixedIn::<f64>::new(
-            16000.0 / 48000.0,
+            out_rate as f64 / 48000.0,
             2.0,
             params,
             input_len,

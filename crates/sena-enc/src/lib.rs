@@ -1,6 +1,6 @@
 //! sena-enc: pipeline orchestration (WAV IO, subprocess drivers, packet extraction).
 
-use sena_core::{Profile, LF_RATE, PRE_GAIN, SAMPLE_RATE};
+use sena_core::{Profile, PRE_GAIN, SAMPLE_RATE};
 use sena_dsp::{split, Downsampler};
 use sena_mux::mka::{self, Frame, Track};
 use std::io::Write;
@@ -111,14 +111,14 @@ pub fn encode(cfg: &EncoderConfig, input: &Path, output: &Path) -> Result<(), Er
     let high_p = pad(&high);
 
     // --- downsample low band 48k -> 16k ---
-    let mut ds = Downsampler::new(n);
+    let mut ds = Downsampler::new(n, cfg.profile.lf_rate());
     let low16 = ds.process(&low_p);
 
     // --- write temp WAVs ---
     let wd = cfg.workdir;
     std::fs::create_dir_all(wd)?;
     let lf_wav = wd.join("lf.wav");
-    wav::write_s16(&lf_wav, &low16, LF_RATE)?;
+    wav::write_s16(&lf_wav, &low16, cfg.profile.lf_rate())?;
     let hf_wav = wd.join("hf.wav");
     wav::write_f32(&hf_wav, &high_p, SAMPLE_RATE)?;
 
@@ -163,6 +163,7 @@ pub fn encode(cfg: &EncoderConfig, input: &Path, output: &Path) -> Result<(), Er
     let ogg_bytes = std::fs::read(&hf_ogg)?;
     let (hf_head, preskip, hf_packets) = ogg::extract_opus(&ogg_bytes)?;
     let (lf_asc, lf_aus) = extract_m4a(&lf_m4a)?;
+    let lf_stream_rate = m4a_stream_rate(&lf_m4a)?;
 
     // --- frame timings ---
     let hf_frame_ns = 20_000_000u64; // 20 ms Opus frames
@@ -184,9 +185,9 @@ pub fn encode(cfg: &EncoderConfig, input: &Path, output: &Path) -> Result<(), Er
         Track {
             codec_id: "A_SENALF".into(),
             codec_private: lf_asc.clone(),
-            sample_rate: LF_RATE as f64,
+            sample_rate: lf_stream_rate as f64,
             channels: 2,
-            codec_delay_ns: (cfg.profile.xhe_delay_48k() as u64) * 1_000_000_000 / SAMPLE_RATE as u64,
+            codec_delay_ns: (sena_core::XHE_WARMUP_CORE as u64) * 1_000_000_000 / lf_stream_rate as u64,
             bit_depth: None,
         },
     ];
@@ -216,6 +217,38 @@ pub fn encode(cfg: &EncoderConfig, input: &Path, output: &Path) -> Result<(), Er
     let mka_bytes = mka::write_mka(&tracks, frames, &tags, 1000);
     std::fs::write(output, mka_bytes)?;
     Ok(())
+}
+
+/// Read the stream's actual sample rate from mdhd timescale.
+pub fn m4a_stream_rate(path: &Path) -> Result<u32, Error> {
+    let f = std::fs::read(path)?;
+    for (tag, s, e) in boxes(&f, 0, f.len()) {
+        if tag != b"moov" {
+            continue;
+        }
+        for (tag2, s2, e2) in boxes(&f, s, e) {
+            if tag2 != b"trak" {
+                continue;
+            }
+            for (tag3, s3, e3) in boxes(&f, s2, e2) {
+                if tag3 == b"mdia" {
+                    for (tag4, s4, e4) in boxes(&f, s3, e3) {
+                        if tag4 == b"mdhd" {
+                            let ver = f[s4];
+                            let off = if ver == 1 { 16 } else { 12 };
+                            return Ok(u32::from_be_bytes([
+                                f[s4 + off],
+                                f[s4 + off + 1],
+                                f[s4 + off + 2],
+                                f[s4 + off + 3],
+                            ]));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Err(Error::Format("mdhd not found".into()))
 }
 
 /// Extract ASC (esds desc 0x05) and raw AUs (mdat, stsz order) from an exhale m4a.

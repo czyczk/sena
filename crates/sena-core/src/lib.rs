@@ -25,18 +25,13 @@ impl Profile {
             Profile::At600 => 5,
         }
     }
-    /// warmup trim in samples at the 48 kHz output rate
-    pub fn xhe_delay_48k(self) -> usize {
+
+    /// LF encoder input rate: exhale upsamples to 32 kHz internally for
+    /// presets >= 5, so feed the profile's native rate directly.
+    pub fn lf_rate(self) -> u32 {
         match self {
-            Profile::At300 => 3072,
-            Profile::At600 => 1536,
-        }
-    }
-    /// warmup trim in samples at the 16 kHz low-frequency rate
-    pub fn xhe_warmup_16k(self) -> usize {
-        match self {
-            Profile::At300 => 1024,
-            Profile::At600 => 512,
+            Profile::At300 => 16000,
+            Profile::At600 => 32000,
         }
     }
     pub fn deduct_kbps(self) -> u32 {
@@ -56,6 +51,14 @@ impl Profile {
 
 pub const MIN_TOTAL_KBPS: u32 = 160;
 pub const SENAV_THRESHOLD_KBPS: u32 = 192;
+
+/// warmup trim in core-rate samples (one 1024-sample core frame)
+pub const XHE_WARMUP_CORE: usize = 1024;
+
+/// warmup trim in samples at the 48 kHz output rate, for a stream at lf_rate
+pub fn xhe_delay_48k_at(lf_rate: u32) -> usize {
+    XHE_WARMUP_CORE * 48000 / lf_rate as usize
+}
 
 /// Bitrate accounting (rule B). Returns (xhe_kbps, opus_kbps).
 pub fn account(total_kbps: u32, profile: Profile) -> Option<(u32, u32)> {
@@ -80,7 +83,7 @@ mod tests {
     }
     #[test]
     fn delays() {
-        assert_eq!(Profile::At300.xhe_warmup_16k() * 3, Profile::At300.xhe_delay_48k());
-        assert_eq!(Profile::At600.xhe_warmup_16k() * 3, Profile::At600.xhe_delay_48k());
+        assert_eq!(xhe_delay_48k_at(16000), 3072);
+        assert_eq!(xhe_delay_48k_at(32000), 1536);
     }
 }
