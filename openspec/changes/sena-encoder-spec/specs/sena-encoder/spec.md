@@ -45,9 +45,17 @@ protecting codec inputs from FIR overshoot.
 - THEN decoder restores 1/p exactly.
 
 ### Requirement: Low-frequency input resampling
-The low-frequency band SHALL be resampled from 48 kHz to 16 kHz with
-high-quality resampling (rubato, windowed-sinc, sinc length >= 256) before
-the xHE-AAC encoder; the stored track remains at 16 kHz.
+The low-frequency band SHALL be resampled from 48 kHz to the profile's
+input rate with high-quality resampling (rubato, windowed-sinc, sinc length
+>= 256): 16 kHz for @300, 32 kHz for @600. The encoder's core rate follows
+the input rate deterministically (16 kHz in -> 16 kHz out; preset >= 5
+floors the core at 32 kHz); the stored track rate is whatever the encoder
+emits (16 kHz or 32 kHz).
+
+#### Scenario: Stored rate
+- GIVEN a Sena encode at any profile
+- THEN the low-frequency track in the container is sampled at the rate the
+  encoder actually emitted.
 
 #### Scenario: Stored rate
 - GIVEN a Sena encode at any profile
