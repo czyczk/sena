@@ -62,7 +62,7 @@ fn run(cmd: &mut Command, what: &str) -> Result<(), Error> {
     Ok(())
 }
 
-fn check_version(path: &str, marker: Option<&str>, what: &str) -> Result<(), Error> {
+pub fn check_version(path: &str, marker: Option<&str>, what: &str) -> Result<(), Error> {
     let out = Command::new(path).arg("--version").output().map_err(Error::Io)?;
     let text = String::from_utf8_lossy(&out.stdout);
     if !out.status.success() && text.is_empty() {
@@ -78,22 +78,103 @@ fn check_version(path: &str, marker: Option<&str>, what: &str) -> Result<(), Err
     Ok(())
 }
 
-fn check_exhale(path: &str) -> Result<(), Error> {
+/// First non-empty line of `tool --version` (for display in `senaenc doctor`).
+pub fn opusenc_version(path: &str) -> Result<String, Error> {
+    let out = Command::new(path).arg("--version").output().map_err(Error::Io)?;
+    for text in [String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)] {
+        for line in text.lines() {
+            let l = line.trim();
+            if !l.is_empty() {
+                return Ok(l.to_string());
+            }
+        }
+    }
+    Err(Error::Subprocess(format!("opusenc --version produced no output")))
+}
+
+/// Leading dotted-numeric prefix of a version token, e.g. `1.2.2RC` -> `1.2.2`.
+fn version_token(tok: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut dots = 0u32;
+    for c in tok.chars() {
+        if c.is_ascii_digit() {
+            out.push(c);
+        } else if c == '.' && !out.is_empty() && dots < 3 {
+            out.push('.');
+            dots += 1;
+        } else {
+            break;
+        }
+    }
+    while out.ends_with('.') {
+        out.pop();
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+/// Parse an exhale version out of its output. Handles both forms:
+/// `-V`:  "exhale 1.2.2 (x64, ...)"
+/// banner (argument-less run): "| version 1.2.2 (x64, built on ...) |"
+pub fn parse_exhale_version(text: &str) -> Option<String> {
+    let mut it = text.split_whitespace();
+    while let Some(tok) = it.next() {
+        let intro = tok.eq_ignore_ascii_case("exhale")
+            || tok.eq_ignore_ascii_case("version")
+            || tok.starts_with("version");
+        if !intro {
+            continue;
+        }
+        if let Some(v) = it.next().and_then(version_token) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// Dotted version comparison (`1.2.2` >= `1.2.2`, `1.10` > `1.9`).
+pub fn version_ge(a: &str, b: &str) -> bool {
+    fn nums(v: &str) -> Vec<u64> {
+        v.split('.').map(|p| p.parse().unwrap_or(0)).collect()
+    }
+    let (a, b) = (nums(a), nums(b));
+    for i in 0..a.len().max(b.len()) {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        if x != y {
+            return x > y;
+        }
+    }
+    true
+}
+
+/// Run exhale and return its version. `exhale -V` prints the version and
+/// exits 0; older builds fall back to the argument-less banner, which also
+/// contains "version x.y.z".
+pub fn exhale_version(path: &str) -> Result<String, Error> {
+    let all = |out: &std::process::Output| {
+        format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
+    };
+    let out = Command::new(path).arg("-V").output().map_err(Error::Io)?;
+    if let Some(v) = parse_exhale_version(&all(&out)) {
+        return Ok(v);
+    }
     let out = Command::new(path).output().map_err(Error::Io)?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    // exhale prints its banner on stderr/stdout when run without args
-    let all = format!("{}{}", text, String::from_utf8_lossy(&out.stderr));
-    if !all.contains("exhale") {
-        return Err(Error::Subprocess(format!("cannot run exhale at {path}")));
+    if let Some(v) = parse_exhale_version(&all(&out)) {
+        return Ok(v);
     }
-    // version check: banner contains "version 1.2.2" or later
-    let ver_ok = all
-        .split_whitespace()
-        .any(|w| w.starts_with("version") || w.starts_with("1."));
-    if !ver_ok {
-        return Err(Error::Subprocess("cannot determine exhale version".into()));
+    Err(Error::Subprocess(format!("cannot determine exhale version at {path}")))
+}
+
+/// Require exhale >= 1.2.2 (the version baseline the encoder needs).
+pub fn check_exhale(path: &str) -> Result<(), Error> {
+    let v = exhale_version(path)?;
+    if version_ge(&v, "1.2.2") {
+        Ok(())
+    } else {
+        Err(Error::Subprocess(format!(
+            "exhale {v} at {path} is older than the required 1.2.2"
+        )))
     }
-    Ok(())
 }
 
 pub fn encode(cfg: &EncoderConfig, input: &Path, output: &Path) -> Result<(), Error> {
@@ -461,4 +542,36 @@ fn _io_write(v: &[u8]) -> std::io::Result<()> {
     let s = Stdio::piped();
     let _ = s;
     std::io::stdout().write_all(v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exhale_version_parsing() {
+        // -V output (exit 0)
+        assert_eq!(parse_exhale_version("exhale 1.2.2 (x64, Unicode, Mar 03 2025)"), Some("1.2.2".into()));
+        // argument-less banner
+        assert_eq!(
+            parse_exhale_version(" | version 1.2.3 (x64, built on Mar 03 2025) - written by C.R.Helmrich |"),
+            Some("1.2.3".into())
+        );
+        // release-candidate suffix
+        assert_eq!(parse_exhale_version("exhale 1.2.2RC (x64)"), Some("1.2.2".into()));
+        // colored banner (colors stripped, still parseable)
+        assert_eq!(parse_exhale_version("\x1b[31mexhale\x1b[0m - ecodis ... version 1.2.4 (x64)"), Some("1.2.4".into()));
+        assert_eq!(parse_exhale_version("no version here"), None);
+    }
+
+    #[test]
+    fn version_comparison() {
+        assert!(version_ge("1.2.2", "1.2.2"));
+        assert!(version_ge("1.2.3", "1.2.2"));
+        assert!(version_ge("2.0", "1.9.9"));
+        assert!(version_ge("1.10", "1.9"));
+        assert!(!version_ge("1.2.1", "1.2.2"));
+        assert!(!version_ge("1.1.9", "1.2.2"));
+        assert!(!version_ge("1.2RC", "1.2.2"));
+    }
 }

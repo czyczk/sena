@@ -31,12 +31,23 @@ senaenc [--profile 300|600] [--opus-original|--opus-senav] <bitrate_kbps> <in.wa
   - `opusenc-senav[.exe]` (used for > 192 kbit/s by default; version output
     contains `Opus SenaV`)
 
+`exhale[.exe]` / `opusenc[.exe]` must be named with the platform extension
+(`exhale.exe` on Windows); the lookup probes the directory of
+`senaenc.exe` first (including `.exe`/`PATHEXT` variants), then `PATH`.
+
 Examples:
 
 ```bash
 senaenc --profile 300 160 in.wav out.sena
 senaenc --profile 600 --opus-senav 192 - out.sena < in.wav
+senaenc doctor   # check the required/optional tools without encoding
 ```
+
+`senaenc doctor` reports each tool's location and version without
+encoding: `exhale` and `opusenc` are required (missing, not runnable, or
+older than the baseline is fatal, exit code 4), while `opusenc-senav` is
+optional (a missing or non-SenaV build only warns and disables senav mode
+and automatic selection above 192 kbit/s).
 
 ## senadec command line
 

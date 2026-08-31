@@ -1,21 +1,174 @@
 //! senaenc CLI.
 
 use sena_core::{account, Profile, MIN_TOTAL_KBPS, SENAV_THRESHOLD_KBPS};
-use sena_enc::{encode_bytes, EncoderConfig};
+use sena_enc::{check_version, encode_bytes, exhale_version, opusenc_version, version_ge, EncoderConfig};
 use std::path::{Path, PathBuf};
 
 fn usage() -> ! {
     eprintln!(
         "usage: senaenc [--profile 300|600] [--opus-original|--opus-senav] \
-         <bitrate_kbps> <in.wav> <out.sena>\n\
+         <bitrate_kbps> <in.wav|-> <out.sena>\n\
+         senaenc doctor                              check required encoder tools\n\
          bitrate >= {MIN_TOTAL_KBPS} kbit/s (below that, use plain Opus)\n\
          default profile: 600; default opus: original <= {SENAV_THRESHOLD_KBPS}k, senav above"
     );
     std::process::exit(2);
 }
 
+/// Name candidates to probe in one directory: the name as-is, then the
+/// Windows executable extensions (.exe plus PATHEXT). On Windows a bare
+/// `exhale` path never resolves to `exhale.exe`, so the end-to-end lookup
+/// next to `senaenc.exe` used to report an adjacent `exhale.exe` as missing.
+fn tool_candidates(dir: &Path, name: &str) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut push = |p: PathBuf| {
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    };
+    push(dir.join(name));
+    #[cfg(windows)]
+    {
+        push(dir.join(format!("{name}.exe")));
+        if let Ok(pathext) = std::env::var("PATHEXT") {
+            for e in pathext.split(';') {
+                let e = e.trim_start_matches('.').trim();
+                if !e.is_empty() {
+                    push(dir.join(format!("{name}.{e}")));
+                }
+            }
+        }
+    }
+    out
+}
+
+struct ToolFinder {
+    exe_dir: PathBuf,
+}
+
+impl ToolFinder {
+    fn new() -> Self {
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .unwrap_or_default();
+        Self { exe_dir }
+    }
+
+    /// Search next to the executable first, then on PATH.
+    /// Returns (path, source) where source is "next to senaenc" or "PATH".
+    fn find(&self, name: &str) -> Option<(PathBuf, &'static str)> {
+        for cand in tool_candidates(&self.exe_dir, name) {
+            if cand.is_file() {
+                return Some((cand, "next to senaenc"));
+            }
+        }
+        let path_var = std::env::var_os("PATH")?;
+        for dir in std::env::split_paths(&path_var) {
+            for cand in tool_candidates(&dir, name) {
+                if cand.is_file() {
+                    return Some((cand, "PATH"));
+                }
+            }
+        }
+        None
+    }
+}
+
+/// `senaenc doctor`: verify the encoder tools without encoding anything.
+/// exhale and opusenc are required (missing/unrunnable/too old = fatal);
+/// opusenc-senav is optional (missing only warns and limits useful modes).
+/// Returns the process exit code (4 on fatal problems, 0 otherwise).
+fn doctor() -> i32 {
+    let finder = ToolFinder::new();
+    let mut fatal = 0u32;
+    let mut warnings = 0u32;
+    eprintln!("senaenc doctor: checking encoder tools");
+    eprintln!(
+        "  search order: {} (next to senaenc), then PATH",
+        finder.exe_dir.display()
+    );
+
+    // exhale: required, >= 1.2.2
+    match finder.find("exhale") {
+        Some((p, src)) => match exhale_version(&p.to_string_lossy()) {
+            Ok(v) if version_ge(&v, "1.2.2") => {
+                eprintln!("  [ok] exhale {v} ({}, {src})", p.display());
+            }
+            Ok(v) => {
+                fatal += 1;
+                eprintln!("  [fatal] exhale {v} at {} ({src}): older than required 1.2.2", p.display());
+            }
+            Err(e) => {
+                fatal += 1;
+                eprintln!("  [fatal] exhale at {} ({src}): {e}", p.display());
+            }
+        },
+        None => {
+            fatal += 1;
+            eprintln!("  [fatal] exhale (>= 1.2.2) not found next to senaenc or on PATH");
+            eprintln!("         impact: the xHE-AAC low band cannot be encoded at all.");
+            eprintln!("         fix: put exhale.exe next to senaenc.exe ({}) or add its folder to PATH", finder.exe_dir.display());
+        }
+    }
+
+    // opusenc: required (original mode; also the fallback when senav is absent)
+    match finder.find("opusenc") {
+        Some((p, src)) => match opusenc_version(&p.to_string_lossy()) {
+            Ok(v) => {
+                eprintln!("  [ok] opusenc ({v}) ({}, {src})", p.display());
+            }
+            Err(e) => {
+                fatal += 1;
+                eprintln!("  [fatal] opusenc at {} ({src}): {e}", p.display());
+            }
+        },
+        None => {
+            fatal += 1;
+            eprintln!("  [fatal] opusenc not found next to senaenc or on PATH");
+            eprintln!("         impact: the high band cannot be encoded at all.");
+            eprintln!("         fix: put opusenc.exe next to senaenc.exe ({}) or add its folder to PATH", finder.exe_dir.display());
+        }
+    }
+
+    // opusenc-senav: optional
+    match finder.find("opusenc-senav") {
+        Some((p, src)) => match check_version(&p.to_string_lossy(), Some("Opus SenaV"), "opusenc-senav") {
+            Ok(()) => {
+                eprintln!("  [ok] opusenc-senav (SenaV build) ({}, {src})", p.display());
+            }
+            Err(e) => {
+                warnings += 1;
+                eprintln!("  [warn] opusenc-senav at {} ({src}): {e}", p.display());
+                eprintln!("         impact: treated as absent - automatic senav selection (bitrate > {SENAV_THRESHOLD_KBPS} kbit/s) and --opus-senav will fail.");
+            }
+        },
+        None => {
+            warnings += 1;
+            eprintln!("  [warn] opusenc-senav not found (optional)");
+            eprintln!("         impact: --opus-senav and automatic senav selection (bitrate > {SENAV_THRESHOLD_KBPS} kbit/s) are unavailable;");
+            eprintln!("         encoding still works up to {SENAV_THRESHOLD_KBPS} kbit/s (auto) or at any rate with --opus-original.");
+            eprintln!("         fix: optional - put opusenc-senav.exe next to senaenc.exe ({}) or add its folder to PATH", finder.exe_dir.display());
+        }
+    }
+
+    if fatal > 0 {
+        eprintln!("doctor: {fatal} fatal problem(s) - fix them before encoding");
+        4
+    } else if warnings > 0 {
+        eprintln!("doctor: ok (required tools present), {warnings} warning(s)");
+        0
+    } else {
+        eprintln!("doctor: ok (all tools present)");
+        0
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.len() == 1 && args[0] == "doctor" {
+        std::process::exit(doctor());
+    }
     let mut profile = Profile::At600;
     let mut opus_mode: Option<bool> = None; // None = auto
     let keep_workdir = args.iter().any(|a| a == "--keep-workdir");
@@ -62,27 +215,20 @@ fn main() {
         if use_senav { "opusenc-senav" } else { "opusenc (original)" }
     );
 
-    // locate binaries: same dir as the executable first, then PATH
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-        .unwrap_or_default();
-    let find = |name: &str| -> Option<String> {
-        let cand = exe_dir.join(name);
-        if cand.exists() {
-            return Some(cand.to_string_lossy().into_owned());
-        }
-        which_crate(name)
-    };
-    let exhale = find("exhale").unwrap_or_else(|| {
+    // locate binaries: same dir as the executable first (with Windows
+    // .exe/PATHEXT variants), then PATH
+    let finder = ToolFinder::new();
+    let (exhale, _) = finder.find("exhale").unwrap_or_else(|| {
         eprintln!("error: exhale (>= 1.2.2) not found next to senaenc or on PATH");
         std::process::exit(4);
     });
+    let exhale = exhale.to_string_lossy().into_owned();
     let opus_name = if use_senav { "opusenc-senav" } else { "opusenc" };
-    let opusenc = find(opus_name).unwrap_or_else(|| {
+    let (opusenc, _) = finder.find(opus_name).unwrap_or_else(|| {
         eprintln!("error: {opus_name} not found next to senaenc or on PATH");
         std::process::exit(4);
     });
+    let opusenc = opusenc.to_string_lossy().into_owned();
 
     let input_bytes = if stdin_input {
         use std::io::Read;
@@ -121,24 +267,4 @@ fn main() {
         let _ = std::fs::remove_dir_all(&wd);
     }
     eprintln!("senaenc: wrote {}", output.display());
-}
-
-/// Minimal PATH lookup without extra deps.
-fn which_crate(name: &str) -> Option<String> {
-    let path_var = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
-        let cand = Path::new(&dir).join(name);
-        if cand.is_file() {
-            return Some(cand.to_string_lossy().into_owned());
-        }
-        // windows .exe suffix
-        #[cfg(windows)]
-        {
-            let cand = cand.with_extension("exe");
-            if cand.is_file() {
-                return Some(cand.to_string_lossy().into_owned());
-            }
-        }
-    }
-    None
 }
