@@ -1,0 +1,467 @@
+//! Streaming decoder: parses the container at open time, then decodes codec
+//! frames incrementally as `read_f32` requests PCM. LF and HF codec frames are
+//! consumed independently and any unconsumed prefix is retained across chunks,
+//! so a short chunk on one track never discards samples from the other track.
+//! The zero-phase rational resampler runs on whole LF prefixes, and chunks are
+//! cut at exact resampler input/output boundaries.
+
+use std::collections::VecDeque;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+
+use opus_decoder::{Channels, DecodeMode, Decoder as OpusDecoder};
+use rxaac_dec_lib::asc::AudioSpecificConfig;
+use rxaac_dec_lib::usac::UsacDecoder;
+use sena_core::PRE_GAIN;
+use sena_dsp::Resampler;
+
+use crate::demux::Demuxed;
+use crate::pipeline::{
+    DecodeError, DecodedInfo, LfAuInfo, OpusPacketInfo, ReadInfo, SAMPLE_RATE,
+    XHE_TRIM_CORE_SAMPLES, add_bits_interval, parse_opus_head,
+};
+
+const MIN_CHUNK_FRAMES: u64 = 4800; // 100 ms @48k
+
+pub struct StreamingDecoder {
+    demux: Demuxed,
+    info: DecodedInfo,
+    pub warnings: Vec<String>,
+    cursor: u64,
+    state: Option<State>,
+    bits_prefix: Vec<f64>,
+    last_read: ReadInfo,
+}
+
+struct State {
+    lf_rate: u32,
+    pre_skip: usize,
+    xdec: UsacDecoder,
+    opus: OpusDecoder,
+    frame_index: usize,
+    lf_raw: VecDeque<f32>,
+    hf_raw: VecDeque<f32>,
+    lf_total_before: i128,
+    opus_total_before: i128,
+    lf_infos: Vec<LfAuInfo>,
+    opus_infos: Vec<OpusPacketInfo>,
+    lf_errors: usize,
+    opus_errors: usize,
+    output: VecDeque<f64>,
+    first: bool,
+    produced: u64,
+    finished: bool,
+}
+
+impl StreamingDecoder {
+    pub fn open(demux: Demuxed) -> Result<Self, DecodeError> {
+        let (info, warnings) = crate::pipeline::probe(&demux)?;
+        Ok(Self {
+            demux,
+            info,
+            warnings,
+            cursor: 0,
+            state: None,
+            bits_prefix: vec![0.0],
+            last_read: ReadInfo::default(),
+        })
+    }
+
+    pub fn info(&self) -> DecodedInfo {
+        self.info
+    }
+
+    fn init_state(&mut self) -> Result<(), DecodeError> {
+        let lf_track = self.demux.track("A_SENALF").unwrap();
+        let hf_track = self.demux.track("A_OPUS").unwrap();
+        let lf_rate = lf_track.sample_rate.round() as u32;
+        let asc = AudioSpecificConfig::parse(&lf_track.codec_private)
+            .map_err(|e| DecodeError::Format(format!("ASC parse: {e}")))?;
+        let opus_head = parse_opus_head(&hf_track.codec_private)?;
+        let xdec = UsacDecoder::new(&asc)
+            .map_err(|e| DecodeError::Codec(format!("rxaac init: {e}")))?;
+        if xdec.num_channels() != 2 {
+            return Err(DecodeError::Unsupported("rxaac channels != 2".into()));
+        }
+        let mut opus = OpusDecoder::new(SAMPLE_RATE, Channels::Stereo)
+            .map_err(|e| DecodeError::Codec(format!("opus init: {e}")))?;
+        if opus_head.output_gain != 0 {
+            opus.set_gain(i32::from(opus_head.output_gain))
+                .map_err(|e| DecodeError::Codec(format!("opus output gain: {e}")))?;
+        }
+        self.state = Some(State {
+            lf_rate,
+            pre_skip: opus_head.pre_skip as usize,
+            xdec,
+            opus,
+            frame_index: 0,
+            lf_raw: VecDeque::new(),
+            hf_raw: VecDeque::new(),
+            lf_total_before: 0,
+            opus_total_before: 0,
+            lf_infos: Vec::new(),
+            opus_infos: Vec::new(),
+            lf_errors: 0,
+            opus_errors: 0,
+            output: VecDeque::new(),
+            first: true,
+            produced: 0,
+            finished: false,
+        });
+        Ok(())
+    }
+
+    fn decode_next_frame(&mut self) -> Result<bool, DecodeError> {
+        let st = self.state.as_mut().unwrap();
+        if st.frame_index >= self.demux.frames.len() {
+            st.finished = true;
+            return Ok(false);
+        }
+        let frame = self.demux.frames[st.frame_index].clone();
+        st.frame_index += 1;
+        let lf_num = self.demux.track("A_SENALF").unwrap().number;
+        if frame.track == lf_num {
+            // Decode into a scratch buffer so a panicking decoder can never
+            // leave partial samples in the stream queue.
+            let mut out: Vec<f32> = Vec::new();
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                st.xdec.decode_au(&frame.data, &mut out)
+            }));
+            let failed = match result {
+                Ok(Err(e)) => {
+                    eprintln!("warning: LF AU decode error ({}): {e}", frame.t_ns);
+                    true
+                }
+                Err(_) => {
+                    eprintln!("warning: LF AU decoder panic ({}); replacing with silence", frame.t_ns);
+                    true
+                }
+                Ok(Ok(())) => false,
+            };
+            if failed {
+                st.lf_errors += 1;
+                out.clear();
+                let n = st.xdec.output_samples() * st.xdec.num_channels();
+                out.resize(n, 0.0);
+            }
+            let samples = out.len() / st.xdec.num_channels();
+            if samples == 0 || samples * st.xdec.num_channels() != out.len() {
+                return Err(DecodeError::Codec("rxaac returned a non-integral frame".into()));
+            }
+            st.lf_raw.extend(out);
+            st.lf_infos.push(LfAuInfo {
+                start_core: st.lf_total_before,
+                samples_core: samples as i128,
+                bits: (frame.data.len() * 8) as u64,
+            });
+            st.lf_total_before += samples as i128;
+        } else {
+            let mut buf = vec![0.0f32; 5760 * 2];
+            let mut n = match st.opus.decode_float(Some(&frame.data), &mut buf, DecodeMode::Normal) {
+                Ok(n) => n,
+                Err(e) => {
+                    eprintln!("warning: Opus packet decode error ({}): {e}; using PLC", frame.t_ns);
+                    st.opus_errors += 1;
+                    st.opus.decode_float(None, &mut buf, DecodeMode::Normal)
+                        .map_err(|e| DecodeError::Codec(format!("opus PLC: {e}")))?
+                }
+            };
+            n = n.min(5760);
+            st.hf_raw.extend(buf[..n * 2].iter().copied());
+            st.opus_infos.push(OpusPacketInfo {
+                start_48k: st.opus_total_before,
+                samples_48k: n as i128,
+                bits: (frame.data.len() * 8) as u64,
+            });
+            st.opus_total_before += n as i128;
+        }
+        Ok(true)
+    }
+
+    fn chunk_bits(
+        &self,
+        lf_rate: u32,
+        pre_skip: usize,
+        lf_infos: &[LfAuInfo],
+        opus_infos: &[OpusPacketInfo],
+        start: u64,
+        end: u64,
+    ) -> Vec<f64> {
+        let n = (end - start) as usize;
+        let mut delta = vec![0.0f64; n + 1];
+        let base = start as i128;
+        for info in lf_infos {
+            let s_core = info.start_core - XHE_TRIM_CORE_SAMPLES as i128;
+            let s48 = s_core * 48_000 / lf_rate as i128;
+            let e48 = (s_core + info.samples_core) * 48_000 / lf_rate as i128;
+            add_bits_interval(&mut delta, n as i128, s48 - base, e48 - base, info.bits as f64);
+        }
+        for info in opus_infos {
+            let s = info.start_48k - pre_skip as i128;
+            let e = s + info.samples_48k;
+            add_bits_interval(&mut delta, n as i128, s - base, e - base, info.bits as f64);
+        }
+        let mut rate = vec![0.0f64; n + 1];
+        let mut acc = 0.0;
+        for i in 0..n {
+            acc += delta[i];
+            rate[i + 1] = acc;
+        }
+        rate
+    }
+
+    fn trim_lf_infos(infos: &mut Vec<LfAuInfo>, mut frames: i128) {
+        let mut remove = 0usize;
+        for info in infos.iter_mut() {
+            if frames <= 0 {
+                break;
+            }
+            if frames >= info.samples_core {
+                frames -= info.samples_core;
+                remove += 1;
+            } else {
+                info.start_core += frames;
+                info.samples_core -= frames;
+                frames = 0;
+            }
+        }
+        if remove != 0 {
+            infos.drain(..remove);
+        }
+    }
+
+    fn trim_opus_infos(infos: &mut Vec<OpusPacketInfo>, mut frames: i128) {
+        let mut remove = 0usize;
+        for info in infos.iter_mut() {
+            if frames <= 0 {
+                break;
+            }
+            if frames >= info.samples_48k {
+                frames -= info.samples_48k;
+                remove += 1;
+            } else {
+                info.start_48k += frames;
+                info.samples_48k -= frames;
+                frames = 0;
+            }
+        }
+        if remove != 0 {
+            infos.drain(..remove);
+        }
+    }
+
+    fn produce_chunk(&mut self) -> Result<(), DecodeError> {
+        let lf_skip = {
+            let st = self.state.as_ref().unwrap();
+            if st.first { XHE_TRIM_CORE_SAMPLES } else { 0 }
+        };
+        let hf_skip = {
+            let st = self.state.as_ref().unwrap();
+            if st.first { st.pre_skip } else { 0 }
+        };
+        let raw_empty = {
+            let st = self.state.as_ref().unwrap();
+            st.lf_raw.len() <= lf_skip * 2 || st.hf_raw.len() <= hf_skip * 2
+        };
+        if raw_empty {
+            let st = self.state.as_mut().unwrap();
+            if st.finished {
+                // Trailing unmatched stream data after the shorter track ended.
+                st.lf_raw.clear();
+                st.hf_raw.clear();
+                st.lf_infos.clear();
+                st.opus_infos.clear();
+                st.first = false;
+            }
+            return Ok(());
+        }
+
+        let (lf48, hf_after, take, start, rate, lf_consume_core) = {
+            let st = self.state.as_ref().unwrap();
+            let lf_after: Vec<f64> = st
+                .lf_raw
+                .iter()
+                .skip(lf_skip * 2)
+                .map(|&s| f64::from(s))
+                .collect();
+            let hf_after: Vec<f64> = st
+                .hf_raw
+                .iter()
+                .skip(hf_skip * 2)
+                .map(|&s| f64::from(s))
+                .collect();
+            let resampler = Resampler::new(st.lf_rate, SAMPLE_RATE);
+            let lf48 = resampler.process(&lf_after, 2);
+            let n = (lf48.len() / 2).min(hf_after.len() / 2);
+            let remaining = self.info.playable_frames.saturating_sub(st.produced);
+            let take = (n as u64).min(remaining) as usize;
+            if take == 0 {
+                return Ok(());
+            }
+            let lf_consume_core = resampler
+                .input_frames_for_output(take)
+                .ok_or_else(|| DecodeError::Codec(format!("LF resampler cannot consume {take} frames")))?
+                .min(lf_after.len() / 2);
+            let start = st.produced;
+            let end = start + take as u64;
+            let rate = self.chunk_bits(st.lf_rate, st.pre_skip, &st.lf_infos, &st.opus_infos, start, end);
+            (lf48, hf_after, take, start, rate, lf_consume_core)
+        };
+
+        let gain = 1.0 / PRE_GAIN;
+        let mut chunk_out = Vec::with_capacity(take * 2);
+        for i in 0..take {
+            let lf = lf48[i * 2] * gain;
+            let r = lf48[i * 2 + 1] * gain;
+            let hl = hf_after[i * 2] * gain;
+            let hr = hf_after[i * 2 + 1] * gain;
+            chunk_out.push(lf + hl);
+            chunk_out.push(r + hr);
+        }
+
+        {
+            let st = self.state.as_mut().unwrap();
+            st.output.extend(chunk_out);
+            st.produced = start + take as u64;
+            for _ in 0..(lf_skip + lf_consume_core) * 2 {
+                st.lf_raw.pop_front();
+            }
+            for _ in 0..(hf_skip + take) * 2 {
+                st.hf_raw.pop_front();
+            }
+            Self::trim_lf_infos(&mut st.lf_infos, lf_consume_core as i128);
+            Self::trim_opus_infos(&mut st.opus_infos, take as i128);
+            st.first = false;
+        }
+
+        let mut last_bits = *self.bits_prefix.last().unwrap();
+        for v in rate.iter().skip(1) {
+            last_bits += v;
+            self.bits_prefix.push(last_bits);
+        }
+        Ok(())
+    }
+
+    fn fill(&mut self, want: u64) -> Result<(), DecodeError> {
+        if self.state.is_none() {
+            self.init_state()?;
+        }
+        loop {
+            let (available, finished) = {
+                let st = self.state.as_ref().unwrap();
+                ((st.output.len() / 2) as u64, st.finished)
+            };
+            if available >= want || finished {
+                return Ok(());
+            }
+            // Decode codec frames until the shorter ready stream covers a chunk.
+            loop {
+                let (ready, eof) = {
+                    let st = self.state.as_ref().unwrap();
+                    let lf_ready = {
+                        let trim = if st.first { XHE_TRIM_CORE_SAMPLES as i128 } else { 0 };
+                        let core = (st.lf_raw.len() / 2) as i128 - trim;
+                        (core * 48_000 / st.lf_rate as i128).max(0) as u64
+                    };
+                    let hf_ready = {
+                        let trim = if st.first { st.pre_skip as i128 } else { 0 };
+                        ((st.hf_raw.len() / 2) as i128 - trim).max(0) as u64
+                    };
+                    (lf_ready.min(hf_ready), st.finished)
+                };
+                if ready >= MIN_CHUNK_FRAMES || eof {
+                    break;
+                }
+                if !self.decode_next_frame()? {
+                    break;
+                }
+            }
+            let before = (self.state.as_ref().unwrap().output.len() / 2) as u64;
+            self.produce_chunk()?;
+            let (after, eof) = {
+                let st = self.state.as_ref().unwrap();
+                ((st.output.len() / 2) as u64, st.finished)
+            };
+            if after == before && eof {
+                return Ok(());
+            }
+        }
+    }
+
+    pub fn read_f32(&mut self, out: &mut [f32], max_frames: u64) -> Result<u64, DecodeError> {
+        let remaining = self.info.playable_frames.saturating_sub(self.cursor);
+        let want = max_frames.min(remaining);
+        if out.len() < want as usize * 2 {
+            return Err(DecodeError::Format("output buffer too small".into()));
+        }
+        if want == 0 {
+            self.last_read = ReadInfo { start_frame: self.info.playable_frames, frames: 0, payload_bits: 0 };
+            return Ok(0);
+        }
+        self.fill(want)?;
+        let start = self.cursor;
+        let bits_start = self.bits_prefix[start as usize];
+        let mut got = 0u64;
+        {
+            let st = self.state.as_mut().unwrap();
+            while got < want {
+                if st.output.is_empty() {
+                    break;
+                }
+                out[(got * 2) as usize] = st.output.pop_front().unwrap() as f32;
+                out[(got * 2 + 1) as usize] = st.output.pop_front().unwrap() as f32;
+                got += 1;
+            }
+        }
+        self.cursor += got;
+        let bits_end = self.bits_prefix[self.cursor as usize];
+        self.last_read = ReadInfo {
+            start_frame: start,
+            frames: got,
+            payload_bits: (bits_end - bits_start).max(0.0).round() as u64,
+        };
+        Ok(got)
+    }
+
+    pub fn read_info(&self) -> ReadInfo {
+        self.last_read
+    }
+
+    pub fn position(&self) -> u64 {
+        self.cursor
+    }
+
+    /// P0 seek is linear: rebuild the codec state and discard frames up to
+    /// the target, keeping any buffered frames at/after the target for the
+    /// next read. Cluster-level seeking is planned as a follow-up.
+    pub fn seek(&mut self, frame: u64) -> Result<(), DecodeError> {
+        if frame > self.info.playable_frames {
+            return Err(DecodeError::Format("seek past playable length".into()));
+        }
+        if frame < self.cursor {
+            self.cursor = 0;
+            self.bits_prefix = vec![0.0];
+            self.state = None;
+            self.last_read = ReadInfo::default();
+        }
+        while self.cursor < frame {
+            let available = self.state.as_ref().map_or(0, |st| (st.output.len() / 2) as u64);
+            if available == 0 {
+                let want = (frame - self.cursor).min(MIN_CHUNK_FRAMES);
+                self.fill(want)?;
+            }
+            let available = self.state.as_ref().map_or(0, |st| (st.output.len() / 2) as u64);
+            let take = available.min(frame - self.cursor);
+            if take == 0 {
+                break;
+            }
+            if let Some(st) = self.state.as_mut() {
+                for _ in 0..take * 2 {
+                    st.output.pop_front();
+                }
+            }
+            self.cursor += take;
+        }
+        self.last_read = ReadInfo { start_frame: self.cursor, frames: 0, payload_bits: 0 };
+        Ok(())
+    }
+}

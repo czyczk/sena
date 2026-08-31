@@ -1,7 +1,7 @@
 //! senaenc CLI.
 
 use sena_core::{account, Profile, MIN_TOTAL_KBPS, SENAV_THRESHOLD_KBPS};
-use sena_enc::{encode, EncoderConfig};
+use sena_enc::{encode_bytes, EncoderConfig};
 use std::path::{Path, PathBuf};
 
 fn usage() -> ! {
@@ -52,6 +52,7 @@ fn main() {
     }
     let (xhe_k, opus_k) = account(kbps, profile).unwrap();
     let use_senav = opus_mode.unwrap_or(kbps > SENAV_THRESHOLD_KBPS);
+    let stdin_input = input.as_os_str() == "-";
     eprintln!(
         "senaenc: profile @{}  total {}k -> xHE-AAC {}k (deducted) + Opus {}k ({})",
         profile.crossover_hz(),
@@ -83,6 +84,18 @@ fn main() {
         std::process::exit(4);
     });
 
+    let input_bytes = if stdin_input {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        if let Err(e) = std::io::stdin().read_to_end(&mut buf) {
+            eprintln!("error: reading stdin: {e}");
+            std::process::exit(1);
+        }
+        buf
+    } else {
+        Vec::new()
+    };
+
     let wd = std::env::temp_dir().join(format!("senaenc-{}", std::process::id()));
     let cfg = EncoderConfig {
         profile,
@@ -92,7 +105,12 @@ fn main() {
         opusenc: &opusenc,
         workdir: &wd,
     };
-    if let Err(e) = encode(&cfg, &input, &output) {
+    let result = if stdin_input {
+        encode_bytes(&cfg, &input_bytes, &output)
+    } else {
+        sena_enc::encode(&cfg, &input, &output)
+    };
+    if let Err(e) = result {
         eprintln!("error: {e}");
         let _ = std::fs::remove_dir_all(&wd);
         std::process::exit(1);

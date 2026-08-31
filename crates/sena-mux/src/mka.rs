@@ -20,8 +20,16 @@ pub struct Frame {
     pub data: Vec<u8>,
 }
 
-/// Write a Sena mka file. Frames must be sorted by time.
-pub fn write_mka(tracks: &[Track], mut frames: Vec<Frame>, tags: &[(&str, &str)], cluster_ms: u64) -> Vec<u8> {
+/// Write a Sena mka file. Frames must be sorted by time. `playable_ns` is the
+/// playable length of the file (the source timeline length in nanoseconds);
+/// the Segment Info Duration is set to exactly this value (no padding).
+pub fn write_mka(
+    tracks: &[Track],
+    mut frames: Vec<Frame>,
+    tags: &[(&str, &str)],
+    cluster_ms: u64,
+    playable_ns: u64,
+) -> Vec<u8> {
     let mut out = vec![];
 
     // EBML header
@@ -41,10 +49,8 @@ pub fn write_mka(tracks: &[Track], mut frames: Vec<Frame>, tags: &[(&str, &str)]
     ebml::uint(&mut info, &[0x2A, 0xD7, 0xB1], TIMECODE_SCALE);
     ebml::str(&mut info, &[0x4D, 0x80], "senaenc");
     ebml::str(&mut info, &[0x57, 0x41], "senaenc");
-    if let Some(last) = frames.last() {
-        let dur = (last.t_ns as f64 / 1e3) + 20_000.0; // ms, padded
-        ebml::float(&mut info, &[0x44, 0x89], dur);
-    }
+    // exact playable duration (ms); no padding convention
+    ebml::float(&mut info, &[0x44, 0x89], playable_ns as f64 / 1e6);
     ebml::write_element(&mut out, &[0x15, 0x49, 0xA9, 0x66], &info);
 
     // Tracks
@@ -96,7 +102,10 @@ pub fn write_mka(tracks: &[Track], mut frames: Vec<Frame>, tags: &[(&str, &str)]
             let f = &frames[idx];
             let mut sb = vec![];
             ebml::write_vint(&mut sb, (f.track + 1) as u64);
-            let rel = ((f.t_ns - start) * TIMECODE_SCALE as u64 / 1_000_000_000) as u16;
+            // SimpleBlock relative timestamp is signed 16-bit in TimestampScale
+            // ticks. With TIMECODE_SCALE = 1 ms and 1 s clusters this is
+            // always within i16 range for Sena frame timing.
+            let rel = ((f.t_ns - start) / TIMECODE_SCALE) as i16;
             sb.extend_from_slice(&rel.to_be_bytes());
             sb.push(0x80); // keyframe, no lacing
             sb.extend_from_slice(&f.data);

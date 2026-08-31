@@ -9,7 +9,7 @@ Sena defines two profiles, both with a fixed linear-phase FIR crossover:
   16 kHz input, exhale non-eSBR preset 1 (nominal 64 kbit/s, measured
   ~20 kbit/s actual on low-frequency-only content).
 - `xAAC-Opus@600`: crossover 600 Hz; low-frequency codec configured at
-  16 kHz input, exhale non-eSBR preset 5 (nominal 128 kbit/s, measured
+  32 kHz input, exhale non-eSBR preset 5 (nominal 128 kbit/s, measured
   ~32 kbit/s actual).
 
 When no profile is specified, the encoder SHALL default to `xAAC-Opus@600`.
@@ -17,6 +17,18 @@ When no profile is specified, the encoder SHALL default to `xAAC-Opus@600`.
 #### Scenario: Profile default
 - GIVEN no profile argument
 - THEN the encoder uses xAAC-Opus@600.
+
+### Requirement: Channel policy
+The encoder SHALL support stereo input as P0. Mono input is a planned
+future mode and SHALL be encoded as true mono tracks (one channel per
+codec track), not as duplicated stereo. Input with more than two channels
+is explicitly out of scope.
+
+#### Scenario: Channel policy
+- GIVEN a stereo source
+- THEN the encoder encodes both tracks as two-channel streams.
+- GIVEN a mono or multichannel source during the P0 milestone
+- THEN the encoder fails with a clear unsupported-channel error.
 
 ### Requirement: Crossover filter
 The crossover SHALL be a linear-phase FIR low-pass with subtractive
@@ -44,22 +56,50 @@ protecting codec inputs from FIR overshoot.
 - GIVEN encoder pad p
 - THEN decoder restores 1/p exactly.
 
+### Requirement: Zero-phase rational resampler
+The encoder SHALL use `sena_dsp::Resampler` (pure Rust) for all sample-rate
+changes. The product SHALL NOT use soxr or rubato.
+
+The normative design is: symmetric windowed-sinc, zero-phase rational ratio,
+Kaiser window beta = 9.0, passband at 0.98 * min(Nyquist) when upsampling
+and 0.90 * min(Nyquist) when downsampling, taps =
+ceil(12 / normalized transition) rounded to odd, processed block-wise with
+guard samples so the result is independent of block partitioning.
+
+#### Scenario: Resampler acceptance
+- GIVEN the resampler test suite
+- THEN impulse responses are symmetric around the corresponding output
+  sample (zero phase), block-partitioned results equal whole-buffer
+  results, and sine fidelity error is below 3e-4 for the supported rates.
+
+### Requirement: Input rate normalization
+The encoder SHALL accept lossless sources at any sample rate (e.g. 44100,
+48000, 96000 Hz) and resample the input to 48 kHz with the zero-phase
+rational resampler before the crossover split (the FIR tables and the
+alignment constants are defined at 48 kHz). Resampling SHALL NOT introduce
+a time offset: the zero-phase resampler aligns the 48 kHz output to the
+input timeline. The normalized length in 48 kHz frames SHALL be
+`round(src_frames * 48000 / src_rate)`.
+
+#### Scenario: 44.1 kHz source
+- GIVEN a 44100 Hz stereo source
+- WHEN encoded
+- THEN the input is normalized to 48 kHz with no timing offset and the
+  encode passes the same alignment checks as a 48 kHz source.
+
 ### Requirement: Low-frequency input resampling
 The low-frequency band SHALL be resampled from 48 kHz to the profile's
-input rate with high-quality resampling (rubato, windowed-sinc, sinc length
->= 256): 16 kHz for @300, 32 kHz for @600. The encoder's core rate follows
-the input rate deterministically (16 kHz in -> 16 kHz out; preset >= 5
-floors the core at 32 kHz); the stored track rate is whatever the encoder
-emits (16 kHz or 32 kHz).
+input rate with the zero-phase rational resampler (`sena_dsp::Resampler`,
+symmetric windowed-sinc, block-wise; no fractional group delay): 16 kHz for
+@300, 32 kHz for @600. The encoder's core rate follows the input rate
+deterministically (16 kHz in -> 16 kHz out; preset >= 5 floors the core at
+32 kHz); the stored track rate is whatever the encoder emits (16 kHz or
+32 kHz).
 
 #### Scenario: Stored rate
 - GIVEN a Sena encode at any profile
 - THEN the low-frequency track in the container is sampled at the rate the
   encoder actually emitted.
-
-#### Scenario: Stored rate
-- GIVEN a Sena encode at any profile
-- THEN the low-frequency track in the container is sampled at 16 kHz.
 
 ### Requirement: Bitrate accounting
 Bitrate accounting SHALL follow these rules (rule B):
@@ -97,25 +137,66 @@ link or embed their code.
 - THEN senaenc fails with a clear error naming the binary and the required version.
 
 ### Requirement: Alignment constants
-The encoder SHALL record per-profile track delays (in 48 kHz samples):
+The encoder SHALL write Matroska `CodecDelay` as the leading-padding trim
+amount, not as a relative lead between tracks:
 
-- @300: xHE-AAC track leads by 3072 samples (one 1024-sample warmup frame
-  at 16 kHz).
-- @600: xHE-AAC track leads by 1536 samples (512 warmup samples at 16 kHz).
+- LF track: `1024 * 1e9 / actual_lf_rate` ns. Equivalent at 48 kHz:
+  `1024 * 48000 / actual_lf_rate` samples (typically 3072 for a 16 kHz
+  stream and 1536 for a 32 kHz stream).
+- Opus track: `pre_skip * 1e9 / 48000` ns, where `pre_skip` comes from the
+  emitted `OpusHead`.
 
-The Opus track delay is 0 after pre-skip. These constants SHALL be written
-as CodecDelay metadata and SHALL match the decoder's warmup trimming.
+Both values SHALL be written from these formulas at mux time, without any
+measurement. After each core's leading padding has been trimmed, the Opus
+track sits at timeline 0 and the LF track sits at timeline 0 after
+upsampling.
 
 #### Scenario: Constant delays
-- GIVEN a profile
-- THEN the recorded delay equals the fixed per-profile constant without any
-  measurement at encode time.
+- GIVEN a profile and an actual LF stream rate
+- THEN the recorded CodecDelay equals the formula value for that actual
+  rate without any measurement at encode time.
+
+### Requirement: Playable length
+The encoder SHALL record the input length as the `SENA_PLAYABLE_SAMPLES`
+container tag. For a source already at 48 kHz, the value is
+`src_frames`; for other source rates it is
+`round(src_frames * 48000 / src_rate)`, i.e. the normalized 48 kHz frame
+count produced by input rate normalization. Encoding SHALL NOT change the
+timeline: after the decoder has applied the documented trims, the playable
+output SHALL be exactly as long as the normalized input. The encoder feeds
+the codecs with the deterministically padded band signals and does not
+further crop the output; the playable length is the single source of truth
+for where the playable output ends.
+
+#### Scenario: Length conservation
+- GIVEN an input of N source frames at rate R
+- THEN the Sena file carries SENA_PLAYABLE_SAMPLES =
+  round(N * 48000 / R) and a decoded playable output of exactly that
+  length.
+
+### Requirement: Block timing
+The LF track's AU timestamps SHALL advance by one AU duration
+(1024 samples at the actual stream rate: 64 ms at 16 kHz, 32 ms at
+32 kHz); the Opus track's timestamps SHALL advance by 20 ms. The Segment
+`Info Duration` SHALL equal the playable length. This guarantees that the
+container's time axis matches the decoded timeline and that cluster
+interleaving stays correct for streaming and seeking.
+
+#### Scenario: Correct frame timestamps
+- GIVEN a Sena file
+- THEN consecutive LF AU timestamps differ by 64 ms (16 kHz stream) or
+  32 ms (32 kHz stream), and Info Duration equals the playable length.
 
 ### Requirement: Encoder validation
 A golden-output suite SHALL verify: FIR coefficients match the reference
 design exactly; crossover reconstruction identity; resampler quality;
 container parseability and delay metadata; end-to-end decode matches the
 reference pipeline within tolerance.
+
+`assets/e2e` references were produced by an archived external pipeline
+(soxr HQ, AOSP libxaac, opusdec); they are final validation answers, not a
+product pipeline to reproduce internally. Non-bit-exact differences SHALL
+be attributed to documented acceptable causes before release.
 
 #### Scenario: Golden suite
 - GIVEN the golden suite

@@ -5,17 +5,22 @@ members = [
     "crates/sena-dsp",
     "crates/sena-mux",
     "crates/sena-enc",
+    "crates/sena-dec",
     "bins/senaenc",
+    "bins/senadec",
 ]
 
 [workspace.package]
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
+rust-version = "1.88"
 
 [workspace.dependencies]
 sena-core = { path = "crates/sena-core" }
 sena-dsp = { path = "crates/sena-dsp" }
 sena-mux = { path = "crates/sena-mux" }
 sena-enc = { path = "crates/sena-enc" }
+sena-dec = { path = "crates/sena-dec" }
 rustfft = "6"
-rubato = "0.16"
+opus-decoder = { path = "../ropus/crates/opus-decoder", default-features = false }
+rxaac-dec-lib = { path = "../rxaac-dec/crates/rxaac-dec-lib" }

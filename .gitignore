@@ -1,3 +1,29 @@
+# Baseline: `cargo new` default for a binary project.
 /target
+
+# Local build-tool caches and copied toolchains (this WSL box has read-only
+# ~/.cargo / ~/.rustup; see notes/build-and-cross.md).
+/.cargo-home/
+/.toolchains/
+/.cache/
+
+# Generated cross-build intermediates.
+/build/
+
+# Python.
+__pycache__/
+*.pyc
+
+# Editor / OS noise.
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+
+# Keep these on purpose:
+#   Cargo.lock  -- this workspace contains binaries, so lockfile is committed.
+#   bin/        -- checked-in launchers/symlinks used by senaenc on this host
+#                  are ignored, except the .gitkeep placeholder.
 /bin/*
 !/bin/.gitkeep

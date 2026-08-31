@@ -1,7 +1,7 @@
 //! sena-enc: pipeline orchestration (WAV IO, subprocess drivers, packet extraction).
 
 use sena_core::{Profile, PRE_GAIN, SAMPLE_RATE};
-use sena_dsp::{split, Downsampler};
+use sena_dsp::split;
 use sena_mux::mka::{self, Frame, Track};
 use std::io::Write;
 use std::path::Path;
@@ -97,11 +97,23 @@ fn check_exhale(path: &str) -> Result<(), Error> {
 }
 
 pub fn encode(cfg: &EncoderConfig, input: &Path, output: &Path) -> Result<(), Error> {
-    // --- read input WAV ---
-    let (x, ch) = wav::read_f64(input)?;
+    let bytes = std::fs::read(input)?;
+    encode_bytes(cfg, &bytes, output)
+}
+
+pub fn encode_bytes(cfg: &EncoderConfig, input: &[u8], output: &Path) -> Result<(), Error> {
+    // --- read input WAV (any sample rate; stdin-safe via encode_bytes) ---
+    let (x, ch, in_rate) = wav::read_f64_bytes(input)?;
     if ch != 2 {
         return Err(Error::Format(format!("expected stereo input, got {ch} ch")));
     }
+    // --- normalize the input rate to 48 kHz (zero-phase rational resampler) ---
+    let x48: Vec<f64> = if in_rate == SAMPLE_RATE {
+        x
+    } else {
+        sena_dsp::Resampler::new(in_rate, SAMPLE_RATE).process(&x, ch)
+    };
+    let x = x48;
     let n = x.len() / 2;
 
     // --- split & pad ---
@@ -110,9 +122,8 @@ pub fn encode(cfg: &EncoderConfig, input: &Path, output: &Path) -> Result<(), Er
     let low_p = pad(&low);
     let high_p = pad(&high);
 
-    // --- downsample low band 48k -> 16k ---
-    let mut ds = Downsampler::new(n, cfg.profile.lf_rate());
-    let low16 = ds.process(&low_p);
+    // --- downsample low band 48k -> lf rate (zero-phase rational resampler) ---
+    let low16 = sena_dsp::Resampler::new(SAMPLE_RATE, cfg.profile.lf_rate()).process(&low_p, 2);
 
     // --- write temp WAVs ---
     let wd = cfg.workdir;
@@ -167,10 +178,9 @@ pub fn encode(cfg: &EncoderConfig, input: &Path, output: &Path) -> Result<(), Er
 
     // --- frame timings ---
     let hf_frame_ns = 20_000_000u64; // 20 ms Opus frames
-    let lf_frame_ns = match cfg.profile {
-        Profile::At300 => 64_000_000u64, // 1024 @ 16k
-        Profile::At600 => 48_000_000u64, // 768 @ 16k
-    };
+    // LF AU duration: one 1024-sample core frame at the actual stream rate
+    // (64 ms at 16 kHz, 32 ms at 32 kHz).
+    let lf_frame_ns = (sena_core::XHE_WARMUP_CORE as u64) * 1_000_000_000 / lf_stream_rate as u64;
 
     // --- mux ---
     let tracks = vec![
@@ -210,11 +220,14 @@ pub fn encode(cfg: &EncoderConfig, input: &Path, output: &Path) -> Result<(), Er
     }
     let profile_tag = cfg.profile.crossover_hz().to_string();
     let version_tag = "1".to_string();
+    let playable_tag = n.to_string(); // input length in 48 kHz stereo frames
     let tags: Vec<(&str, &str)> = vec![
         ("SENA_PROFILE", &profile_tag),
         ("SENA_VERSION", &version_tag),
+        ("SENA_PLAYABLE_SAMPLES", &playable_tag),
     ];
-    let mka_bytes = mka::write_mka(&tracks, frames, &tags, 1000);
+    let playable_ns = (n as u64) * 1_000_000_000 / SAMPLE_RATE as u64;
+    let mka_bytes = mka::write_mka(&tracks, frames, &tags, 1000, playable_ns);
     std::fs::write(output, mka_bytes)?;
     Ok(())
 }
@@ -232,7 +245,7 @@ pub fn m4a_stream_rate(path: &Path) -> Result<u32, Error> {
             }
             for (tag3, s3, e3) in boxes(&f, s2, e2) {
                 if tag3 == b"mdia" {
-                    for (tag4, s4, e4) in boxes(&f, s3, e3) {
+                    for (tag4, s4, _e4) in boxes(&f, s3, e3) {
                         if tag4 == b"mdhd" {
                             let ver = f[s4];
                             let off = if ver == 1 { 16 } else { 12 };
@@ -365,6 +378,7 @@ fn walk_descs(f: &[u8], start: usize, end: usize) -> Option<Vec<u8>> {
 fn find_aus(f: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
     let mut sizes: Option<Vec<u32>> = None;
     let mut mdat_start = None;
+    let mut first_chunk_offset = None;
     for (tag, s, e) in boxes(f, 0, f.len()) {
         if tag == b"mdat" {
             mdat_start = Some(s);
@@ -386,7 +400,7 @@ fn find_aus(f: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
                             if t5 != b"stbl" {
                                 continue;
                             }
-                            for (t6, s6, e6) in boxes(f, s5, e5) {
+                            for (t6, s6, _e6) in boxes(f, s5, e5) {
                                 if t6 == b"stsz" {
                                     let count = u32::from_be_bytes([f[s6 + 8], f[s6 + 9], f[s6 + 10], f[s6 + 11]]) as usize;
                                     let mut v = Vec::with_capacity(count);
@@ -400,6 +414,22 @@ fn find_aus(f: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
                                     }
                                     sizes = Some(v);
                                 }
+                                if t6 == b"stco" {
+                                    // stco payload: version/flags(4) + count(4)
+                                    // + chunk offsets; the first offset is the
+                                    // authoritative start of AU #0. exhale's
+                                    // mdat preamble length can vary, so the
+                                    // old hard-coded `mdat + 2` is unreliable.
+                                    let count = u32::from_be_bytes([f[s6 + 4], f[s6 + 5], f[s6 + 6], f[s6 + 7]]) as usize;
+                                    if count > 0 {
+                                        first_chunk_offset = Some(u32::from_be_bytes([
+                                            f[s6 + 8],
+                                            f[s6 + 9],
+                                            f[s6 + 10],
+                                            f[s6 + 11],
+                                        ]) as usize);
+                                    }
+                                }
                             }
                         }
                     }
@@ -409,7 +439,11 @@ fn find_aus(f: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
     }
     let sizes = sizes.ok_or_else(|| Error::Format("stsz not found".into()))?;
     let start = mdat_start.ok_or_else(|| Error::Format("mdat not found".into()))?;
-    let mut off = start;
+    // exhale writes "unused but informative" bytes at the start of the mdat
+    // payload before the first AU. Their length can vary, so trust the MP4
+    // stco chunk table; fall back to the historical two-byte preamble only
+    // when stco is absent.
+    let mut off = first_chunk_offset.unwrap_or(start + 2);
     let mut aus = vec![];
     for sz in sizes {
         let sz = sz as usize;
@@ -424,19 +458,7 @@ fn find_aus(f: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
 
 #[allow(dead_code)]
 fn _io_write(v: &[u8]) -> std::io::Result<()> {
-    let mut s = Stdio::piped();
+    let s = Stdio::piped();
     let _ = s;
     std::io::stdout().write_all(v)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn debug_m4a() {
-        let (asc, aus) = extract_m4a(std::path::Path::new("/tmp/dbg_lf.m4a")).expect("extract");
-        eprintln!("ASC {} bytes: {:02x?}", asc.len(), &asc[..8]);
-        eprintln!("AUs: {} first {} bytes", aus.len(), aus[0].len());
-    }
 }

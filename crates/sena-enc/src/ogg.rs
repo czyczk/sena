@@ -8,7 +8,6 @@ pub fn extract_opus(ogg: &[u8]) -> Result<(Vec<u8>, u16, Vec<Vec<u8>>), Error> {
     let mut packets: Vec<Vec<u8>> = vec![];
     let mut pos = 0usize;
     let mut cur = Vec::new();
-    let mut segs_left = 0usize;
     while pos + 27 <= ogg.len() {
         if &ogg[pos..pos + 4] != b"OggS" {
             return Err(Error::Format("bad ogg page".into()));
@@ -23,13 +22,10 @@ pub fn extract_opus(ogg: &[u8]) -> Result<(Vec<u8>, u16, Vec<Vec<u8>>), Error> {
                 return Err(Error::Format("ogg page truncated".into()));
             }
             cur.extend_from_slice(&ogg[body..body + l]);
-            segs_left += 1;
             body += l;
             if l < 255 {
                 // packet complete
-                let p = std::mem::take(&mut cur);
-                packets.push(p);
-                segs_left = 0;
+                packets.push(std::mem::take(&mut cur));
             }
         }
         if hdr_type & 0x04 != 0 {

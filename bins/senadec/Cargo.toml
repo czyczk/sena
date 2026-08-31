@@ -1,0 +1,11 @@
+[package]
+name = "senadec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "Apache-2.0"
+description = "Sena decoder CLI."
+
+[dependencies]
+sena-core.workspace = true
+sena-dec.workspace = true

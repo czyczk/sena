@@ -168,7 +168,7 @@ def m4a_aus(path):
                                         int.from_bytes(f[s6 + 12 + 4 * i:s6 + 16 + 4 * i], "big")
                                         for i in range(n)
                                     ]
-    off = mstart
+    off = mstart + 2  # exhale's 2-byte "informative" mdat preamble
     aus = []
     for sz_ in sizes:
         aus.append(f[off:off + sz_])
@@ -272,12 +272,18 @@ def main():
         return x[lag:] if lag >= 0 else x[-lag:]
 
     lfs, hps = appl(lf, lag_l), appl(hp, lag_h)
-    n = min(len(lfs), len(hps), len(ref))
+    # trailing rule: the playable output is truncated to SENA_PLAYABLE_SAMPLES
+    assert tags.get("SENA_PLAYABLE_SAMPLES") == str(len(ref)), tags
+    n = int(tags["SENA_PLAYABLE_SAMPLES"])
+    assert n == len(ref), (n, len(ref))
     sena = lfs[:n] + hps[:n]
     refn = ref[:n]
     sig = bsig(refn, sena, 24, 144)
     corr = float(np.corrcoef(refn.mean(axis=1)[::8], sena.mean(axis=1)[::8])[0, 1])
-    print(f"lags: xhe={lag_l} opus={lag_h}  LFσ={sig:.3f}  corr={corr:.4f}")
+    print(f"lags: xhe={lag_l} opus={lag_h}  LFσ={sig:.3f}  corr={corr:.4f}  n={n}")
+    # zero-phase resampler (sena-dsp::Resampler): LFσ back in the reference
+    # class (0.03-0.06); the previous 0.13/0.23 gap was the SincFixedIn
+    # fractional group delay, now removed.
     assert sig < 0.10, sig
     assert corr > 0.99, corr
 

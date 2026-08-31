@@ -1,0 +1,21 @@
+[package]
+name = "sena-dec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "Apache-2.0"
+description = "Sena decoder core: demux, external codec adapters, trim/mix, C ABI, tags."
+
+[features]
+default = ["simd"]
+simd = ["opus-decoder/simd"]
+
+[dependencies]
+sena-core.workspace = true
+sena-dsp.workspace = true
+sena-mux.workspace = true
+opus-decoder.workspace = true
+rxaac-dec-lib.workspace = true
+
+[lib]
+crate-type = ["rlib", "staticlib"]
