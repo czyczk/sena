@@ -104,7 +104,7 @@ Standalone `senaenc` release builds (no `opusenc`/`exhale` needed at build
 time; they are runtime dependencies only):
 
 ```bash
-just senaenc                                        # Windows x64 + arm64 + macOS Universal -> ~/temp
+just senaenc                                        # Windows x64 + arm64 + macOS Universal -> build/senaenc
 just senaenc "linux-x64"                            # any supported alias/full Rust triple
 SENAENC_OUT=/tmp/x SENAENC_VS=2026 just senaenc     # env overrides
 just --set senaenc_out /tmp/x --set senaenc_vs 2022 senaenc
@@ -113,6 +113,10 @@ just senaenc-win-arm64
 just senaenc-macos-universal
 just senaenc-list-targets
 ```
+
+The default output directory is `build/senaenc` (repo-local; `/build/` is
+git-ignored). Pass `--out` / `SENAENC_OUT` / `--set senaenc_out ...` to write
+elsewhere; relative paths resolve against the repo root.
 
 Supported targets: `windows-x86`, `windows-x64`, `windows-arm64`,
 `windows-arm64ec`, `macos-x64`, `macos-arm64`, `macos-universal`,

@@ -6,7 +6,7 @@ set shell := ["bash", "-uc"]
 repo := justfile_directory()
 script := repo / "plugins" / "foobar2000" / "scripts" / "build.py"
 senaenc_script := repo / "scripts" / "build-senaenc.py"
-senaenc_out := env_var_or_default("SENAENC_OUT", "~/temp")
+senaenc_out := env_var_or_default("SENAENC_OUT", "build/senaenc")
 senaenc_vs := env_var_or_default("SENAENC_VS", "auto")
 senaenc_linker := env_var_or_default("SENAENC_LINKER", "auto")
 FOOBAR_SDK := env_var_or_default("FOOBAR_SDK", "~/src/public/foobar2000-research/SDK-2025-03-07")
@@ -41,12 +41,13 @@ install-foobar:
 
 # ---------------------------------------------------------------------------
 # Standalone senaenc release builds (no opusenc/exhale needed at build time).
-# Default: Windows x86-64 + Windows arm64 + macOS Universal into ~/temp.
+# Default: Windows x86-64 + Windows arm64 + macOS Universal into
+# build/senaenc (repo-local; /build/ is git-ignored).
 #
 # Usage:
 #   just senaenc                        # the three requested targets
 #   just senaenc "linux-x64"            # one or more supported aliases/triples
-#   SENAENC_OUT=/tmp/x just senaenc     # env override (also: --set senaenc_out ...)
+#   SENAENC_OUT=/tmp/x just senaenc     # output elsewhere via env (also: --set senaenc_out ...)
 #   SENAENC_VS=2022 just senaenc        # VS auto/2022/2026
 #   SENAENC_LINKER=xwin just senaenc    # auto/xwin/vs/cargo
 senaenc targets="windows-x64 windows-arm64 macos-universal":

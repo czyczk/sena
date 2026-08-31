@@ -21,10 +21,13 @@ Windows linker selection:
 
 --vs auto|2022|2026 selects the Visual Studio instance when VS is used.
 
-Output goes to --out (default ~/temp). On this WSL box the Linux ~/temp is on
-a read-only root mount, so the script detects that and, when WSL interop is
-available, delivers the files to the equivalent Windows profile temp
-directory (normally C:\\Users\\<you>\\temp) and prints the real location.
+Output goes to --out (default: build/senaenc in the repository root; /build/
+is git-ignored, so the binaries never dirty the working tree). Relative
+--out paths are resolved against the repo root. An explicit output path on
+a read-only mount (e.g. the WSL Linux ~/temp on this box) is detected and,
+when WSL interop is available, the files are delivered to the equivalent
+Windows profile temp directory (normally C:\\Users\\<you>\\temp) and the
+real location is printed.
 """
 
 import argparse
@@ -118,7 +121,7 @@ def ensure_rust_target(triple):
         ["rustc", "--print", "target-libdir", "--target", triple],
         env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
-    if r.returncode == 0:
+    if r.returncode == 0 and Path(r.stdout.strip()).exists():
         return
     raise SystemExit(
         f"error: Rust standard library for {triple} is not installed.\n"
@@ -466,7 +469,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--target", action="append", help="target alias or full Rust triple (repeatable)")
     ap.add_argument("target_args", nargs="*", help="target aliases/triples as positional arguments (justfile style)")
-    ap.add_argument("--out", default="~/temp", help="output directory (default: ~/temp)")
+    ap.add_argument("--out", default=str(ROOT / "build" / "senaenc"),
+                    help="output directory (default: build/senaenc in the repository; relative paths resolve against the repo root)")
     ap.add_argument("--vs", choices=["auto", "2022", "2026"], default="auto",
                     help="Visual Studio instance preference when VS linking is used")
     ap.add_argument("--linker", choices=["auto", "xwin", "vs", "cargo"], default="auto",
@@ -494,6 +498,9 @@ def main():
 
     STAGE.mkdir(parents=True, exist_ok=True)
     out = Path(os.path.expanduser(args.out))
+    if not out.is_absolute():
+        out = ROOT / out
+    out = out.resolve()
     delivered = []
     mac_slices = []
 
