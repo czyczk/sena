@@ -89,4 +89,26 @@ just all        # builds sena-dec libs + Windows x86/x64/arm64ec + macOS compone
 just test
 ```
 
+Standalone `senaenc` release builds (no `opusenc`/`exhale` needed at build
+time; they are runtime dependencies only):
+
+```bash
+just senaenc                                        # Windows x64 + arm64 + macOS Universal -> ~/temp
+just senaenc "linux-x64"                            # any supported alias/full Rust triple
+SENAENC_OUT=/tmp/x SENAENC_VS=2026 just senaenc     # env overrides
+just --set senaenc_out /tmp/x --set senaenc_vs 2022 senaenc
+just senaenc-win-x64
+just senaenc-win-arm64
+just senaenc-macos-universal
+just senaenc-list-targets
+```
+
+Supported targets: `windows-x86`, `windows-x64`, `windows-arm64`,
+`windows-arm64ec`, `macos-x64`, `macos-arm64`, `macos-universal`,
+`linux-x64`, `linux-arm64`, or the equivalent full Rust target triples.
+Unsupported targets fail with an explicit error. Windows linker modes are
+`auto` (real MSVC link.exe via VS when available, otherwise cargo-xwin),
+`xwin`, `vs`, and `cargo`; `--vs auto|2022|2026` selects the Visual Studio
+instance when VS linking is used.
+
 See `plugins/foobar2000/scripts/README.md` for per-host one-click details.
