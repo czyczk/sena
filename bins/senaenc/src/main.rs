@@ -1,7 +1,7 @@
 //! senaenc CLI.
 
 use sena_core::{account, Profile, MIN_TOTAL_KBPS, SENAV_THRESHOLD_KBPS};
-use sena_enc::{check_version, encode_bytes, exhale_version, opusenc_version, version_ge, EncoderConfig};
+use sena_enc::{check_version, exhale_version, opusenc_version, version_ge, EncoderConfig};
 use std::path::{Path, PathBuf};
 
 fn usage() -> ! {
@@ -230,18 +230,6 @@ fn main() {
     });
     let opusenc = opusenc.to_string_lossy().into_owned();
 
-    let input_bytes = if stdin_input {
-        use std::io::Read;
-        let mut buf = Vec::new();
-        if let Err(e) = std::io::stdin().read_to_end(&mut buf) {
-            eprintln!("error: reading stdin: {e}");
-            std::process::exit(1);
-        }
-        buf
-    } else {
-        Vec::new()
-    };
-
     let wd = std::env::temp_dir().join(format!("senaenc-{}", std::process::id()));
     let cfg = EncoderConfig {
         profile,
@@ -251,8 +239,11 @@ fn main() {
         opusenc: &opusenc,
         workdir: &wd,
     };
+    // Streaming encode: the input is consumed as the DSP makes progress, so
+    // feeding hosts (foobar2000 converter) see the real pipeline tempo.
     let result = if stdin_input {
-        encode_bytes(&cfg, &input_bytes, &output)
+        let mut stdin = std::io::stdin().lock();
+        sena_enc::encode_stream(&cfg, &mut stdin, &output)
     } else {
         sena_enc::encode(&cfg, &input, &output)
     };

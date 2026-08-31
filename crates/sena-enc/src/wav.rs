@@ -132,6 +132,207 @@ fn write_hdr(out: &mut Vec<u8>, rate: u32, ch: u16, bits: u16, data_len: usize) 
     out.extend_from_slice(&(data_len as u32).to_le_bytes());
 }
 
+/// Incremental WAV redder: feed bytes in arbitrary chunks, then take
+/// decoded interleaved frames. Header parsing waits until the fmt/data
+/// chunks are fully buffered; streaming data lengths (0 / 0xFFFFFFFF) run
+/// until EOF. Supported payloads: 8/16/24-bit PCM and IEEE float32.
+pub struct WavStream {
+    parsed: bool,
+    ch: usize,
+    rate: u32,
+    bits: usize,
+    fmt: u16,
+    buf: Vec<u8>, // after parse: data payload only
+}
+
+impl WavStream {
+    pub fn new() -> Self {
+        Self { parsed: false, ch: 0, rate: 0, bits: 0, fmt: 0, buf: Vec::new() }
+    }
+
+    /// Append bytes; tries to parse the header once enough is available.
+    pub fn feed(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        self.buf.extend_from_slice(bytes);
+        if !self.parsed {
+            self.try_parse()?;
+        }
+        Ok(())
+    }
+
+    fn try_parse(&mut self) -> Result<(), Error> {
+        let f = &self.buf;
+        if f.len() < 12 {
+            return Ok(()); // wait for more bytes
+        }
+        if &f[0..4] != b"RIFF" || &f[8..12] != b"WAVE" {
+            return Err(Error::Format("not a WAV file".into()));
+        }
+        let mut pos = 12;
+        let mut fmt_info: Option<(usize, u32, usize, u16)> = None;
+        let mut data = None;
+        while pos + 8 <= f.len() {
+            let id = &f[pos..pos + 4];
+            let sz = u32::from_le_bytes([f[pos + 4], f[pos + 5], f[pos + 6], f[pos + 7]]) as usize;
+            if id == b"data" {
+                data = Some(pos + 8);
+                break;
+            }
+            if pos + 8 + sz > f.len() {
+                return Ok(()); // chunk header not fully buffered yet
+            }
+            if id == b"fmt " && sz >= 16 {
+                // payload starts at pos + 8: fmtTag(2) ch(2) rate(4)
+                // byteRate(4) blockAlign(2) bits(2)
+                let fmt = u16::from_le_bytes([f[pos + 8], f[pos + 9]]);
+                let ch = u16::from_le_bytes([f[pos + 10], f[pos + 11]]) as usize;
+                let rate = u32::from_le_bytes([f[pos + 12], f[pos + 13], f[pos + 14], f[pos + 15]]);
+                let bits = u16::from_le_bytes([f[pos + 22], f[pos + 23]]) as usize;
+                fmt_info = Some((ch, rate, bits, fmt));
+            }
+            pos += 8 + sz + (sz & 1);
+        }
+        let (ch, rate, bits, fmt) = fmt_info.ok_or(Error::Format("no fmt chunk".into()))?;
+        let ds = data.ok_or(Error::Format("no data chunk".into()))?;
+        if ch == 0 || rate == 0 || bits / 8 * ch == 0 {
+            return Err(Error::Format("bad WAV header".into()));
+        }
+        self.parsed = true;
+        self.ch = ch;
+        self.rate = rate;
+        self.bits = bits;
+        self.fmt = fmt;
+        self.buf.drain(..ds);
+        Ok(())
+    }
+
+    pub fn parsed(&self) -> bool {
+        self.parsed
+    }
+
+    pub fn rate(&self) -> Option<u32> {
+        self.parsed.then_some(self.rate)
+    }
+
+    pub fn channels(&self) -> Option<usize> {
+        self.parsed.then_some(self.ch)
+    }
+
+    /// Decode up to `target_frames` complete frames from the buffered data.
+    /// Ok(None) when no complete frame is available; feed more or finish().
+    pub fn take(&mut self, target_frames: usize) -> Result<Option<Vec<f64>>, Error> {
+        if !self.parsed {
+            return Ok(None);
+        }
+        let block = self.bits / 8 * self.ch;
+        if self.buf.len() < block {
+            return Ok(None);
+        }
+        let n = (self.buf.len() / block).min(target_frames);
+        let mut out = Vec::with_capacity(n * self.ch);
+        match (self.fmt, self.bits) {
+            (1, 8) => {
+                for i in 0..n * self.ch {
+                    out.push((self.buf[i] as f64 - 128.0) / 128.0);
+                }
+            }
+            (1, 16) => {
+                for i in 0..n * self.ch {
+                    let v = i16::from_le_bytes([self.buf[2 * i], self.buf[2 * i + 1]]);
+                    out.push(v as f64 / 32768.0);
+                }
+            }
+            (1, 24) => {
+                for i in 0..n * self.ch {
+                    let b0 = self.buf[3 * i] as i32;
+                    let b1 = self.buf[3 * i + 1] as i32;
+                    let b2 = self.buf[3 * i + 2] as i32;
+                    let v = ((b0 | (b1 << 8) | (b2 << 16)) << 8) >> 8;
+                    out.push(v as f64 / 8_388_608.0);
+                }
+            }
+            (3, 32) => {
+                for i in 0..n * self.ch {
+                    let v = f32::from_le_bytes([
+                        self.buf[4 * i],
+                        self.buf[4 * i + 1],
+                        self.buf[4 * i + 2],
+                        self.buf[4 * i + 3],
+                    ]);
+                    out.push(v as f64);
+                }
+            }
+            _ => return Err(Error::Format(format!("unsupported WAV format {} {}bit", self.fmt, self.bits))),
+        }
+        self.buf.drain(..n * block);
+        Ok(Some(out))
+    }
+
+    /// Signal end of input: a trailing partial frame is dropped, like the
+    /// batch reader (which floors by the block size).
+    pub fn finish(&self) -> Result<(), Error> {
+        if !self.parsed {
+            return Err(Error::Format("no WAV header".into()));
+        }
+        Ok(())
+    }
+}
+
+/// Streaming WAV writer: writes a placeholder header, appends interleaved
+/// f64 samples (s16 or f32), patches the RIFF/data sizes on finish.
+pub struct WavWriter {
+    f: std::fs::File,
+    bits: usize,
+    body: u64,
+}
+
+impl WavWriter {
+    pub fn create(path: &std::path::Path, rate: u32, bits: u16, ch: u16) -> Result<Self, Error> {
+        use std::io::{Seek, Write};
+        let mut f = std::fs::File::create(path)?;
+        let mut hdr = Vec::new();
+        write_hdr(&mut hdr, rate, ch, bits, 0);
+        f.write_all(&hdr)?;
+        f.seek(std::io::SeekFrom::End(0))?;
+        Ok(Self { f, bits: bits as usize, body: 0 })
+    }
+
+    pub fn push(&mut self, x: &[f64]) -> Result<(), Error> {
+        use std::io::Write;
+        let mut out = Vec::with_capacity(x.len() * (self.bits / 8));
+        match self.bits {
+            16 => {
+                for &v in x {
+                    let s = (v.clamp(-1.0, 1.0) * 32767.0).round() as i16;
+                    out.extend_from_slice(&s.to_le_bytes());
+                }
+            }
+            32 => {
+                for &v in x {
+                    out.extend_from_slice(&(v as f32).to_le_bytes());
+                }
+            }
+            _ => unreachable!("unsupported output bits"),
+        }
+        self.f.write_all(&out)?;
+        self.body += out.len() as u64;
+        Ok(())
+    }
+
+    /// Patch the RIFF and data chunk sizes now that the body length is known.
+    pub fn finish(mut self) -> Result<(), Error> {
+        use std::io::{Seek, Write};
+        let total = self.body + 36;
+        let mut patch = Vec::new();
+        patch.extend_from_slice(&(total as u32).to_le_bytes());
+        patch.extend_from_slice(&(self.body as u32).to_le_bytes());
+        self.f.seek(std::io::SeekFrom::Start(4))?;
+        self.f.write_all(&patch[..4])?;
+        self.f.seek(std::io::SeekFrom::Start(40))?;
+        self.f.write_all(&patch[4..])?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

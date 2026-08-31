@@ -1,7 +1,6 @@
 //! sena-enc: pipeline orchestration (WAV IO, subprocess drivers, packet extraction).
 
 use sena_core::{Profile, PRE_GAIN, SAMPLE_RATE};
-use sena_dsp::split;
 use sena_mux::mka::{self, Frame, Track};
 use std::io::Write;
 use std::path::Path;
@@ -178,41 +177,155 @@ pub fn check_exhale(path: &str) -> Result<(), Error> {
 }
 
 pub fn encode(cfg: &EncoderConfig, input: &Path, output: &Path) -> Result<(), Error> {
-    let bytes = std::fs::read(input)?;
-    encode_bytes(cfg, &bytes, output)
+    let mut f = std::fs::File::open(input)?;
+    encode_stream(cfg, &mut f, output)
 }
 
 pub fn encode_bytes(cfg: &EncoderConfig, input: &[u8], output: &Path) -> Result<(), Error> {
-    // --- read input WAV (any sample rate; stdin-safe via encode_bytes) ---
-    let (x, ch, in_rate) = wav::read_f64_bytes(input)?;
-    if ch != 2 {
-        return Err(Error::Format(format!("expected stereo input, got {ch} ch")));
-    }
-    // --- normalize the input rate to 48 kHz (zero-phase rational resampler) ---
-    let x48: Vec<f64> = if in_rate == SAMPLE_RATE {
-        x
-    } else {
-        sena_dsp::Resampler::new(in_rate, SAMPLE_RATE).process(&x, ch)
-    };
-    let x = x48;
-    let n = x.len() / 2;
+    let mut bytes = input;
+    encode_stream(cfg, &mut bytes, output)
+}
 
-    // --- split & pad ---
-    let (low, high) = split(&x, 2, cfg.profile.crossover_hz());
-    let pad = |b: &[f64]| -> Vec<f64> { b.iter().map(|v| v * PRE_GAIN).collect() };
-    let low_p = pad(&low);
-    let high_p = pad(&high);
+/// Full encode pipeline over a streaming input (stdin-safe).
+///
+/// The WAV is parsed incrementally and pushed through the streaming DSP
+/// (rate normalize -> crossover split -> LF downsample) chunk by chunk,
+/// writing the two codec-input WAVs as the input arrives. This keeps the
+/// memory bounded and makes the input consumption rate track the actual
+/// work, so a feeding host (foobar2000 converter) drives its progress bar
+/// with the real pipeline instead of racing to 100% while senaenc then
+/// does all the work.
+pub fn encode_stream<R: std::io::Read>(
+    cfg: &EncoderConfig,
+    input: &mut R,
+    output: &Path,
+) -> Result<(), Error> {
+    use sena_dsp::{CrossoverStream, StreamResampler};
 
-    // --- downsample low band 48k -> lf rate (zero-phase rational resampler) ---
-    let low16 = sena_dsp::Resampler::new(SAMPLE_RATE, cfg.profile.lf_rate()).process(&low_p, 2);
-
-    // --- write temp WAVs ---
     let wd = cfg.workdir;
     std::fs::create_dir_all(wd)?;
+
+    let mut ws = wav::WavStream::new();
+    let mut norm: Option<StreamResampler> = None;
+    let mut split_s: Option<CrossoverStream> = None;
+    let mut lf_rs: Option<StreamResampler> = None;
+    let mut lf_wr: Option<wav::WavWriter> = None;
+    let mut hf_wr: Option<wav::WavWriter> = None;
+    let mut ch = 2usize;
+    let mut byte_buf = [0u8; 262_144];
+    let mut eof = false;
+
+    loop {
+        if norm.is_none() {
+            if !ws.parsed() {
+                if eof {
+                    return Err(Error::Format("no WAV header".into()));
+                }
+                let n = input.read(&mut byte_buf).map_err(Error::Io)?;
+                if n == 0 {
+                    eof = true;
+                    continue;
+                }
+                ws.feed(&byte_buf[..n])?;
+                continue;
+            }
+            // header is parsed: initialize the pipeline
+            let in_rate = ws.rate().unwrap();
+            ch = ws.channels().unwrap();
+            if ch != 2 {
+                return Err(Error::Format(format!("expected stereo input, got {ch} ch")));
+            }
+            let lf_rate = cfg.profile.lf_rate();
+            norm = Some(StreamResampler::new(in_rate, SAMPLE_RATE));
+            split_s = Some(CrossoverStream::new(cfg.profile.crossover_hz()));
+            lf_rs = Some(StreamResampler::new(SAMPLE_RATE, lf_rate));
+            lf_wr = Some(wav::WavWriter::create(&wd.join("lf.wav"), lf_rate, 16, 2)?);
+            hf_wr = Some(wav::WavWriter::create(&wd.join("hf.wav"), SAMPLE_RATE, 32, 2)?);
+            continue;
+        }
+
+        match ws.take(48_000)? {
+            Some(x) => push_chunk(
+                &x,
+                ch,
+                norm.as_mut().unwrap(),
+                split_s.as_mut().unwrap(),
+                lf_rs.as_mut().unwrap(),
+                lf_wr.as_mut().unwrap(),
+                hf_wr.as_mut().unwrap(),
+            )?,
+            None => {
+                if eof {
+                    break;
+                }
+                let n = input.read(&mut byte_buf).map_err(Error::Io)?;
+                if n == 0 {
+                    eof = true;
+                } else {
+                    ws.feed(&byte_buf[..n])?;
+                }
+            }
+        }
+    }
+    ws.finish()?;
+
+    // Flush the pipeline latencies (normalize tail -> split tail -> LF tail).
+    let mut norm = norm.unwrap();
+    let mut split_s = split_s.unwrap();
+    let mut lf_rs = lf_rs.unwrap();
+    let mut lf_wr = lf_wr.unwrap();
+    let mut hf_wr = hf_wr.unwrap();
+    let playable = norm.output_frames_total();
+    let n48_tail = norm.finish(ch);
+    let (low_a, high_a) = split_s.push(&n48_tail, ch);
+    let (low_b, high_b) = split_s.finish(ch);
+
+    let low_p: Vec<f64> = low_a.iter().chain(low_b.iter()).map(|v| v * PRE_GAIN).collect();
+    let lf16 = lf_rs.push(&low_p, ch);
+    lf_wr.push(&lf16)?;
+    let lf16b = lf_rs.finish(ch);
+    lf_wr.push(&lf16b)?;
+    let high_p: Vec<f64> = high_a.iter().chain(high_b.iter()).map(|v| v * PRE_GAIN).collect();
+    hf_wr.push(&high_p)?;
+    lf_wr.finish()?;
+    hf_wr.finish()?;
+
+    run_codecs(cfg, wd, playable, output)
+}
+
+/// One chunk through normalize -> split -> pad -> LF downsample -> writers.
+fn push_chunk(
+    x: &[f64],
+    ch: usize,
+    norm: &mut sena_dsp::StreamResampler,
+    split_s: &mut sena_dsp::CrossoverStream,
+    lf_rs: &mut sena_dsp::StreamResampler,
+    lf_wr: &mut wav::WavWriter,
+    hf_wr: &mut wav::WavWriter,
+) -> Result<(), Error> {
+    let n48 = norm.push(x, ch);
+    let (low, high) = split_s.push(&n48, ch);
+    if !low.is_empty() {
+        let low_p: Vec<f64> = low.iter().map(|v| v * PRE_GAIN).collect();
+        let lf16 = lf_rs.push(&low_p, ch);
+        lf_wr.push(&lf16)?;
+    }
+    if !high.is_empty() {
+        let high_p: Vec<f64> = high.iter().map(|v| v * PRE_GAIN).collect();
+        hf_wr.push(&high_p)?;
+    }
+    Ok(())
+}
+
+/// Encode the two temp WAVs, extract the streams and mux the container.
+fn run_codecs(
+    cfg: &EncoderConfig,
+    wd: &Path,
+    playable: usize,
+    output: &Path,
+) -> Result<(), Error> {
     let lf_wav = wd.join("lf.wav");
-    wav::write_s16(&lf_wav, &low16, cfg.profile.lf_rate())?;
     let hf_wav = wd.join("hf.wav");
-    wav::write_f32(&hf_wav, &high_p, SAMPLE_RATE)?;
 
     // --- encode ---
     let lf_m4a = wd.join("lf.m4a");
@@ -301,13 +414,14 @@ pub fn encode_bytes(cfg: &EncoderConfig, input: &[u8], output: &Path) -> Result<
     }
     let profile_tag = cfg.profile.crossover_hz().to_string();
     let version_tag = "1".to_string();
-    let playable_tag = n.to_string(); // input length in 48 kHz stereo frames
+    // input length in 48 kHz stereo frames (the normalized source timeline)
+    let playable_tag = playable.to_string();
     let tags: Vec<(&str, &str)> = vec![
         ("SENA_PROFILE", &profile_tag),
         ("SENA_VERSION", &version_tag),
         ("SENA_PLAYABLE_SAMPLES", &playable_tag),
     ];
-    let playable_ns = (n as u64) * 1_000_000_000 / SAMPLE_RATE as u64;
+    let playable_ns = (playable as u64) * 1_000_000_000 / SAMPLE_RATE as u64;
     let mka_bytes = mka::write_mka(&tracks, frames, &tags, 1000, playable_ns);
     std::fs::write(output, mka_bytes)?;
     Ok(())
@@ -573,5 +687,110 @@ mod tests {
         assert!(!version_ge("1.2.1", "1.2.2"));
         assert!(!version_ge("1.1.9", "1.2.2"));
         assert!(!version_ge("1.2RC", "1.2.2"));
+    }
+
+    fn synth_wav(secs: usize, rate: u32, stream_len: bool) -> Vec<u8> {
+        // Stereo s16 PCM: RIFF/WAVE/fmt/data with a streaming data length
+        // (0xFFFFFFFF) when `stream_len`, else the real length.
+        let frames = secs * rate as usize;
+        let data_len = frames * 4usize;
+        let mut w = Vec::new();
+        w.extend_from_slice(b"RIFF");
+        w.extend_from_slice(&((36 + data_len) as u32).to_le_bytes());
+        w.extend_from_slice(b"WAVEfmt ");
+        w.extend_from_slice(&16u32.to_le_bytes());
+        w.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        w.extend_from_slice(&2u16.to_le_bytes()); // stereo
+        w.extend_from_slice(&rate.to_le_bytes());
+        w.extend_from_slice(&(rate * 4).to_le_bytes());
+        w.extend_from_slice(&4u16.to_le_bytes());
+        w.extend_from_slice(&16u16.to_le_bytes());
+        w.extend_from_slice(b"data");
+        w.extend_from_slice(&(if stream_len { 0xFFFF_FFFFu32 } else { data_len as u32 }).to_le_bytes());
+        for i in 0..frames {
+            let t = i as f64 / rate as f64;
+            let l = (2.0 * std::f64::consts::PI * 220.0 * t).sin() as i16;
+            let r = (0.6 * (2.0 * std::f64::consts::PI * 440.0 * t).sin()) as i16;
+            w.extend_from_slice(&l.to_le_bytes());
+            w.extend_from_slice(&r.to_le_bytes());
+        }
+        w
+    }
+
+    #[test]
+    fn wav_stream_matches_batch_reader() {
+        for stream_len in [false, true] {
+            let bytes = synth_wav(3, 44100, stream_len);
+            let (batch, ch, rate) = wav::read_f64_bytes(&bytes).unwrap();
+            // feed in odd-sized chunks
+            let mut ws = wav::WavStream::new();
+            for chunk in bytes.chunks(997) {
+                ws.feed(chunk).unwrap();
+            }
+            ws.finish().unwrap();
+            assert_eq!((ch, rate), (2, 44100));
+            let mut got = Vec::new();
+            loop {
+                match ws.take(4096).unwrap() {
+                    Some(x) => got.extend(x),
+                    None => break,
+                }
+            }
+            assert_eq!(got.len(), batch.len());
+            let maxe = got
+                .iter()
+                .zip(batch.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f64::max);
+            assert!(maxe < 1e-9, "stream reader vs batch error {maxe}");
+        }
+    }
+
+    #[test]
+    fn stream_dsp_matches_batch_dsp() {
+        // Drive encode_stream far enough to write the temp band WAVs (the
+        // codec step then fails on the fake exhale path), and compare those
+        // against the batch DSP written by hand.
+        let src = synth_wav(3, 44100, true);
+        let wd = std::env::temp_dir().join(format!("sena-enc-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&wd);
+        let cfg = EncoderConfig {
+            profile: Profile::At300,
+            total_kbps: 160,
+            use_senav: false,
+            exhale: "/nonexistent/exhale",
+            opusenc: "/nonexistent/opusenc",
+            workdir: &wd,
+        };
+        let mut bytes = &src[..];
+        let out = wd.join("out.sena");
+        let err = encode_stream(&cfg, &mut bytes, &out);
+        assert!(err.is_err(), "expected codec-step failure, got {err:?}");
+
+        // Reference: the same DSP via the batch functions.
+        let (x, ch, in_rate) = wav::read_f64_bytes(&src).unwrap();
+        assert_eq!(ch, 2);
+        let x48 = sena_dsp::Resampler::new(in_rate, SAMPLE_RATE).process(&x, ch);
+        let (low, high) = sena_dsp::split(&x48, 2, 300.0);
+        let low_p: Vec<f64> = low.iter().map(|v| v * PRE_GAIN).collect();
+        let low16 = sena_dsp::Resampler::new(SAMPLE_RATE, 16000).process(&low_p, 2);
+        let high_p: Vec<f64> = high.iter().map(|v| v * PRE_GAIN).collect();
+        let ref_lf = wd.join("ref_lf.wav");
+        let ref_hf = wd.join("ref_hf.wav");
+        wav::write_s16(&ref_lf, &low16, 16000).unwrap();
+        wav::write_f32(&ref_hf, &high_p, SAMPLE_RATE).unwrap();
+
+        let lf = wav::read_f64(&wd.join("lf.wav")).unwrap().0;
+        let hf = wav::read_f64(&wd.join("hf.wav")).unwrap().0;
+        let (rlf, _, _) = wav::read_f64(&ref_lf).unwrap();
+        let (rhf, _, _) = wav::read_f64(&ref_hf).unwrap();
+        assert_eq!(lf.len(), rlf.len(), "LF lengths differ");
+        assert_eq!(hf.len(), rhf.len(), "HF lengths differ");
+        // s16 quantization: allow 1 LSB; f32 path: allow 1e-6.
+        let ml = lf.iter().zip(rlf.iter()).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+        let mh = hf.iter().zip(rhf.iter()).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+        assert!(ml <= 1.0 / 32768.0 + 1e-9, "LF max diff {ml}");
+        assert!(mh < 1e-6, "HF max diff {mh}");
+        let _ = std::fs::remove_dir_all(&wd);
     }
 }

@@ -25,6 +25,10 @@ senaenc [--profile 300|600] [--opus-original|--opus-senav] <bitrate_kbps> <in.wa
 - Input WAV may be 8/16/24-bit PCM or 32-bit IEEE float, any sample rate
   (24k, 32k, 44.1k, 48k, 88.2k, 96k, ...). senaenc normalizes it to 48 kHz
   with a zero-phase rational resampler before the crossover.
+- The input is consumed incrementally: the decode-resample-split-downsample
+  pipeline runs chunk by chunk while the input arrives (so a feeding host
+  such as the foobar2000 converter sees its progress bar advance with the
+  real work), then the two codec inputs (lf.wav / hf.wav) are encoded.
 - Required binaries next to `senaenc.exe` or on PATH:
   - `exhale[.exe]` >= 1.2.2
   - `opusenc[.exe]` >= 1.6.1 (used for <= 192 kbit/s by default)
