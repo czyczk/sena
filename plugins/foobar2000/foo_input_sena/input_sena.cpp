@@ -164,6 +164,7 @@ void input_sena::retag(const file_info &info, abort_callback &abort) {
     m_file->reopen(abort);
 
     pfc::list_t<SenaMetaEntry> entries;
+    pfc::list_t<SenaMetaEntry> meta_rg_entries; // RG arriving as plain meta
     t_size skipped = 0;
     t_size rg_written = 0;
     info.meta_enumerate([&](const char *key, const char *value) {
@@ -176,9 +177,13 @@ void input_sena::retag(const file_info &info, abort_callback &abort) {
             skipped++;
             return;
         }
-        // ReplayGain values travel in file_info's info (replaygain_info),
-        // not in meta; some sources also carry the meta form - keep meta
-        // entries as-is (they are the same strings).
+        // ReplayGain may arrive in meta (transferred tags) AND in the info
+        // section (fresh scan) at the same time; collect both and dedupe
+        // below with the info section winning.
+        if (replaygain_info::g_is_meta_replaygain(key, strlen(key))) {
+            meta_rg_entries.add_item(SenaMetaEntry{key, value});
+            return;
+        }
         entries.add_item(SenaMetaEntry{key, value});
     });
     // ReplayGain: foobar stores these in the info section (replaygain_info);
@@ -192,6 +197,21 @@ void input_sena::retag(const file_info &info, abort_callback &abort) {
         rg_values.add_item(value);
         rg_written++;
     });
+    auto rg_key_present = [&](const char *key) {
+        for (t_size i = 0; i < rg_names.get_count(); i++) {
+            if (stricmp_utf8(rg_names[i], key) == 0) return true;
+        }
+        return false;
+    };
+    // The info section is authoritative (fresh scan); meta-form RG is kept
+    // only for keys the info section does not provide (pure tag transfers).
+    for (t_size i = 0; i < meta_rg_entries.get_count(); i++) {
+        const char *key = meta_rg_entries[i].key;
+        const char *value = meta_rg_entries[i].value;
+        if (!rg_key_present(key)) {
+            entries.add_item(SenaMetaEntry{key, value});
+        }
+    }
     for (t_size i = 0; i < rg_names.get_count(); i++) {
         entries.add_item(SenaMetaEntry{rg_names[i].get_ptr(), rg_values[i].get_ptr()});
     }
