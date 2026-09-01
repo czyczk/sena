@@ -17,7 +17,7 @@ use sena_dsp::Resampler;
 use crate::demux::Demuxed;
 use crate::pipeline::{
     DecodeError, DecodedInfo, LfAuInfo, OpusPacketInfo, ReadInfo, SAMPLE_RATE,
-    XHE_TRIM_CORE_SAMPLES, add_bits_interval, parse_opus_head,
+    add_bits_interval, parse_opus_head,
 };
 
 const MIN_CHUNK_FRAMES: u64 = 4800; // 100 ms @48k
@@ -28,13 +28,26 @@ pub struct StreamingDecoder {
     pub warnings: Vec<String>,
     cursor: u64,
     state: Option<State>,
+    /// Absolute frame index of `bits_prefix[0]` (bits_prefix only covers
+    /// frames produced since the last seek, to stay memory-bounded).
+    bits_base: u64,
     bits_prefix: Vec<f64>,
     last_read: ReadInfo,
 }
 
 struct State {
     lf_rate: u32,
-    pre_skip: usize,
+    /// Leading trim applied on the first produce/fill after (re)start: one
+    /// 1024-sample core frame at stream start; at a seek, the raw samples
+    /// from the jump AU up to the target frame. Reads the same as `first`.
+    lf_trim: usize,
+    hf_trim: usize,
+    /// Per-track AU/packet counters still to skip (seek jump without decode).
+    lf_skip_aus: usize,
+    hf_skip_pkts: usize,
+    /// Seek (true): keep the raw LF context before the trim point so the
+    /// zero-phase resampler has real audio instead of zeros (start: false).
+    lf_trim_after: bool,
     xdec: UsacDecoder,
     opus: OpusDecoder,
     frame_index: usize,
@@ -61,6 +74,7 @@ impl StreamingDecoder {
             warnings,
             cursor: 0,
             state: None,
+            bits_base: 0,
             bits_prefix: vec![0.0],
             last_read: ReadInfo::default(),
         })
@@ -90,7 +104,11 @@ impl StreamingDecoder {
         }
         self.state = Some(State {
             lf_rate,
-            pre_skip: opus_head.pre_skip as usize,
+            lf_trim: crate::pipeline::XHE_TRIM_CORE_SAMPLES,
+            hf_trim: opus_head.pre_skip as usize,
+            lf_skip_aus: 0,
+            hf_skip_pkts: 0,
+            lf_trim_after: false,
             xdec,
             opus,
             frame_index: 0,
@@ -120,6 +138,10 @@ impl StreamingDecoder {
         st.frame_index += 1;
         let lf_num = self.demux.track("A_SENALF").unwrap().number;
         if frame.track == lf_num {
+            if st.lf_skip_aus > 0 {
+                st.lf_skip_aus -= 1;
+                return Ok(true);
+            }
             // Decode into a scratch buffer so a panicking decoder can never
             // leave partial samples in the stream queue.
             let mut out: Vec<f32> = Vec::new();
@@ -155,6 +177,10 @@ impl StreamingDecoder {
             });
             st.lf_total_before += samples as i128;
         } else {
+            if st.hf_skip_pkts > 0 {
+                st.hf_skip_pkts -= 1;
+                return Ok(true);
+            }
             let mut buf = vec![0.0f32; 5760 * 2];
             let mut n = match st.opus.decode_float(Some(&frame.data), &mut buf, DecodeMode::Normal) {
                 Ok(n) => n,
@@ -180,7 +206,8 @@ impl StreamingDecoder {
     fn chunk_bits(
         &self,
         lf_rate: u32,
-        pre_skip: usize,
+        lf_trim: usize,
+        hf_trim: usize,
         lf_infos: &[LfAuInfo],
         opus_infos: &[OpusPacketInfo],
         start: u64,
@@ -189,14 +216,16 @@ impl StreamingDecoder {
         let n = (end - start) as usize;
         let mut delta = vec![0.0f64; n + 1];
         let base = start as i128;
+        // infos are relative to the raw stream start (AU skip counters and
+        // the leading trim keep them aligned with the playable timeline).
         for info in lf_infos {
-            let s_core = info.start_core - XHE_TRIM_CORE_SAMPLES as i128;
+            let s_core = info.start_core - lf_trim as i128;
             let s48 = s_core * 48_000 / lf_rate as i128;
             let e48 = (s_core + info.samples_core) * 48_000 / lf_rate as i128;
             add_bits_interval(&mut delta, n as i128, s48 - base, e48 - base, info.bits as f64);
         }
         for info in opus_infos {
-            let s = info.start_48k - pre_skip as i128;
+            let s = info.start_48k - hf_trim as i128;
             let e = s + info.samples_48k;
             add_bits_interval(&mut delta, n as i128, s - base, e - base, info.bits as f64);
         }
@@ -252,11 +281,11 @@ impl StreamingDecoder {
     fn produce_chunk(&mut self) -> Result<(), DecodeError> {
         let lf_skip = {
             let st = self.state.as_ref().unwrap();
-            if st.first { XHE_TRIM_CORE_SAMPLES } else { 0 }
+            if st.first { st.lf_trim } else { 0 }
         };
         let hf_skip = {
             let st = self.state.as_ref().unwrap();
-            if st.first { st.pre_skip } else { 0 }
+            if st.first { st.hf_trim } else { 0 }
         };
         let raw_empty = {
             let st = self.state.as_ref().unwrap();
@@ -275,12 +304,13 @@ impl StreamingDecoder {
             return Ok(());
         }
 
-        let (lf48, hf_after, take, start, rate, lf_consume_core) = {
+        let (lf48, lf_off, hf_after, take, start, rate, lf_consume_core) = {
             let st = self.state.as_ref().unwrap();
+            let trim_after = st.lf_trim_after;
             let lf_after: Vec<f64> = st
                 .lf_raw
                 .iter()
-                .skip(lf_skip * 2)
+                .skip(if trim_after { 0 } else { lf_skip * 2 })
                 .map(|&s| f64::from(s))
                 .collect();
             let hf_after: Vec<f64> = st
@@ -291,27 +321,38 @@ impl StreamingDecoder {
                 .collect();
             let resampler = Resampler::new(st.lf_rate, SAMPLE_RATE);
             let lf48 = resampler.process(&lf_after, 2);
-            let n = (lf48.len() / 2).min(hf_after.len() / 2);
+            // Seek: the pre-target raw stays as the resampler context; the
+            // corresponding output prefix is skipped after resampling.
+            let lf_off = if trim_after { resampler.output_frames(lf_skip) } else { 0 };
+            let n = (lf48.len() / 2).saturating_sub(lf_off).min(hf_after.len() / 2);
             let remaining = self.info.playable_frames.saturating_sub(st.produced);
-            let take = (n as u64).min(remaining) as usize;
-            if take == 0 {
-                return Ok(());
-            }
-            let lf_consume_core = resampler
-                .input_frames_for_output(take)
-                .ok_or_else(|| DecodeError::Codec(format!("LF resampler cannot consume {take} frames")))?
-                .min(lf_after.len() / 2);
+            let mut take = (n as u64).min(remaining) as usize;
+            // The rational ratio only represents some output counts exactly;
+            // trim up to 2 frames from the chunk so the resampler can map the
+            // raw count one-to-one (the frames are emitted by the next chunk).
+            let consume_core = loop {
+                if take == 0 {
+                    return Ok(());
+                }
+                if let Some(k) = resampler.input_frames_for_output(take) {
+                    break k;
+                }
+                take -= 1;
+            };
+            // Raw consumed for `take` outputs counted from the trimmed
+            // (seek) point; the pre-target raw stays as context.
+            let lf_consume_core = consume_core.min(lf_after.len() / 2);
             let start = st.produced;
             let end = start + take as u64;
-            let rate = self.chunk_bits(st.lf_rate, st.pre_skip, &st.lf_infos, &st.opus_infos, start, end);
-            (lf48, hf_after, take, start, rate, lf_consume_core)
+            let rate = self.chunk_bits(st.lf_rate, st.lf_trim, st.hf_trim, &st.lf_infos, &st.opus_infos, start, end);
+            (lf48, lf_off, hf_after, take, start, rate, lf_consume_core)
         };
 
         let gain = 1.0 / PRE_GAIN;
         let mut chunk_out = Vec::with_capacity(take * 2);
         for i in 0..take {
-            let lf = lf48[i * 2] * gain;
-            let r = lf48[i * 2 + 1] * gain;
+            let lf = lf48[(i + lf_off) * 2] * gain;
+            let r = lf48[(i + lf_off) * 2 + 1] * gain;
             let hl = hf_after[i * 2] * gain;
             let hr = hf_after[i * 2 + 1] * gain;
             chunk_out.push(lf + hl);
@@ -322,6 +363,8 @@ impl StreamingDecoder {
             let st = self.state.as_mut().unwrap();
             st.output.extend(chunk_out);
             st.produced = start + take as u64;
+            // The pre-target raw stays as resampler context on seeks; the
+            // consumed raw covers the trimmed part plus the take part.
             for _ in 0..(lf_skip + lf_consume_core) * 2 {
                 st.lf_raw.pop_front();
             }
@@ -358,12 +401,12 @@ impl StreamingDecoder {
                 let (ready, eof) = {
                     let st = self.state.as_ref().unwrap();
                     let lf_ready = {
-                        let trim = if st.first { XHE_TRIM_CORE_SAMPLES as i128 } else { 0 };
+                        let trim = if st.first { st.lf_trim as i128 } else { 0 };
                         let core = (st.lf_raw.len() / 2) as i128 - trim;
                         (core * 48_000 / st.lf_rate as i128).max(0) as u64
                     };
                     let hf_ready = {
-                        let trim = if st.first { st.pre_skip as i128 } else { 0 };
+                        let trim = if st.first { st.hf_trim as i128 } else { 0 };
                         ((st.hf_raw.len() / 2) as i128 - trim).max(0) as u64
                     };
                     (lf_ready.min(hf_ready), st.finished)
@@ -399,7 +442,7 @@ impl StreamingDecoder {
         }
         self.fill(want)?;
         let start = self.cursor;
-        let bits_start = self.bits_prefix[start as usize];
+        let bits_start = self.bits_prefix[(start - self.bits_base) as usize];
         let mut got = 0u64;
         {
             let st = self.state.as_mut().unwrap();
@@ -413,7 +456,7 @@ impl StreamingDecoder {
             }
         }
         self.cursor += got;
-        let bits_end = self.bits_prefix[self.cursor as usize];
+        let bits_end = self.bits_prefix[(self.cursor - self.bits_base) as usize];
         self.last_read = ReadInfo {
             start_frame: start,
             frames: got,
@@ -430,38 +473,74 @@ impl StreamingDecoder {
         self.cursor
     }
 
-    /// P0 seek is linear: rebuild the codec state and discard frames up to
-    /// the target, keeping any buffered frames at/after the target for the
-    /// next read. Cluster-level seeking is planned as a follow-up.
+    /// Jump seek: xHE-AAC streams mark independent random-access AUs with
+    /// the USAC independency flag (the first payload bit); a fresh decoder
+    /// started at such an AU is bit-exact with sequential decoding, so the
+    /// seek decodes only a handful of AUs instead of the whole prefix.
+    /// Opus packets are independent and jump directly by index.
     pub fn seek(&mut self, frame: u64) -> Result<(), DecodeError> {
         if frame > self.info.playable_frames {
             return Err(DecodeError::Format("seek past playable length".into()));
         }
-        if frame < self.cursor {
-            self.cursor = 0;
-            self.bits_prefix = vec![0.0];
-            self.state = None;
-            self.last_read = ReadInfo::default();
+        let f = frame as usize;
+        let lf_track = self.demux.track("A_SENALF").unwrap().clone();
+        let hf_track = self.demux.track("A_OPUS").unwrap().clone();
+        let lf_rate = lf_track.sample_rate.round() as u32;
+        // playable core c = f * lf_rate / 48000; the raw core at that point is
+        // c + 1024 (one warmup AU was trimmed at the stream start).
+        let c = (f as u128 * lf_rate as u128 / 48_000) as usize;
+        let target_raw_core = c + crate::pipeline::XHE_TRIM_CORE_SAMPLES;
+        let au = target_raw_core / crate::pipeline::XHE_TRIM_CORE_SAMPLES;
+        let mut start_au = self.prev_indep_au(au);
+        // The LF resampler needs ~1000 core samples of context before the
+        // target; step one independency further back when needed.
+        if start_au == au && start_au > 0 {
+            start_au = self.prev_indep_au(start_au - 1);
         }
-        while self.cursor < frame {
-            let available = self.state.as_ref().map_or(0, |st| (st.output.len() / 2) as u64);
-            if available == 0 {
-                let want = (frame - self.cursor).min(MIN_CHUNK_FRAMES);
-                self.fill(want)?;
-            }
-            let available = self.state.as_ref().map_or(0, |st| (st.output.len() / 2) as u64);
-            let take = available.min(frame - self.cursor);
-            if take == 0 {
-                break;
-            }
-            if let Some(st) = self.state.as_mut() {
-                for _ in 0..take * 2 {
-                    st.output.pop_front();
-                }
-            }
-            self.cursor += take;
+        let lf_trim = target_raw_core - start_au * crate::pipeline::XHE_TRIM_CORE_SAMPLES;
+
+        let pre_skip = parse_opus_head(&hf_track.codec_private)?.pre_skip as usize;
+        let j0 = (f + pre_skip) / 960;
+        let hf_trim = f + pre_skip - j0 * 960;
+
+        self.cursor = frame;
+        self.bits_base = frame;
+        self.bits_prefix = vec![0.0];
+        self.last_read = ReadInfo::default();
+        self.state = None;
+        self.init_state()?;
+        {
+            let st = self.state.as_mut().unwrap();
+            st.lf_trim = lf_trim;
+            st.hf_trim = hf_trim;
+            st.lf_skip_aus = start_au;
+            st.hf_skip_pkts = j0;
+            st.lf_trim_after = true;
         }
-        self.last_read = ReadInfo { start_frame: self.cursor, frames: 0, payload_bits: 0 };
         Ok(())
     }
+
+    /// Largest LF AU index <= `au` whose payload starts with the USAC
+    /// independency flag (bit 7 of the first byte), i.e. a bit-exact random
+    /// access point. AU 0 is by construction such a point.
+    fn prev_indep_au(&self, au: usize) -> usize {
+        let lf_num = self.demux.track("A_SENALF").unwrap().number;
+        let positions: Vec<usize> = self
+            .demux
+            .frames
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.track == lf_num)
+            .map(|(i, _)| i)
+            .collect();
+        let mut idx = au.min(positions.len().saturating_sub(1));
+        loop {
+            let f = &self.demux.frames[positions[idx]];
+            if f.data.first().map(|b| b >> 7 != 0).unwrap_or(false) || idx == 0 {
+                return idx;
+            }
+            idx -= 1;
+        }
+    }
+
 }

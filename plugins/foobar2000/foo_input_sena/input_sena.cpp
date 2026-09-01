@@ -162,6 +162,14 @@ void input_sena::retag(const file_info &info, abort_callback &abort) {
 
     pfc::list_t<SenaMetaEntry> entries;
     info.meta_enumerate([&](const char *key, const char *value) {
+        // Attached pictures (meta "PICTURE") carry binary payloads that
+        // Matroska string tags cannot hold; Matroska Attachments would be
+        // required. Skip them: the transfer then succeeds without pictures
+        // instead of failing with "error transferring attached pictures".
+        if (stricmp_utf8(key, "PICTURE") == 0) {
+            console::formatter() << "foo_input_sena: skipping attached picture (not supported in .sena tags);";
+            return;
+        }
         entries.add_item(SenaMetaEntry{key, value});
     });
 

@@ -195,6 +195,21 @@ where
     Ok(entries)
 }
 
+/// Filter out entries that cannot be represented as Matroska string tags:
+/// attached pictures (binary payload, would need Attachments) and values
+/// with NUL bytes or invalid UTF-8 (the C ABI cannot carry them correctly).
+fn sanitize_entries(entries: &[(String, String)]) -> Vec<(String, String)> {
+    entries
+        .iter()
+        .filter(|(k, v)| {
+            !k.eq_ignore_ascii_case("PICTURE")
+                && !v.as_bytes().contains(&0)
+                && std::str::from_utf8(v.as_bytes()).is_ok()
+        })
+        .cloned()
+        .collect()
+}
+
 /// Rewrite user metadata in a complete Sena file buffer.
 ///
 /// The first top-level `Tags` element is treated as immutable and is left
@@ -204,6 +219,7 @@ where
 /// empty), and the Segment size is re-patched with its original size-vint
 /// width. Cluster and Cue bytes are never moved.
 pub fn rewrite_user_tags(original: &[u8], entries: &[(String, String)]) -> Result<Vec<u8>, String> {
+    let entries = sanitize_entries(entries);
     let demux = Demuxed::parse(original.to_vec()).map_err(|e| e.to_string())?;
     let seg = demux.segment.clone();
     let mut out = original.to_vec();
@@ -217,7 +233,7 @@ pub fn rewrite_user_tags(original: &[u8], entries: &[(String, String)]) -> Resul
     }
 
     let old_payload_len = seg.payload_end - seg.payload_start;
-    let appended = if entries.is_empty() { Vec::new() } else { build_user_tags(entries) };
+    let appended = if entries.is_empty() { Vec::new() } else { build_user_tags(&entries) };
     let new_payload_len = old_payload_len + appended.len();
     let insert_at = seg.payload_end;
     out.splice(insert_at..insert_at, appended.iter().copied());
@@ -294,6 +310,41 @@ mod tests {
             ("ARTIST".to_string(), "zenas".to_string()),
         ]);
         assert!(served2 < tagged.len() / 10);
+    }
+
+    #[test]
+    fn picture_and_binary_entries_are_skipped() {
+        // foobar's attached-picture meta and any value with embedded NULs
+        // must not reach the Matroska tag strings; the write must succeed
+        // and the file must stay valid.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/e2e/01__p300__lfa__hf144.sena");
+        let original = std::fs::read(path).unwrap();
+        let mut pic = vec![0u8];
+        pic.extend_from_slice(b"image/jpeg\0");
+        pic.extend_from_slice(&[0xff, 0xd8, 0xff, 0xe0]);
+        let entries = vec![
+            ("TITLE".to_string(), "ok".to_string()),
+            ("PICTURE".to_string(), String::from_utf8_lossy(&pic).into_owned()),
+            ("BAD".to_string(), "a\0b".to_string()),
+        ];
+        let rewritten = rewrite_user_tags(&original, &entries).unwrap();
+        let check = Demuxed::parse(rewritten.clone()).unwrap();
+        assert_eq!(check.immutable_tag("SENA_PROFILE"), Some("300"));
+        assert_eq!(check.immutable_tag("SENA_PLAYABLE_SAMPLES"), Some("960000"));
+        let user: Vec<(String, String)> = check.tags.iter().skip(1).flat_map(|t| t.entries.clone()).collect();
+        assert_eq!(user, vec![("TITLE".to_string(), "ok".to_string())]);
+        // read-back via the scan path too
+        let mut served = 0usize;
+        let bytes = rewritten.clone();
+        let mut read_at = |pos: u64, len: usize| -> Result<Vec<u8>, String> {
+            served += len;
+            bytes.get(pos as usize..pos as usize + len).map(|s| s.to_vec()).ok_or_else(|| "range".into())
+        };
+        let back = scan_user_tags(&mut read_at).unwrap();
+        assert_eq!(back, vec![("TITLE".to_string(), "ok".to_string())]);
+        // the container must still decode
+        let dec = crate::pipeline::Decoder::open(&check).unwrap();
+        assert_eq!(dec.info().playable_frames, 960000);
     }
 
     #[test]
