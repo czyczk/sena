@@ -1,4 +1,5 @@
 //! Sena decoder core.
+pub mod attachments;
 pub mod demux;
 pub mod ffi;
 pub mod output;

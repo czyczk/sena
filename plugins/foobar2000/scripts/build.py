@@ -554,7 +554,7 @@ def _build_mac_slice(arch, sdk, sysroot, clang, ld, ar, ranlib, tmp, triples, ru
         run([str(ranlib), str(lib)])
     # plugin objects
     plug_objs = []
-    for srcname in ["input_sena.cpp", "main.cpp", "dynamic_bitrate_helper.cpp"]:
+    for srcname in ["input_sena.cpp", "album_art_sena.cpp", "main.cpp", "dynamic_bitrate_helper.cpp"]:
         obj = outroot / "sdk-objs" / f"{srcname}.o"
         run([str(clang), "-target", triple] + common + ["-c", str(PLUGIN / srcname), "-o", str(obj)])
         plug_objs.append(obj)

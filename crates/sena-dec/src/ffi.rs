@@ -68,6 +68,167 @@ pub struct SenaDecHandle {
     decoder: StreamingDecoder,
 }
 
+/// Album art (Matroska Attachments) access via the same callback file IO.
+pub struct SenaArtHandle {
+    names: Vec<Vec<u8>>,
+    mimes: Vec<Vec<u8>>,
+    datas: Vec<Vec<u8>>,
+}
+
+#[repr(C)]
+pub struct SenaArtInput {
+    pub name: *const c_char,
+    pub mime: *const c_char,
+    pub data: *const u8,
+    pub data_len: usize,
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sena_file_art_read(
+    io: *const SenaFileIo,
+    out: *mut *mut SenaArtHandle,
+    err: *mut c_char,
+    err_len: usize,
+) -> i32 {
+    let result = catch_unwind(AssertUnwindSafe(|| -> Result<*mut SenaArtHandle, String> {
+        if io.is_null() || out.is_null() {
+            return Err("invalid argument: NULL io/out".into());
+        }
+        let io = unsafe { &*io };
+        let bytes = unsafe { read_all_file(io) }?;
+        let demux = Demuxed::parse(bytes).map_err(|e| e.to_string())?;
+        let arts = crate::attachments::parse_attachments(&demux);
+        let mut names = Vec::new();
+        let mut mimes = Vec::new();
+        let mut datas = Vec::new();
+        for a in arts {
+            names.push(cstr_vec(&a.name));
+            mimes.push(cstr_vec(&a.mime));
+            datas.push(a.data);
+        }
+        Ok(Box::into_raw(Box::new(SenaArtHandle { names, mimes, datas })))
+    }));
+    match result {
+        Ok(Ok(h)) => {
+            unsafe { *out = h };
+            SENA_DEC_OK
+        }
+        Ok(Err(e)) => {
+            write_err(err, err_len, &e);
+            error_code(&e)
+        }
+        Err(_) => {
+            write_err(err, err_len, "internal panic");
+            SENA_DEC_ERR_DECODE
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sena_art_count(tags: *const SenaArtHandle) -> u32 {
+    if tags.is_null() {
+        return 0;
+    }
+    let t = unsafe { &*tags };
+    t.names.len() as u32
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sena_art_name(tags: *const SenaArtHandle, index: u32) -> *const c_char {
+    if tags.is_null() {
+        return ptr::null();
+    }
+    let t = unsafe { &*tags };
+    t.names.get(index as usize).map(|v| v.as_ptr().cast()).unwrap_or(ptr::null())
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sena_art_mime(tags: *const SenaArtHandle, index: u32) -> *const c_char {
+    if tags.is_null() {
+        return ptr::null();
+    }
+    let t = unsafe { &*tags };
+    t.mimes.get(index as usize).map(|v| v.as_ptr().cast()).unwrap_or(ptr::null())
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sena_art_data(tags: *const SenaArtHandle, index: u32) -> *const u8 {
+    if tags.is_null() {
+        return ptr::null();
+    }
+    let t = unsafe { &*tags };
+    t.datas.get(index as usize).map(|v| v.as_ptr()).unwrap_or(ptr::null())
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sena_art_data_len(tags: *const SenaArtHandle, index: u32) -> usize {
+    if tags.is_null() {
+        return 0;
+    }
+    let t = unsafe { &*tags };
+    t.datas.get(index as usize).map(|v| v.len()).unwrap_or(0)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sena_art_close(tags: *mut SenaArtHandle) {
+    if !tags.is_null() {
+        unsafe { drop(Box::from_raw(tags)) };
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sena_file_art_write(
+    io: *const SenaFileIo,
+    entries: *const SenaArtInput,
+    count: u32,
+    err: *mut c_char,
+    err_len: usize,
+) -> i32 {
+    let result = catch_unwind(AssertUnwindSafe(|| -> Result<(), String> {
+        if io.is_null() {
+            return Err("invalid argument: NULL io".into());
+        }
+        let mut arts = Vec::new();
+        if count > 0 {
+            if entries.is_null() {
+                return Err("invalid argument: NULL entries".into());
+            }
+            let slice = unsafe { std::slice::from_raw_parts(entries, count as usize) };
+            for e in slice {
+                if e.name.is_null() || e.mime.is_null() || (e.data.is_null() && e.data_len > 0) {
+                    return Err("invalid argument: NULL art entry field".into());
+                }
+                let name = unsafe { CStr::from_ptr(e.name) }.to_string_lossy().into_owned();
+                let mime = unsafe { CStr::from_ptr(e.mime) }.to_string_lossy().into_owned();
+                if name.is_empty() {
+                    return Err("invalid argument: empty art name".into());
+                }
+                let data = if e.data_len == 0 {
+                    Vec::new()
+                } else {
+                    unsafe { std::slice::from_raw_parts(e.data, e.data_len) }.to_vec()
+                };
+                arts.push(crate::attachments::Attachment::new(&name, &mime, data));
+            }
+        }
+        let io = unsafe { &*io };
+        let original = unsafe { read_all_file(io) }?;
+        let rewritten = crate::attachments::rewrite_attachments(&original, &arts)?;
+        unsafe { write_rewrite_tail(io, &original, &rewritten) }
+    }));
+    match result {
+        Ok(Ok(())) => SENA_DEC_OK,
+        Ok(Err(e)) => {
+            write_err(err, err_len, &e);
+            error_code(&e)
+        }
+        Err(_) => {
+            write_err(err, err_len, "internal panic");
+            SENA_DEC_ERR_DECODE
+        }
+    }
+}
+
 pub struct SenaTagsHandle {
     keys: Vec<Vec<u8>>,
     values: Vec<Vec<u8>>,

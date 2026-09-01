@@ -169,6 +169,12 @@ fn read_id(data: &[u8], pos: usize) -> Result<(&[u8], usize), DemuxError> {
     Ok((data.get(pos..end).ok_or(DemuxError::Truncated { context: "id" })?, len))
 }
 
+/// Public wrapper over the internal EBML element reader (used by the
+/// attachments/tags scanner helpers).
+pub fn read_elem_public(data: &[u8], pos: usize) -> Result<Elem, DemuxError> {
+    read_elem(data, pos)
+}
+
 fn read_elem(data: &[u8], pos: usize) -> Result<Elem, DemuxError> {
     let (_, id_len) = read_id(data, pos)?;
     let (size, size_len) = read_vint(data, pos + id_len)?;

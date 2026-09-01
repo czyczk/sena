@@ -117,6 +117,7 @@
     <ClCompile Include="input_sena.cpp" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="dynamic_bitrate_helper.cpp" />
+    <ClCompile Include="album_art_sena.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="input_sena.h" />

@@ -161,17 +161,22 @@ void input_sena::retag(const file_info &info, abort_callback &abort) {
     m_file->reopen(abort);
 
     pfc::list_t<SenaMetaEntry> entries;
+    t_size skipped = 0;
     info.meta_enumerate([&](const char *key, const char *value) {
-        // Attached pictures (meta "PICTURE") carry binary payloads that
-        // Matroska string tags cannot hold; Matroska Attachments would be
-        // required. Skip them: the transfer then succeeds without pictures
+        // Attached pictures reach the tag writer as "PICTURE" meta with a
+        // binary payload that Matroska string tags cannot hold; pictures
+        // are handled separately through the album_art_editor service
+        // (Matroska Attachments). Skip them so the transfer succeeds
         // instead of failing with "error transferring attached pictures".
         if (stricmp_utf8(key, "PICTURE") == 0) {
-            console::print("foo_input_sena: skipping attached picture (not supported in .sena tags)");
+            skipped++;
             return;
         }
         entries.add_item(SenaMetaEntry{key, value});
     });
+    pfc::string8 dbg;
+    dbg << "foo_input_sena: retag writing " << entries.get_count() << " entries (skipped " << skipped << " pictures)";
+    console::print(dbg);
 
     SenaFileIo io{};
     io.user_data = this;
@@ -267,13 +272,17 @@ void input_sena::read_user_tags(file_info &info, abort_callback &abort) {
     if (sena_file_read_tags(&io, &tags, errbuf, sizeof(errbuf)) != SENA_DEC_OK) {
         return;
     }
-    for (uint32_t i = 0; i < sena_tags_count(tags); ++i) {
+    uint32_t n = sena_tags_count(tags);
+    for (uint32_t i = 0; i < n; ++i) {
         const char *key = sena_tags_key(tags, i);
         const char *value = sena_tags_value(tags, i);
         if (key && value) {
             info.meta_add(key, value);
         }
     }
+    pfc::string8 dbg;
+    dbg << "foo_input_sena: read back " << n << " user tags";
+    console::print(dbg);
     sena_tags_close(tags);
     m_file->reopen(abort);
 }
