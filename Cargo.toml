@@ -23,4 +23,5 @@ sena-enc = { path = "crates/sena-enc" }
 sena-dec = { path = "crates/sena-dec" }
 rustfft = "6"
 opus-decoder = { path = "../ropus/crates/opus-decoder", default-features = false }
+sha2 = "0.10"
 rxaac-dec-lib = { path = "../rxaac-dec/crates/rxaac-dec-lib" }

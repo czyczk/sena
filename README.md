@@ -47,6 +47,11 @@ senaenc --profile 600 --opus-senav 192 - out.sena < in.wav
 senaenc doctor   # check the required/optional tools without encoding
 ```
 
+The container carries an `Audio SHA256` content hash (like FLAC's
+Audio MD5): SHA-256 of the normalized 48 kHz stereo float32 PCM (the
+playable timeline). It is shown in foobar2000's Properties (Details,
+next to Codec / Codec profile) and printed by `senadec --info`.
+
 `senaenc doctor` reports each tool's location and version without
 encoding: `exhale` and `opusenc` are required (missing, not runnable, or
 older than the baseline is fatal, exit code 4), while `opusenc-senav` is

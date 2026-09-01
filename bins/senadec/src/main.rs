@@ -143,6 +143,9 @@ fn run() -> Result<(), String> {
             info.playable_frames,
             info.playable_frames as f64 / info.sample_rate as f64
         );
+        if !info.audio_sha256.is_empty() {
+            eprintln!("info: audio-sha256={}", info.audio_sha256);
+        }
         return Ok(());
     }
 

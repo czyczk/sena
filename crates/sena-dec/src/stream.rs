@@ -81,7 +81,7 @@ impl StreamingDecoder {
     }
 
     pub fn info(&self) -> DecodedInfo {
-        self.info
+        self.info.clone()
     }
 
     fn init_state(&mut self) -> Result<(), DecodeError> {

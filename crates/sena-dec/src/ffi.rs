@@ -49,6 +49,8 @@ pub struct SenaDecInfo {
     pub playable_frames: u64,
     pub profile: u32,
     pub sena_version: u32,
+    /// SENA_AUDIO_SHA256 (64 hex chars + NUL); empty for files without it.
+    pub audio_sha256: [c_char; 65],
 }
 
 #[repr(C)]
@@ -421,7 +423,11 @@ pub unsafe extern "C" fn sena_dec_get_info(
     }
     let d = unsafe { &*dec };
     let i = d.decoder.info();
-    unsafe { *info = SenaDecInfo { sample_rate: i.sample_rate, channels: i.channels, playable_frames: i.playable_frames, profile: i.profile, sena_version: i.sena_version } };
+    let mut sha = [0 as c_char; 65];
+    for (k, c) in i.audio_sha256.as_bytes().iter().take(64).enumerate() {
+        sha[k] = *c as c_char;
+    }
+    unsafe { *info = SenaDecInfo { sample_rate: i.sample_rate, channels: i.channels, playable_frames: i.playable_frames, profile: i.profile, sena_version: i.sena_version, audio_sha256: sha } };
     SENA_DEC_OK
 }
 
@@ -500,7 +506,11 @@ pub unsafe extern "C" fn sena_dec_probe_info(
         let bytes = unsafe { read_all(io) }?;
         let demux = Demuxed::parse(bytes).map_err(|e| e.to_string())?;
         let (probe, _warnings) = crate::pipeline::probe(&demux).map_err(|e| e.to_string())?;
-        Ok(SenaDecInfo { sample_rate: probe.sample_rate, channels: probe.channels, playable_frames: probe.playable_frames, profile: probe.profile, sena_version: probe.sena_version })
+        let mut sha = [0 as c_char; 65];
+        for (k, c) in probe.audio_sha256.as_bytes().iter().take(64).enumerate() {
+            sha[k] = *c as c_char;
+        }
+        Ok(SenaDecInfo { sample_rate: probe.sample_rate, channels: probe.channels, playable_frames: probe.playable_frames, profile: probe.profile, sena_version: probe.sena_version, audio_sha256: sha })
     }));
     match result {
         Ok(Ok(i)) => {
@@ -745,7 +755,7 @@ mod tests {
         let mut err = [0u8; 256];
         assert_eq!(unsafe { sena_dec_open(&io, &mut handle, err.as_mut_ptr().cast(), err.len()) }, SENA_DEC_OK);
         assert!(!handle.is_null());
-        let mut info = SenaDecInfo { sample_rate: 0, channels: 0, playable_frames: 0, profile: 0, sena_version: 0 };
+        let mut info = SenaDecInfo { sample_rate: 0, channels: 0, playable_frames: 0, profile: 0, sena_version: 0, audio_sha256: [0; 65] };
         assert_eq!(unsafe { sena_dec_get_info(handle, &mut info) }, SENA_DEC_OK);
         assert_eq!((info.sample_rate, info.channels, info.playable_frames, info.profile), (48000, 2, 960000, 300));
 

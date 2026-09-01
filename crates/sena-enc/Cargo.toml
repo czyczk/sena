@@ -7,3 +7,4 @@ edition.workspace = true
 sena-core.workspace = true
 sena-dsp.workspace = true
 sena-mux.workspace = true
+sha2.workspace = true

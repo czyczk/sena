@@ -1,6 +1,7 @@
 //! sena-enc: pipeline orchestration (WAV IO, subprocess drivers, packet extraction).
 
 use sena_core::{Profile, PRE_GAIN, SAMPLE_RATE};
+use sha2::{Digest, Sha256};
 use sena_mux::mka::{self, Frame, Track};
 use std::io::Write;
 use std::path::Path;
@@ -216,6 +217,24 @@ pub fn encode_bytes(cfg: &EncoderConfig, input: &[u8], output: &Path) -> Result<
     encode_stream(cfg, &mut bytes, output)
 }
 
+/// Audio SHA-256 of the canonical audio content: the normalized 48 kHz
+/// stereo stream (interleaved f32, little-endian) - the exact playable
+/// timeline the file carries. Deterministic for the same source audio
+/// regardless of the input sample rate / bit depth.
+pub fn audio_sha256_of(pcm48: &[f64]) -> String {
+    let mut h = Sha256::new();
+    for &v in pcm48 {
+        h.update((v as f32).to_le_bytes());
+    }
+    let out = h.finalize();
+    let mut hex = String::with_capacity(64);
+    for b in out {
+        use std::fmt::Write;
+        let _ = write!(hex, "{b:02x}");
+    }
+    hex
+}
+
 /// Full encode pipeline over a streaming input (stdin-safe).
 ///
 /// The WAV is parsed incrementally and pushed through the streaming DSP
@@ -245,6 +264,7 @@ pub fn encode_stream<R: std::io::Read>(
     let mut ch = 2usize;
     let mut byte_buf = [0u8; 262_144];
     let mut eof = false;
+    let mut audio_hash = Sha256::new();
 
     loop {
         if norm.is_none() {
@@ -276,16 +296,21 @@ pub fn encode_stream<R: std::io::Read>(
         }
 
         match ws.take(48_000)? {
-            Some(x) => push_chunk(
-                &x,
-                ch,
-                norm.as_mut().unwrap(),
-                split_s.as_mut().unwrap(),
-                lf_rs.as_mut().unwrap(),
-                lf_wr.as_mut().unwrap(),
-                hf_wr.as_mut().unwrap(),
-                &mut st,
-            )?,
+            Some(x) => {
+                let n48 = push_chunk(
+                    &x,
+                    ch,
+                    norm.as_mut().unwrap(),
+                    split_s.as_mut().unwrap(),
+                    lf_rs.as_mut().unwrap(),
+                    lf_wr.as_mut().unwrap(),
+                    hf_wr.as_mut().unwrap(),
+                    &mut st,
+                )?;
+                for &v in &n48 {
+                    audio_hash.update((v as f32).to_le_bytes());
+                }
+            }
             None => {
                 if eof {
                     break;
@@ -310,6 +335,9 @@ pub fn encode_stream<R: std::io::Read>(
     let playable = norm.output_frames_total();
     st.begin();
     let n48_tail = norm.finish(ch);
+    for &v in &n48_tail {
+        audio_hash.update((v as f32).to_le_bytes());
+    }
     end_tick(&mut st.t, &mut st.norm);
     st.begin();
     let (low_a, high_a) = split_s.push(&n48_tail, ch);
@@ -331,7 +359,16 @@ pub fn encode_stream<R: std::io::Read>(
     lf_wr.finish()?;
     hf_wr.finish()?;
 
-    let result = run_codecs(cfg, wd, playable, output, &mut st);
+    let audio_sha256 = {
+        let out = audio_hash.finalize();
+        let mut hex = String::with_capacity(64);
+        for b in out {
+            use std::fmt::Write;
+            let _ = write!(hex, "{b:02x}");
+        }
+        hex
+    };
+    let result = run_codecs(cfg, wd, playable, output, &mut st, &audio_sha256);
     if result.is_ok() {
         st.report(playable);
     }
@@ -406,7 +443,7 @@ fn push_chunk(
     lf_wr: &mut wav::WavWriter,
     hf_wr: &mut wav::WavWriter,
     st: &mut StageTimes,
-) -> Result<(), Error> {
+) -> Result<Vec<f64>, Error> {
     st.begin();
     let n48 = norm.push(x, ch);
     end_tick(&mut st.t, &mut st.norm);
@@ -440,7 +477,7 @@ fn push_chunk(
             return Err(e);
         }
     }
-    Ok(())
+    Ok(n48)
 }
 
 /// Encode the two temp WAVs, extract the streams and mux the container.
@@ -450,6 +487,7 @@ fn run_codecs(
     playable: usize,
     output: &Path,
     st: &mut StageTimes,
+    audio_sha256: &str,
 ) -> Result<(), Error> {
     let lf_wav = wd.join("lf.wav");
     let hf_wav = wd.join("hf.wav");
@@ -566,6 +604,9 @@ fn run_codecs(
             ("SENA_PROFILE", &profile_tag),
             ("SENA_VERSION", &version_tag),
             ("SENA_PLAYABLE_SAMPLES", &playable_tag),
+            // Audio SHA-256: content hash of the normalized 48 kHz stereo
+            // f32 PCM (the playable timeline), FLAC Audio-MD5 style.
+            ("SENA_AUDIO_SHA256", audio_sha256),
         ];
         let playable_ns = (playable as u64) * 1_000_000_000 / SAMPLE_RATE as u64;
         let mka_bytes = mka::write_mka(&tracks, frames, &tags, 1000, playable_ns);
@@ -835,6 +876,28 @@ mod tests {
         assert!(!version_ge("1.2.1", "1.2.2"));
         assert!(!version_ge("1.1.9", "1.2.2"));
         assert!(!version_ge("1.2RC", "1.2.2"));
+    }
+
+    #[test]
+    fn audio_sha256_known_vector_and_determinism() {
+        // 1 s stereo linear ramp (no transcendental functions: exact across
+        // libraries); expected value computed independently in python
+        // (numpy float32 LE bytes -> sha256).
+        let mut x = Vec::with_capacity(48_000 * 2);
+        for i in 0..48_000 {
+            x.push(i as f64 / 1000.0);
+            x.push(i as f64 / 2000.0);
+        }
+        let h = audio_sha256_of(&x);
+        assert_eq!(
+            h,
+            "3b0c1537e33ad95d037a9bf15520ee5cd0cab5286aea89f788b4d68375fcacad"
+        );
+        assert_eq!(audio_sha256_of(&x), h, "must be deterministic");
+        // content, not layout: a shuffled copy hashes differently
+        let mut y = x.clone();
+        y.rotate_left(2);
+        assert_ne!(audio_sha256_of(&y), h);
     }
 
     fn synth_wav(secs: usize, rate: u32, stream_len: bool) -> Vec<u8> {

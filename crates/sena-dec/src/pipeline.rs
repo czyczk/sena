@@ -42,13 +42,16 @@ impl From<crate::demux::DemuxError> for DecodeError {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct DecodedInfo {
     pub sample_rate: u32,
     pub channels: u32,
     pub playable_frames: u64,
     pub profile: u32,
     pub sena_version: u32,
+    /// SENA_AUDIO_SHA256 tag (content hash of the normalized 48 kHz stereo
+    /// f32 PCM); empty for files that predate the tag.
+    pub audio_sha256: String,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -341,12 +344,17 @@ pub fn probe(demux: &Demuxed) -> Result<(DecodedInfo, Vec<String>), DecodeError>
     AudioSpecificConfig::parse(&lf_track.codec_private)
         .map_err(|e| DecodeError::Format(format!("ASC parse: {e}")))?;
 
+    let audio_sha256 = demux
+        .immutable_tag("SENA_AUDIO_SHA256")
+        .unwrap_or("")
+        .to_string();
     Ok((DecodedInfo {
         sample_rate: SAMPLE_RATE,
         channels: 2,
         playable_frames: playable,
         profile: profile_num,
         sena_version: version_num,
+        audio_sha256,
     }, warnings))
 }
 
@@ -457,6 +465,10 @@ pub fn decode(demux: &Demuxed) -> Result<Decoded, DecodeError> {
 
     let (_rate_per_frame, bits_total) = build_bit_accounting(playable, &lf_infos, core_rate, &opus_infos, hf_skip);
 
+    let audio_sha256 = demux
+        .immutable_tag("SENA_AUDIO_SHA256")
+        .unwrap_or("")
+        .to_string();
     Ok(Decoded {
         info: DecodedInfo {
             sample_rate: SAMPLE_RATE,
@@ -464,6 +476,7 @@ pub fn decode(demux: &Demuxed) -> Result<Decoded, DecodeError> {
             playable_frames: playable,
             profile: profile_num,
             sena_version: version_num,
+            audio_sha256,
         },
         pcm,
         lf_track_pcm,
@@ -475,7 +488,7 @@ pub fn decode(demux: &Demuxed) -> Result<Decoded, DecodeError> {
 
 impl Decoded {
     pub fn info(&self) -> DecodedInfo {
-        self.info
+        self.info.clone()
     }
     pub fn pcm_f64(&self) -> &[f64] {
         &self.pcm
@@ -498,7 +511,7 @@ impl Decoder {
     }
 
     pub fn info(&self) -> DecodedInfo {
-        self.decoded.info
+        self.decoded.info.clone()
     }
 
     pub fn warnings(&self) -> &[String] {

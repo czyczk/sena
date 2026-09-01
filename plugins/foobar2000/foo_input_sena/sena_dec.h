@@ -47,6 +47,7 @@ typedef struct {
     uint64_t playable_frames;
     uint32_t profile;
     uint32_t sena_version;
+    char audio_sha256[65]; /* SENA_AUDIO_SHA256, 64 hex + NUL; empty if absent */
 } SenaDecInfo;
 
 typedef struct {

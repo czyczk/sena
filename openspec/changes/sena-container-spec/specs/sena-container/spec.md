@@ -52,6 +52,23 @@ authority for trimming.
 - THEN both tracks expose CodecDelay matching the formulas above for the
   file's actual rates.
 
+### Requirement: Audio content hash
+The container SHALL carry a top-level tag `SENA_AUDIO_SHA256` whose value
+is the SHA-256 (64 lowercase hex characters) of the canonical audio
+content: the normalized 48 kHz stereo PCM stream (interleaved float32,
+little-endian) that represents the playable timeline. It is the FLAC
+Audio-MD5 equivalent for Sena: deterministic for the same source audio
+regardless of the input sample rate or bit depth (the input is
+normalized to 48 kHz before hashing). Files produced before the tag was
+introduced simply do not carry it.
+
+#### Scenario: Content hash present
+- GIVEN a Sena file encoded by a tag-aware encoder
+- THEN SENA_AUDIO_SHA256 is a 64-char hex SHA-256 of the normalized
+  48 kHz stereo f32 PCM (verifiable by re-computing from the source:
+  for a 48 kHz source it equals SHA-256 of the interleaved float32
+  samples).
+
 ### Requirement: Playable length metadata
 The container SHALL carry a top-level tag `SENA_PLAYABLE_SAMPLES` whose
 value is the playable length of the file in 48 kHz stereo frames, i.e.

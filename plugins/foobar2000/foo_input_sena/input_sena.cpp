@@ -67,6 +67,9 @@ void input_sena::get_info(file_info &info, abort_callback &abort) {
     info.info_set("encoding", "lossy");
     info.info_set("codec", "Sena");
     info.info_set("codec_profile", di.profile == 300 ? "xAAC-Opus@300" : "xAAC-Opus@600");
+    if (di.audio_sha256[0]) {
+        info.info_set("Audio SHA256", di.audio_sha256);
+    }
 
     if (m_file->can_seek()) {
         t_filesize size = m_file->get_size_ex(abort);
