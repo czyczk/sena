@@ -79,28 +79,6 @@ senadec-plugin-fb2k-all vs="auto":
 senadec-plugin-fb2k-install:
     @python3 "{{script}}" install
 
-# Legacy aliases (pre-namespaced names) -------------------------------------
-
-windows vs="auto":
-    @echo "deprecated: use senadec-plugin-fb2k-windows"
-    @python3 "{{script}}" windows --vs {{vs}}
-
-mac:
-    @echo "deprecated: use senadec-plugin-fb2k-mac"
-    @python3 "{{script}}" mac
-
-package:
-    @echo "deprecated: use senadec-plugin-fb2k-package"
-    @python3 "{{script}}" package
-
-all vs="auto":
-    @echo "deprecated: use senadec-plugin-fb2k-all"
-    @python3 "{{script}}" all --vs {{vs}}
-
-install-foobar:
-    @echo "deprecated: use senadec-plugin-fb2k-install"
-    @python3 "{{script}}" install
-
 # ---------------------------------------------------------------------------
 # senaenc release binaries (encoder CLI; no opusenc/exhale needed at build
 # time - runtime deps only). Default: Windows x64 + Windows arm64 + macOS

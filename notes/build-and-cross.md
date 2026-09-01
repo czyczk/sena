@@ -72,7 +72,7 @@ this Linux host; the binaries are structurally verified as above.
 
 ## One-click scripts (added 2026-08-31)
 
-- Unified: `just doctor` / `just all`; individual Python command surface in
+- Unified: `just doctor` / `just senadec-plugin-fb2k-all`; individual Python command surface in
   `plugins/foobar2000/scripts/build.py`.
 - Host wrappers: `build-windows.ps1`, `build-macos.sh`, `build-linux.sh`.
 - VS selection: vswhere-based, default prefers 2022 and falls back to 18
@@ -137,7 +137,7 @@ this Linux host; the binaries are structurally verified as above.
   already global, so chunk rates stay correct.
 - `cargo test --workspace` passes on Linux x86_64 after these changes
   (sena-dec 11/11).
-- Rebuilt `just all --vs 2022` after every Rust/C++ change (all three
+- Rebuilt `just senadec-plugin-fb2k-all --vs 2022` after every Rust/C++ change (all three
   Windows DLLs + universal macOS component + package). Package layout
   verified: root x86 DLL, `x64/`, `arm64ec/`,
   `mac/foo_input_sena.component`; all DLLs export
