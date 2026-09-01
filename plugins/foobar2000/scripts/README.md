@@ -4,7 +4,7 @@ Unified entry points (from repo root):
 
 | Host | Command | Produces |
 |---|---|---|
-| Linux / WSL | `just doctor` then `just all` | Windows x86 + x64 + ARM64EC DLLs, macOS universal component, `.fb2k-component` package |
+| Linux / WSL | `just doctor` then `just senadec-plugin-fb2k-all` | Windows x64 + ARM64EC DLLs, macOS universal component, `.fb2k-component` package |
 | Windows PowerShell | `.\plugins\foobar2000\scripts\build-windows.ps1` | Windows x86 + x64 + ARM64EC DLLs and package |
 | macOS | `./plugins/foobar2000/scripts/build-macos.sh` | universal `.component` and package |
 

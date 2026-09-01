@@ -27,3 +27,6 @@ __pycache__/
 #                  are ignored, except the .gitkeep placeholder.
 /bin/*
 !/bin/.gitkeep
+
+# transient cargo homes created by failure simulations
+/.cargo-empty/

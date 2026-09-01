@@ -339,6 +339,9 @@ def build_sdk_lib(vs: pathlib.Path, sdk: pathlib.Path, arch: str, out: pathlib.P
 
 
 def build_windows_plugin(arches=WINDOWS_ARCHES, vs_pref="auto"):
+    """Build Windows plugin DLLs; per-arch failures are reported and skipped
+    (keep going with the arches that can build; e.g. missing target std
+    libs for one arch must not abort the rest)."""
     require_cargo()
     sdk = foobar_sdk()
     vs = pick_vs(vs_pref)
@@ -348,50 +351,71 @@ def build_windows_plugin(arches=WINDOWS_ARCHES, vs_pref="auto"):
     wtmp = windows_temp_dir() / "sena-fb2k" / "windows"
     wtmp_win = lin_to_win(wtmp) if is_wsl() else str(wtmp)
     libs_win = f"{wtmp_win}\\libs"
+    failures = []
+    built = []
     for arch in arches:
-        lib_arch = "Win32" if arch == "x86" else arch
-        arch_win = f"{libs_win}\\{lib_arch}"
-        win_ensure_dir(arch_win)
-        target = RUST_TARGETS[f"windows-{arch}"]
-        rust = build_rust_lib(target)
-        rust_win = lin_to_win(rust) if is_wsl() else str(rust)
-        win_copy(rust_win, f"{arch_win}\\sena_dec.lib")
-        sdkout = wtmp / "sdk" / arch
-        sdk_names = ["foobar2000_SDK.lib", "pfc.lib", "foobar2000_component_client.lib"]
-        if not all((sdkout / n).exists() for n in sdk_names):
-            build_sdk_lib(vs, sdk, arch, sdkout)
-        for name in sdk_names:
-            src_win = lin_to_win(sdkout / name) if is_wsl() else str(sdkout / name)
-            win_copy(src_win, f"{arch_win}\\{name}")
-        if arch == "arm64ec":
-            shared_name = "shared-ARM64EC.lib"
-        elif arch == "x86":
-            shared_name = "shared-Win32.lib"
-        else:
-            shared_name = f"shared-{arch}.lib"
-        shared = sdk / "foobar2000" / "shared" / shared_name
-        win_copy(lin_to_win(shared) if is_wsl() else str(shared), f"{arch_win}\\{shared_name}")
-    outroot = wtmp / "out"
-    for arch in arches:
-        proj = PLUGIN / "foo_input_sena.vcxproj"
-        proj_arg = lin_to_win(proj) if is_wsl() else str(proj)
-        out_win = lin_to_win(outroot / arch) if is_wsl() else str(outroot / arch)
-        obj_win = lin_to_win(outroot.parent / "obj" / arch) if is_wsl() else str(outroot.parent / "obj" / arch)
-        msbuild_arch = "Win32" if arch == "x86" else arch
-        run([str(msbuild_exe(vs)), proj_arg,
-             "/p:Configuration=Release", f"/p:Platform={msbuild_arch}",
-             f"/p:FOOBAR_SDK={lin_to_win(sdk) if is_wsl() else sdk}",
-             f"/p:SENA_LIB_DIR={libs_win}",
-             f"/p:OutDir={out_win}\\",
-             f"/p:IntDir={obj_win}\\",
-             "/m:1", "/p:UseMultiToolTask=false", "/p:PrecompiledHeader=NotUsing",
-             "/v:minimal"])
-        dll = outroot / arch / "foo_input_sena.dll"
-        if not dll.exists():
-            raise ToolError(f"MSBuild did not produce {dll}")
-        (DIST / "windows" / arch).mkdir(parents=True, exist_ok=True)
-        shutil.copy2(dll, DIST / "windows" / arch / "foo_input_sena.dll")
+        try:
+            _build_windows_arch(arch, vs, sdk, wtmp, wtmp_win, libs_win)
+            built.append(arch)
+            print(f"OK: windows arch {arch}")
+        except Exception as e:
+            failures.append((arch, str(e)))
+            print(f"WARN: windows arch {arch} failed, skipping: {e}", file=sys.stderr)
     print("Windows plugin artifacts written to", DIST / "windows")
+    _report_failures("windows", failures, built)
+
+
+def _build_windows_arch(arch, vs, sdk, wtmp, wtmp_win, libs_win):
+    lib_arch = "Win32" if arch == "x86" else arch
+    arch_win = f"{libs_win}\\{lib_arch}"
+    win_ensure_dir(arch_win)
+    target = RUST_TARGETS[f"windows-{arch}"]
+    rust = build_rust_lib(target)
+    rust_win = lin_to_win(rust) if is_wsl() else str(rust)
+    win_copy(rust_win, f"{arch_win}\\sena_dec.lib")
+    sdkout = wtmp / "sdk" / arch
+    sdk_names = ["foobar2000_SDK.lib", "pfc.lib", "foobar2000_component_client.lib"]
+    if not all((sdkout / n).exists() for n in sdk_names):
+        build_sdk_lib(vs, sdk, arch, sdkout)
+    for name in sdk_names:
+        src_win = lin_to_win(sdkout / name) if is_wsl() else str(sdkout / name)
+        win_copy(src_win, f"{arch_win}\\{name}")
+    if arch == "arm64ec":
+        shared_name = "shared-ARM64EC.lib"
+    elif arch == "x86":
+        shared_name = "shared-Win32.lib"
+    else:
+        shared_name = f"shared-{arch}.lib"
+    shared = sdk / "foobar2000" / "shared" / shared_name
+    win_copy(lin_to_win(shared) if is_wsl() else str(shared), f"{arch_win}\\{shared_name}")
+
+    outroot = wtmp / "out"
+    proj = PLUGIN / "foo_input_sena.vcxproj"
+    proj_arg = lin_to_win(proj) if is_wsl() else str(proj)
+    out_win = lin_to_win(outroot / arch) if is_wsl() else str(outroot / arch)
+    obj_win = lin_to_win(outroot.parent / "obj" / arch) if is_wsl() else str(outroot.parent / "obj" / arch)
+    msbuild_arch = "Win32" if arch == "x86" else arch
+    run([str(msbuild_exe(vs)), proj_arg,
+         "/p:Configuration=Release", f"/p:Platform={msbuild_arch}",
+         f"/p:FOOBAR_SDK={lin_to_win(sdk) if is_wsl() else sdk}",
+         f"/p:SENA_LIB_DIR={libs_win}",
+         f"/p:OutDir={out_win}\\",
+         f"/p:IntDir={obj_win}\\",
+         "/m:1", "/p:UseMultiToolTask=false", "/p:PrecompiledHeader=NotUsing",
+         "/v:minimal"])
+    dll = outroot / arch / "foo_input_sena.dll"
+    if not dll.exists():
+        raise ToolError(f"MSBuild did not produce {dll}")
+    (DIST / "windows" / arch).mkdir(parents=True, exist_ok=True)
+    shutil.copy2(dll, DIST / "windows" / arch / "foo_input_sena.dll")
+
+
+def _report_failures(what, failures, built=None):
+    if not failures:
+        return
+    for arch, err in failures:
+        print(f"SKIPPED ({what}): {arch} -> {err}", file=sys.stderr)
+    print(f"built {what} arches: {built or 'none'}; skipped: {[a for a, _ in failures]}", file=sys.stderr)
 
 # ---------------------------------------------------------------- macOS
 def mac_sdk_path() -> pathlib.Path:
@@ -514,6 +538,39 @@ def mac_sources_from_xcode_project(proj: pathlib.Path, base: pathlib.Path) -> li
     return sorted(set(files))
 
 
+def _build_mac_slice(arch, sdk, sysroot, clang, ld, ar, ranlib, tmp, triples, rust_targets, common, proj_sources):
+    triple = triples[arch]
+    outroot = tmp / arch
+    (outroot / "sdk-objs").mkdir(parents=True)
+    (outroot / "libs").mkdir(parents=True)
+    for libname, sources in proj_sources.items():
+        objs = []
+        for i, src in enumerate(sources):
+            obj = outroot / "sdk-objs" / f"{libname}_{i:03d}.o"
+            run([str(clang), "-target", triple] + common + ["-c", str(src), "-o", str(obj)])
+            objs.append(obj)
+        lib = outroot / "libs" / f"lib{libname}.a"
+        run([str(ar), "rcs", str(lib)] + [str(o) for o in objs])
+        run([str(ranlib), str(lib)])
+    # plugin objects
+    plug_objs = []
+    for srcname in ["input_sena.cpp", "main.cpp", "dynamic_bitrate_helper.cpp"]:
+        obj = outroot / "sdk-objs" / f"{srcname}.o"
+        run([str(clang), "-target", triple] + common + ["-c", str(PLUGIN / srcname), "-o", str(obj)])
+        plug_objs.append(obj)
+    rust = build_rust_lib(rust_targets[arch])
+    bundle = outroot / "foo_input_sena"
+    link_cmd = [str(clang), "-target", triple, "-isysroot", str(sysroot),
+               "-stdlib=libc++", "-fobjc-arc"]
+    if ld is not None:
+        link_cmd.append(f"-fuse-ld={ld}")
+    link_cmd += ["-bundle", "-mmacosx-version-min=11.0",
+                 "-Wl,-platform_version,macos,11.0,11.0",
+                 "-o", str(bundle)]
+    run(link_cmd + [str(o) for o in plug_objs] +
+        [str(outroot / "libs" / f"lib{n}.a") for n in ["sdk", "pfc", "client", "shared"]] +
+        [str(rust), "-framework", "Cocoa", "-framework", "CoreFoundation", "-framework", "Foundation"])
+    return bundle
 def build_mac_plugin(arches=MAC_ARCHES):
     require_cargo()
     sdk = foobar_sdk()
@@ -544,38 +601,17 @@ def build_mac_plugin(arches=MAC_ARCHES):
               "-I", str(PLUGIN)]
     slices = []
     for arch in arches:
-        triple = triples[arch]
-        outroot = tmp / arch
-        (outroot / "sdk-objs").mkdir(parents=True)
-        (outroot / "libs").mkdir(parents=True)
-        for libname, sources in proj_sources.items():
-            objs = []
-            for i, src in enumerate(sources):
-                obj = outroot / "sdk-objs" / f"{libname}_{i:03d}.o"
-                run([str(clang), "-target", triple] + common + ["-c", str(src), "-o", str(obj)])
-                objs.append(obj)
-            lib = outroot / "libs" / f"lib{libname}.a"
-            run([str(ar), "rcs", str(lib)] + [str(o) for o in objs])
-            run([str(ranlib), str(lib)])
-        # plugin objects
-        plug_objs = []
-        for srcname in ["input_sena.cpp", "main.cpp", "dynamic_bitrate_helper.cpp"]:
-            obj = outroot / "sdk-objs" / f"{srcname}.o"
-            run([str(clang), "-target", triple] + common + ["-c", str(PLUGIN / srcname), "-o", str(obj)])
-            plug_objs.append(obj)
-        rust = build_rust_lib(rust_targets[arch])
-        bundle = outroot / "foo_input_sena"
-        link_cmd = [str(clang), "-target", triple, "-isysroot", str(sysroot),
-                   "-stdlib=libc++", "-fobjc-arc"]
-        if ld is not None:
-            link_cmd.append(f"-fuse-ld={ld}")
-        link_cmd += ["-bundle", "-mmacosx-version-min=11.0",
-                     "-Wl,-platform_version,macos,11.0,11.0",
-                     "-o", str(bundle)]
-        run(link_cmd + [str(o) for o in plug_objs] +
-            [str(outroot / "libs" / f"lib{n}.a") for n in ["sdk", "pfc", "client", "shared"]] +
-            [str(rust), "-framework", "Cocoa", "-framework", "CoreFoundation", "-framework", "Foundation"])
-        slices.append(bundle)
+        try:
+            bundle = _build_mac_slice(arch, sdk, sysroot, clang, ld, ar, ranlib, tmp,
+                                      triples, rust_targets, common, proj_sources)
+            slices.append(bundle)
+            print(f"OK: mac arch {arch}")
+        except Exception as e:
+            failures.append((arch, str(e)))
+            print(f"WARN: mac arch {arch} failed, skipping: {e}", file=sys.stderr)
+    if not slices:
+        raise ToolError(f"mac: no arch built; failures: {failures}")
+    # (per-arch WARN lines were already printed above)
     # fat binary (Mach-O fat_arch entries are 20 bytes)
     if len(slices) > 1 and host_os() == "macos" and which("lipo"):
         out = tmp / "foo_input_sena"
@@ -776,6 +812,8 @@ def main():
     elif args.command == "install":
         install_component()
     elif args.command == "all":
+        # Per-arch failures are tolerated inside each builder (they report
+        # and skip), so `all` keeps building what it can and still packages.
         build_windows_plugin(WINDOWS_ARCHES, args.vs)
         build_mac_plugin(MAC_ARCHES)
         make_package()

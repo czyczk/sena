@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Build release senaenc binaries for one or more supported targets.
+"""Build release binaries for a workspace package (senaenc/senadec) for one
+or more supported targets.
 
 Targets (aliases or full Rust triples):
   windows-x86       i686-pc-windows-msvc
@@ -21,7 +22,7 @@ Windows linker selection:
 
 --vs auto|2022|2026 selects the Visual Studio instance when VS is used.
 
-Output goes to --out (default: build/senaenc in the repository root; /build/
+Output goes to --out (default: build/<pkg> in the repository root; /build/
 is git-ignored, so the binaries never dirty the working tree). Relative
 --out paths are resolved against the repo root. An explicit output path on
 a read-only mount (e.g. the WSL Linux ~/temp on this box) is detected and,
@@ -43,7 +44,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PKG = "senaenc"
-STAGE = ROOT / "build" / "senaenc-release"
+STAGE_KIND = "release-bin"
+STAGE = ROOT / "build" / "senaenc-release"  # rebuilt per pkg in main()
+# (STAGE initial value is replaced by main() with the per-pkg path)
 
 TARGETS = {
     "windows-x86": "i686-pc-windows-msvc",
@@ -310,7 +313,7 @@ def build_macos(triple, args):
     src = ROOT / "target" / triple / "release" / PKG
     if not src.exists():
         raise SystemExit(f"error: cargo did not produce {src}")
-    stripped = STAGE / f"senaenc-{triple}.stripped"
+    stripped = STAGE / f"{PKG}-{triple}.stripped"
     stripped.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src, stripped)
     llvm_strip = which("llvm-strip")
@@ -360,8 +363,8 @@ def build_linux(triple, args):
 
 def output_name(kind, triple):
     if kind == "windows":
-        return f"senaenc-{triple}.exe"
-    return f"senaenc-{triple}"
+        return f"{PKG}-{triple}.exe"
+    return f"{PKG}-{triple}"
 
 
 # ---------------------------------------------------------------- delivery
@@ -467,16 +470,23 @@ def verify(src: Path, triple: str | None):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--pkg", choices=["senaenc", "senadec"], default="senaenc",
+                    help="workspace package to build (default: senaenc)")
     ap.add_argument("--target", action="append", help="target alias or full Rust triple (repeatable)")
     ap.add_argument("target_args", nargs="*", help="target aliases/triples as positional arguments (justfile style)")
-    ap.add_argument("--out", default=str(ROOT / "build" / "senaenc"),
-                    help="output directory (default: build/senaenc in the repository; relative paths resolve against the repo root)")
+    ap.add_argument("--out", default=None,
+                    help="output directory (default: build/<pkg> in the repository; relative paths resolve against the repo root)")
     ap.add_argument("--vs", choices=["auto", "2022", "2026"], default="auto",
                     help="Visual Studio instance preference when VS linking is used")
     ap.add_argument("--linker", choices=["auto", "xwin", "vs", "cargo"], default="auto",
                     help="Windows linker mode (default: auto = best available)")
     ap.add_argument("--debug", action="store_true", help="build debug instead of release")
     args = ap.parse_args()
+    global PKG, STAGE
+    PKG = args.pkg
+    STAGE = ROOT / "build" / f"{PKG}-release"
+    if args.out is None:
+        args.out = str(ROOT / "build" / PKG)
 
     requested = (args.target or []) + (args.target_args or [])
     if not requested:
@@ -539,14 +549,14 @@ def main():
         if x86 is None or arm is None:
             raise SystemExit("error: macos-universal requires both x86_64 and arm64 slices")
         if sys.platform == "darwin" and which("lipo"):
-            staged = STAGE / "senaenc-universal-apple-darwin"
+            staged = STAGE / f"{PKG}-universal-apple-darwin"
             run(["lipo", "-create", "-output", str(staged), str(x86), str(arm)])
         else:
-            staged = STAGE / "senaenc-universal-apple-darwin"
+            staged = STAGE / f"{PKG}-universal-apple-darwin"
             staged.write_bytes(fat_macho([x86, arm]))
             staged.chmod(0o755)
         verify(staged, None)
-        delivered.append(deliver(staged, out, "senaenc-universal-apple-darwin"))
+        delivered.append(deliver(staged, out, f"{PKG}-universal-apple-darwin"))
 
     print("\nDone. Delivered:")
     for d in delivered:

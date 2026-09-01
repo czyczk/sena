@@ -99,10 +99,18 @@ Notes:
 ## Build
 
 ```bash
-just doctor
-just all        # builds sena-dec libs + Windows x86/x64/arm64ec + macOS component + package
-just test
+just doctor                          # build-environment check
+just test                            # workspace tests
+just senadec-plugin-fb2k-all         # windows x64/arm64ec + macOS + zipped .fb2k-component
+just senaenc                         # encoder CLI release binaries (windows x64/arm64 + macOS Universal)
+just senadec-bin                     # decoder CLI release binaries (same targets)
 ```
+
+Plugin recipe names are namespaced (`senadec-plugin-fb2k-*`); per-arch
+failures are reported and skipped so one broken arch does not abort the
+rest (`just senadec-plugin-fb2k-windows-x86` shows the exact WARN). The
+packaged plugin lands in `plugins/foobar2000/foo_input_sena/dist/
+foo_input_sena-0.1.0.fb2k-component`.
 
 Standalone `senaenc` release builds (no `opusenc`/`exhale` needed at build
 time; they are runtime dependencies only):
