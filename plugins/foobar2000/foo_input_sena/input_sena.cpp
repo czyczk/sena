@@ -179,11 +179,19 @@ void input_sena::retag(const file_info &info, abort_callback &abort) {
         entries.add_item(SenaMetaEntry{key, value});
     });
     // ReplayGain: foobar stores these in the info section (replaygain_info);
-    // read them from there so the values actually reach the file.
+    // read them from there so the values actually reach the file. NOTE:
+    // replaygain_info::for_each() reuses one stack text buffer for all four
+    // values, so the pointers must be copied immediately - storing the raw
+    // pointers produced garbage ("\x15;\x15").
+    pfc::list_t<pfc::string8> rg_names, rg_values;
     info.get_replaygain().for_each([&](const char *key, const char *value) {
-        entries.add_item(SenaMetaEntry{key, value});
+        rg_names.add_item(key);
+        rg_values.add_item(value);
         rg_written++;
     });
+    for (t_size i = 0; i < rg_names.get_count(); i++) {
+        entries.add_item(SenaMetaEntry{rg_names[i].get_ptr(), rg_values[i].get_ptr()});
+    }
     pfc::string8 dbg;
     dbg << "foo_input_sena: retag writing " << entries.get_count() << " entries (skipped " << skipped
         << " pictures, " << rg_written << " replaygain from info)";
