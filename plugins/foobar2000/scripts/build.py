@@ -168,13 +168,41 @@ def rust_target_libdir(target: str) -> pathlib.Path | None:
                        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if r.returncode != 0:
         return None
-    return pathlib.Path(r.stdout.strip())
+    # rustc prints the path even when the std libs are missing; the real
+    # check is whether the directory exists.
+    p = pathlib.Path(r.stdout.strip())
+    return p if p.exists() else None
+
+
+#: All rust targets the plugin build needs (windows + macos).
+ALL_RUST_TARGETS = [
+    "i686-pc-windows-msvc",
+    "x86_64-pc-windows-msvc",
+    "arm64ec-pc-windows-msvc",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+]
+
+
+def missing_rust_targets() -> list[str]:
+    return [t for t in ALL_RUST_TARGETS if rust_target_libdir(t) is None]
+
+
+def rust_target_hint() -> str:
+    """The exact rustup command installing every missing target std."""
+    missing = missing_rust_targets()
+    if not missing:
+        return "all required rust targets are installed"
+    return "rustup target add " + " ".join(missing)
 
 
 def ensure_rust_target(target: str):
     if rust_target_libdir(target) is None:
         raise ToolError(
-            f"Rust target '{target}' std is not installed; run: rustup target add {target}"
+            f"Rust target '{target}' std libs are not installed.\n"
+            f"  Install all required targets with:\n"
+            f"      rustup target add {target}\n"
+            f"  (or all at once: {rust_target_hint()})"
         )
 
 
@@ -767,6 +795,13 @@ def install_component():
 
 def doctor():
     require_cargo()
+    missing = missing_rust_targets()
+    if missing:
+        print("missing rust target std libs:", ", ".join(missing))
+        print("  install with:");
+        print("      rustup target add " + " ".join(missing))
+    else:
+        print("rust target std libs: all present")
     sdk = foobar_sdk()
     print("foobar SDK:", sdk)
     print("host:", host_os(), "WSL:", is_wsl())
