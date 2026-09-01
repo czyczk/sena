@@ -27,6 +27,7 @@ struct Args {
     dump_prefix: Option<PathBuf>,
     info: bool,
     output_explicit: bool,
+    force: bool,
 }
 
 fn usage() -> &'static str {
@@ -45,6 +46,7 @@ fn parse_args() -> Result<Args, String> {
     let mut dump_prefix = None;
     let mut info = false;
     let mut output_explicit = false;
+    let mut force = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--format" => {
@@ -71,6 +73,7 @@ fn parse_args() -> Result<Args, String> {
                 dump_prefix = Some(PathBuf::from(args.next().ok_or("--dump-tracks requires a prefix")?));
             }
             "--info" => info = true,
+            "--force" => force = true,
             "-o" | "--output" => {
                 output = Some(PathBuf::from(args.next().ok_or("-o requires a path")?));
                 output_explicit = true;
@@ -96,6 +99,7 @@ fn parse_args() -> Result<Args, String> {
         dump_prefix,
         info,
         output_explicit,
+        force,
     })
 }
 
@@ -174,6 +178,14 @@ fn run() -> Result<(), String> {
 
     let pcm = decoded.pcm_f64();
     let out_path = args.output.as_deref().filter(|p| p.as_os_str() != "-");
+    if let Some(p) = out_path {
+        if p.exists() && !args.force {
+            return Err(format!(
+                "output file {} already exists; use --force to overwrite",
+                p.display()
+            ));
+        }
+    }
     match args.format {
         Format::WavF32 | Format::WavS24 | Format::WavS16 => {
             let (fmt, bits) = match args.format {

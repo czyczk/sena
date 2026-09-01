@@ -165,6 +165,7 @@ fn doctor() -> i32 {
 }
 
 fn main() {
+    use std::io::IsTerminal;
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.len() == 1 && args[0] == "doctor" {
         std::process::exit(doctor());
@@ -172,6 +173,7 @@ fn main() {
     let mut profile = Profile::At600;
     let mut opus_mode: Option<bool> = None; // None = auto
     let keep_workdir = args.iter().any(|a| a == "--keep-workdir");
+    let force = args.iter().any(|a| a == "--force");
     let mut rest = vec![];
     let mut i = 0;
     while i < args.len() {
@@ -187,6 +189,7 @@ fn main() {
             "--opus-original" => opus_mode = Some(false),
             "--opus-senav" => opus_mode = Some(true),
             "--keep-workdir" => {}
+            "--force" => {}
             a if a.starts_with('-') && rest.is_empty() => usage(),
             a => rest.push(a.to_string()),
         }
@@ -206,6 +209,25 @@ fn main() {
     let (xhe_k, opus_k) = account(kbps, profile).unwrap();
     let use_senav = opus_mode.unwrap_or(kbps > SENAV_THRESHOLD_KBPS);
     let stdin_input = input.as_os_str() == "-";
+    if output.exists() && !force {
+        if stdin_input || !std::io::stdin().is_terminal() {
+            eprintln!(
+                "error: output file {} already exists; use --force to overwrite",
+                output.display()
+            );
+            std::process::exit(1);
+        }
+        eprint!("overwrite {}? [y/N] ", output.display());
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).is_err() {
+            std::process::exit(1);
+        }
+        let ok = matches!(line.trim(), "y" | "Y" | "yes" | "YES");
+        if !ok {
+            eprintln!("aborted");
+            std::process::exit(1);
+        }
+    }
     eprintln!(
         "senaenc: profile @{}  total {}k -> xHE-AAC {}k (deducted) + Opus {}k ({})",
         profile.crossover_hz(),
