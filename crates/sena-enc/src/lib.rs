@@ -50,15 +50,45 @@ pub struct Encoded<'a> {
     pub hf_frame_ns: u64,
 }
 
-fn run(cmd: &mut Command, what: &str) -> Result<(), Error> {
-    let out = cmd.output().map_err(Error::Io)?;
-    if !out.status.success() {
-        return Err(Error::Subprocess(format!(
-            "{what} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        )));
+
+/// Run two encoder subprocesses concurrently, waiting for both (their
+/// stdout/stderr are piped so error text is preserved).
+fn run_parallel(
+    a: &mut Command,
+    b: &mut Command,
+    what_a: &str,
+    what_b: &str,
+) -> Option<Error> {
+    use std::process::Stdio;
+    a.stdout(Stdio::piped()).stderr(Stdio::piped());
+    b.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let ha = match a.spawn() {
+        Ok(h) => h,
+        Err(e) => return Some(Error::Io(e)),
+    };
+    let hb = match b.spawn() {
+        Ok(h) => h,
+        Err(e) => return Some(Error::Io(e)),
+    };
+    let oa = ha.wait_with_output().map_err(Error::Io).ok();
+    let ob = hb.wait_with_output().map_err(Error::Io).ok();
+    if let Some(o) = oa.as_ref() {
+        if !o.status.success() {
+            return Some(Error::Subprocess(format!(
+                "{what_a} failed: {}",
+                String::from_utf8_lossy(&o.stderr)
+            )));
+        }
     }
-    Ok(())
+    if let Some(o) = ob.as_ref() {
+        if !o.status.success() {
+            return Some(Error::Subprocess(format!(
+                "{what_b} failed: {}",
+                String::from_utf8_lossy(&o.stderr)
+            )));
+        }
+    }
+    None
 }
 
 pub fn check_version(path: &str, marker: Option<&str>, what: &str) -> Result<(), Error> {
@@ -204,6 +234,7 @@ pub fn encode_stream<R: std::io::Read>(
 
     let wd = cfg.workdir;
     std::fs::create_dir_all(wd)?;
+    let mut st = StageTimes::new();
 
     let mut ws = wav::WavStream::new();
     let mut norm: Option<StreamResampler> = None;
@@ -253,6 +284,7 @@ pub fn encode_stream<R: std::io::Read>(
                 lf_rs.as_mut().unwrap(),
                 lf_wr.as_mut().unwrap(),
                 hf_wr.as_mut().unwrap(),
+                &mut st,
             )?,
             None => {
                 if eof {
@@ -276,21 +308,92 @@ pub fn encode_stream<R: std::io::Read>(
     let mut lf_wr = lf_wr.unwrap();
     let mut hf_wr = hf_wr.unwrap();
     let playable = norm.output_frames_total();
+    st.begin();
     let n48_tail = norm.finish(ch);
+    end_tick(&mut st.t, &mut st.norm);
+    st.begin();
     let (low_a, high_a) = split_s.push(&n48_tail, ch);
     let (low_b, high_b) = split_s.finish(ch);
-
-    let low_p: Vec<f64> = low_a.iter().chain(low_b.iter()).map(|v| v * PRE_GAIN).collect();
-    let lf16 = lf_rs.push(&low_p, ch);
-    lf_wr.push(&lf16)?;
-    let lf16b = lf_rs.finish(ch);
-    lf_wr.push(&lf16b)?;
-    let high_p: Vec<f64> = high_a.iter().chain(high_b.iter()).map(|v| v * PRE_GAIN).collect();
-    hf_wr.push(&high_p)?;
+    end_tick(&mut st.t, &mut st.split);
+    {
+        let low_p: Vec<f64> = low_a.iter().chain(low_b.iter()).map(|v| v * PRE_GAIN).collect();
+        st.begin();
+        let lf16 = lf_rs.push(&low_p, ch);
+        end_tick(&mut st.t, &mut st.lf);
+        lf_wr.push(&lf16)?;
+        st.begin();
+        let lf16b = lf_rs.finish(ch);
+        end_tick(&mut st.t, &mut st.lf);
+        lf_wr.push(&lf16b)?;
+        let high_p: Vec<f64> = high_a.iter().chain(high_b.iter()).map(|v| v * PRE_GAIN).collect();
+        hf_wr.push(&high_p)?;
+    }
     lf_wr.finish()?;
     hf_wr.finish()?;
 
-    run_codecs(cfg, wd, playable, output)
+    let result = run_codecs(cfg, wd, playable, output, &mut st);
+    if result.is_ok() {
+        st.report(playable);
+    }
+    result
+}
+
+/// Env-gated stage timing for pipeline analysis (SENAENC_TIME=1 prints the
+/// per-stage CPU/wall breakdown at the end of an encode).
+#[derive(Default)]
+pub struct StageTimes {
+    on: bool,
+    t: Option<std::time::Instant>,
+    pub norm: f64,   // input rate -> 48k normalization
+    pub split: f64,  // crossover split
+    pub lf: f64,     // LF downsample 48k -> lf rate
+    pub write: f64,  // band WAV IO (16/32-bit conversion + file write)
+    pub check: f64,  // tool version checks
+    pub exhale: f64, // xHE-AAC encode
+    pub opus: f64,   // Opus encode
+    pub mux: f64,    // packet extraction + container mux
+}
+
+impl StageTimes {
+    pub fn new() -> Self {
+        Self { on: std::env::var_os("SENAENC_TIME").is_some(), ..Default::default() }
+    }
+
+    pub fn begin(&mut self) {
+        if self.on {
+            self.t = Some(std::time::Instant::now());
+        }
+    }
+
+    pub fn consume_tick(&mut self) {
+        self.t = None;
+    }
+
+    pub fn tick(&self) -> &Option<std::time::Instant> {
+        &self.t
+    }
+
+    pub fn report(&self, playable: usize) {
+        if !self.on {
+            return;
+        }
+        let total = self.norm + self.split + self.lf + self.write + self.check + self.exhale + self.opus + self.mux;
+        eprintln!(
+            "SENAENC_TIME: playable={playable} frames\n\
+             \x20 normalize {:.3}s  split {:.3}s  lf-down {:.3}s  write {:.3}s\n\
+             \x20 check {:.3}s  exhale {:.3}s  opus {:.3}s  mux {:.3}s\n\
+             \x20 summed {:.3}s",
+            self.norm, self.split, self.lf, self.write, self.check, self.exhale, self.opus, self.mux, total
+        );
+    }
+}
+
+/// Fold a pending begin() tick into an accumulator. Takes the two disjoint
+/// fields separately so call sites can borrow them without aliasing.
+fn end_tick(tick: &mut Option<std::time::Instant>, acc: &mut f64) {
+    if let Some(t) = tick.take() {
+        *acc += t.elapsed().as_secs_f64();
+    }
 }
 
 /// One chunk through normalize -> split -> pad -> LF downsample -> writers.
@@ -302,17 +405,40 @@ fn push_chunk(
     lf_rs: &mut sena_dsp::StreamResampler,
     lf_wr: &mut wav::WavWriter,
     hf_wr: &mut wav::WavWriter,
+    st: &mut StageTimes,
 ) -> Result<(), Error> {
+    st.begin();
     let n48 = norm.push(x, ch);
+    end_tick(&mut st.t, &mut st.norm);
+    st.begin();
     let (low, high) = split_s.push(&n48, ch);
+    end_tick(&mut st.t, &mut st.split);
     if !low.is_empty() {
         let low_p: Vec<f64> = low.iter().map(|v| v * PRE_GAIN).collect();
+        st.begin();
         let lf16 = lf_rs.push(&low_p, ch);
-        lf_wr.push(&lf16)?;
+        end_tick(&mut st.t, &mut st.lf);
+        let mut err: Option<Error> = None;
+        st.begin();
+        if let Err(e) = lf_wr.push(&lf16) {
+            err = Some(e);
+        }
+        end_tick(&mut st.t, &mut st.write);
+        if let Some(e) = err {
+            return Err(e);
+        }
     }
     if !high.is_empty() {
         let high_p: Vec<f64> = high.iter().map(|v| v * PRE_GAIN).collect();
-        hf_wr.push(&high_p)?;
+        let mut err: Option<Error> = None;
+        st.begin();
+        if let Err(e) = hf_wr.push(&high_p) {
+            err = Some(e);
+        }
+        end_tick(&mut st.t, &mut st.write);
+        if let Some(e) = err {
+            return Err(e);
+        }
     }
     Ok(())
 }
@@ -323,25 +449,34 @@ fn run_codecs(
     wd: &Path,
     playable: usize,
     output: &Path,
+    st: &mut StageTimes,
 ) -> Result<(), Error> {
     let lf_wav = wd.join("lf.wav");
     let hf_wav = wd.join("hf.wav");
+    st.begin();
+    let ck_err: Option<Error> = check_exhale(cfg.exhale)
+        .and_then(|_| {
+            if cfg.use_senav {
+                check_version(cfg.opusenc, Some("Opus SenaV"), "opusenc-senav")
+            } else {
+                check_version(cfg.opusenc, None, "opusenc")
+            }
+        })
+        .err();
+    end_tick(&mut st.t, &mut st.check);
+    if let Some(e) = ck_err {
+        return Err(e);
+    }
 
     // --- encode ---
+    // The two codec passes are independent (separate input files, separate
+    // output files) and each is single-threaded, so run them concurrently.
     let lf_m4a = wd.join("lf.m4a");
-    check_exhale(cfg.exhale)?;
+    let hf_ogg = wd.join("hf.opus");
     let mut ex = Command::new(cfg.exhale);
     ex.arg(cfg.profile.xhe_preset().to_string())
         .arg(&lf_wav)
         .arg(&lf_m4a);
-    run(&mut ex, "exhale")?;
-
-    if cfg.use_senav {
-        check_version(cfg.opusenc, Some("Opus SenaV"), "opusenc-senav")?;
-    } else {
-        check_version(cfg.opusenc, None, "opusenc")?;
-    }
-    let hf_ogg = wd.join("hf.opus");
     let (_, opus_kbps) = sena_core::account(cfg.total_kbps, cfg.profile)
         .ok_or_else(|| Error::Format("total bitrate below Sena minimum".into()))?;
     let mut op = Command::new(cfg.opusenc);
@@ -362,69 +497,82 @@ fn run_codecs(
             op.env(k, v);
         }
     }
-    run(&mut op, "opusenc")?;
+    let t0 = std::time::Instant::now();
+    let codec_err = run_parallel(&mut ex, &mut op, "exhale", "opusenc");
+    if st.on {
+        let d = t0.elapsed().as_secs_f64();
+        st.exhale += d;
+        st.opus += d;
+    }
+    if let Some(e) = codec_err {
+        return Err(e);
+    }
 
     // --- extract packets ---
-    let ogg_bytes = std::fs::read(&hf_ogg)?;
-    let (hf_head, preskip, hf_packets) = ogg::extract_opus(&ogg_bytes)?;
-    let (lf_asc, lf_aus) = extract_m4a(&lf_m4a)?;
-    let lf_stream_rate = m4a_stream_rate(&lf_m4a)?;
+    st.begin();
+    let extracted: Result<_, Error> = (|| {
+        let ogg_bytes = std::fs::read(&hf_ogg)?;
+        let (hf_head, preskip, hf_packets) = ogg::extract_opus(&ogg_bytes)?;
+        let (lf_asc, lf_aus) = extract_m4a(&lf_m4a)?;
+        let lf_stream_rate = m4a_stream_rate(&lf_m4a)?;
+        Ok((hf_head, preskip, hf_packets, lf_asc, lf_aus, lf_stream_rate))
+    })();
+    end_tick(&mut st.t, &mut st.mux);
+    let (hf_head, preskip, hf_packets, lf_asc, lf_aus, lf_stream_rate) = extracted?;
 
-    // --- frame timings ---
-    let hf_frame_ns = 20_000_000u64; // 20 ms Opus frames
-    // LF AU duration: one 1024-sample core frame at the actual stream rate
-    // (64 ms at 16 kHz, 32 ms at 32 kHz).
-    let lf_frame_ns = (sena_core::XHE_WARMUP_CORE as u64) * 1_000_000_000 / lf_stream_rate as u64;
+    // --- frame timings / mux: the remaining tail is tiny and measured with
+    // the extraction stage (st.mux). ---
+    let muxed = (|| {
+        let hf_frame_ns = 20_000_000u64; // 20 ms Opus frames
+        // LF AU duration: one 1024-sample core frame at the actual stream rate
+        // (64 ms at 16 kHz, 32 ms at 32 kHz).
+        let lf_frame_ns =
+            (sena_core::XHE_WARMUP_CORE as u64) * 1_000_000_000 / lf_stream_rate as u64;
 
-    // --- mux ---
-    let tracks = vec![
-        Track {
-            codec_id: "A_OPUS".into(),
-            codec_private: hf_head.to_vec(),
-            sample_rate: SAMPLE_RATE as f64,
-            channels: 2,
-            codec_delay_ns: (preskip as u64) * 1_000_000_000 / SAMPLE_RATE as u64,
-            bit_depth: Some(32),
-        },
-        Track {
-            codec_id: "A_SENALF".into(),
-            codec_private: lf_asc.clone(),
-            sample_rate: lf_stream_rate as f64,
-            channels: 2,
-            codec_delay_ns: (sena_core::XHE_WARMUP_CORE as u64) * 1_000_000_000 / lf_stream_rate as u64,
-            bit_depth: None,
-        },
-    ];
-    let mut frames = vec![];
-    for (i, p) in hf_packets.iter().enumerate() {
-        frames.push(Frame {
-            track: 0,
-            t_ns: i as u64 * hf_frame_ns,
-            data: p.clone(),
-        });
-    }
-    let mut lf_t = 0u64;
-    for au in &lf_aus {
-        frames.push(Frame {
-            track: 1,
-            t_ns: lf_t,
-            data: au.clone(),
-        });
-        lf_t += lf_frame_ns;
-    }
-    let profile_tag = cfg.profile.crossover_hz().to_string();
-    let version_tag = "1".to_string();
-    // input length in 48 kHz stereo frames (the normalized source timeline)
-    let playable_tag = playable.to_string();
-    let tags: Vec<(&str, &str)> = vec![
-        ("SENA_PROFILE", &profile_tag),
-        ("SENA_VERSION", &version_tag),
-        ("SENA_PLAYABLE_SAMPLES", &playable_tag),
-    ];
-    let playable_ns = (playable as u64) * 1_000_000_000 / SAMPLE_RATE as u64;
-    let mka_bytes = mka::write_mka(&tracks, frames, &tags, 1000, playable_ns);
-    std::fs::write(output, mka_bytes)?;
-    Ok(())
+        let tracks = vec![
+            Track {
+                codec_id: "A_OPUS".into(),
+                codec_private: hf_head.to_vec(),
+                sample_rate: SAMPLE_RATE as f64,
+                channels: 2,
+                codec_delay_ns: (preskip as u64) * 1_000_000_000 / SAMPLE_RATE as u64,
+                bit_depth: Some(32),
+            },
+            Track {
+                codec_id: "A_SENALF".into(),
+                codec_private: lf_asc.clone(),
+                sample_rate: lf_stream_rate as f64,
+                channels: 2,
+                codec_delay_ns: (sena_core::XHE_WARMUP_CORE as u64)
+                    * 1_000_000_000
+                    / lf_stream_rate as u64,
+                bit_depth: None,
+            },
+        ];
+        let mut frames = vec![];
+        for (i, p) in hf_packets.iter().enumerate() {
+            frames.push(Frame { track: 0, t_ns: i as u64 * hf_frame_ns, data: p.clone() });
+        }
+        let mut lf_t = 0u64;
+        for au in &lf_aus {
+            frames.push(Frame { track: 1, t_ns: lf_t, data: au.clone() });
+            lf_t += lf_frame_ns;
+        }
+        let profile_tag = cfg.profile.crossover_hz().to_string();
+        let version_tag = "1".to_string();
+        // input length in 48 kHz stereo frames (the normalized source timeline)
+        let playable_tag = playable.to_string();
+        let tags: Vec<(&str, &str)> = vec![
+            ("SENA_PROFILE", &profile_tag),
+            ("SENA_VERSION", &version_tag),
+            ("SENA_PLAYABLE_SAMPLES", &playable_tag),
+        ];
+        let playable_ns = (playable as u64) * 1_000_000_000 / SAMPLE_RATE as u64;
+        let mka_bytes = mka::write_mka(&tracks, frames, &tags, 1000, playable_ns);
+        std::fs::write(output, mka_bytes)?;
+        Ok::<(), Error>(())
+    })();
+    muxed
 }
 
 /// Read the stream's actual sample rate from mdhd timescale.

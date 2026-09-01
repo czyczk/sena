@@ -142,10 +142,22 @@ pub struct Resampler {
     kernel: Vec<f64>, // symmetric, odd length, DC gain = n (at rate fs_in*n)
     delay: usize,     // (kernel.len()-1)/2, in fs_in*n samples
     guard_in: usize,  // kernel tail in input samples
+    // Polyphase decomposition of the kernel, precomputed once: per phase p
+    // in [0, n), `phase_shift[p]` is the input-sample offset of the first
+    // tap and `phase_taps[p]` the contiguous (reversed) tap values, so an
+    // output sample is a plain dot product of two contiguous slices.
+    phase_shift: Vec<usize>,
+    phase_taps: Vec<Vec<f64>>,
 }
 
 impl Resampler {
     pub fn new(fs_in: u32, fs_out: u32) -> Self {
+        if fs_in == fs_out {
+            // Identity: the general direct formula degenerates exactly to
+            // y[o] = x[o] with a unit kernel, so no special case is needed
+            // anywhere downstream (no latency, no filtering).
+            return Self::with_kernel(1, 1, vec![1.0], 0, 0);
+        }
         let g = gcd(fs_in, fs_out);
         let n = (fs_out / g) as usize;
         let m = (fs_in / g) as usize;
@@ -179,13 +191,29 @@ impl Resampler {
         // guard covers the kernel half-width (delay) plus the decimation
         // stride (m), so every output of a block has complete kernel support.
         let guard_in = (delay + m).div_ceil(n) + 1;
-        Resampler {
-            n,
-            m,
-            kernel,
-            delay,
-            guard_in,
+        Self::with_kernel(n, m, kernel, delay, guard_in)
+    }
+
+    /// Build the phase tables for a given kernel (also used by the identity
+    /// fast path).
+    fn with_kernel(n: usize, m: usize, kernel: Vec<f64>, delay: usize, guard_in: usize) -> Self {
+        let l = kernel.len();
+        let mut phase_shift = Vec::with_capacity(n);
+        let mut phase_taps = Vec::with_capacity(n);
+        for p in 0..n {
+            let base = p + delay;
+            let lo_abs = base / n; // floor: k_lo = -lo_abs
+            let k_hi = ((l - 1 - base) / n) as isize;
+            let k_lo = -(lo_abs as isize);
+            let mut taps = Vec::with_capacity((k_hi - k_lo + 1) as usize);
+            for k in k_lo..=k_hi {
+                taps.push(kernel[(base as isize + k * n as isize) as usize]);
+            }
+            taps.reverse(); // y[o] = sum_j x[q - lo_abs + j'] * taps_rev[j']
+            phase_shift.push(lo_abs);
+            phase_taps.push(taps);
         }
+        Resampler { n, m, kernel, delay, guard_in, phase_shift, phase_taps }
     }
 
     /// Number of output frames produced for a whole-buffer input of
@@ -268,31 +296,44 @@ impl Resampler {
         out
     }
 
+    /// y[o] = sum_j x[s0 + j] * phase_taps[p][j] for the phase of output o,
+    /// both slices contiguous (vectorizable); out-of-buffer inputs are zero.
     fn direct_range(&self, out: &mut [f64], x: &[f64], o_start: usize) {
-        let l = self.kernel.len();
-        let n = self.n;
         let m = self.m;
-        let d = self.delay;
-        let kern = &self.kernel;
-        let n_as_isize = n as isize;
+        let n = self.n;
+        let xlen = x.len() as isize;
         for (j, y) in out.iter_mut().enumerate() {
-            let pos = (o_start + j) * m;
-            let q = pos / n;
+            let o = o_start + j;
+            let pos = o * m;
+            let q = (pos / n) as isize;
             let p = pos % n;
-            let s = p + d;
-            // k such that 0 <= s + k*n < l; k_lo <= 0 <= k_hi.
-            let k_hi = ((l - 1 - s) / n) as isize;
-            let k_lo = -((s / n) as isize);
-            let q_isize = q as isize;
+            let shift = self.phase_shift[p] as isize;
+            let taps = &self.phase_taps[p];
+            let len = taps.len() as isize;
+            // y[o] = sum_j x[q - (len-1) + shift + j] * taps[j]
+            let s0 = q - (len - 1) + shift;
+            let lo = s0.max(0);
+            let hi = (s0 + len).min(xlen);
             let mut acc = 0.0;
-            let mut k = k_lo;
-            while k <= k_hi {
-                let i = q_isize - k;
-                if i >= 0 && (i as usize) < x.len() {
-                    let idx = (s as isize + k * n_as_isize) as usize;
-                    acc += x[i as usize] * kern[idx];
+            if lo < hi {
+                let a = (lo - s0) as usize;
+                let b = (hi - s0) as usize;
+                let xa = lo as usize;
+                let x_slice = &x[xa..xa + (b - a)];
+                let mut accs = [0.0f64; 8];
+                let mut i = 0usize;
+                let t_slice = &taps[a..b];
+                while i + 8 <= x_slice.len() {
+                    for k in 0..8 {
+                        accs[k] += x_slice[i + k] * t_slice[i + k];
+                    }
+                    i += 8;
                 }
-                k += 1;
+                while i < x_slice.len() {
+                    accs[0] += x_slice[i] * t_slice[i];
+                    i += 1;
+                }
+                acc = accs.iter().sum();
             }
             *y = acc;
         }
@@ -349,7 +390,7 @@ impl Resampler {
 /// input. Output latency is `(delay + n - 1) / n` input frames.
 pub struct StreamResampler {
     base: Resampler,
-    pend: Vec<f64>, // interleaved, starting at global frame `pend_start`
+    pend: Vec<Vec<f64>>, // per channel, starting at global frame `pend_start`
     pend_start: usize,
     total_in: usize,
     next_out: usize,
@@ -388,11 +429,15 @@ impl StreamResampler {
         assert!(x.len() % ch == 0, "input not interleaved at {ch} channels");
         if self.ch == 0 {
             self.ch = ch;
+            self.pend = vec![Vec::new(); ch];
         } else {
             assert_eq!(self.ch, ch, "channel count changed");
         }
-        self.pend.extend_from_slice(x);
-        self.total_in += x.len() / ch;
+        let frames = x.len() / ch;
+        for (c, pend_c) in self.pend.iter_mut().enumerate() {
+            pend_c.extend(x.iter().skip(c).step_by(ch));
+        }
+        self.total_in += frames;
         self.drain()
     }
 
@@ -415,7 +460,7 @@ impl StreamResampler {
     fn drain(&mut self) -> Vec<f64> {
         let ch = self.ch;
         let ctx_future = self.ctx_future();
-        let pend_end = self.pend_start + self.pend.len() / ch;
+        let pend_end = self.pend_start + self.pend[0].len();
         // Emit o while its maximum needed input index q + ctx_future is
         // inside the pending window (q grows with o, so the prefix is
         // contiguous). The left context is guaranteed by the trim below.
@@ -432,47 +477,82 @@ impl StreamResampler {
         let mut out = vec![0.0; cnt * ch];
         self.emit_range(&mut out, self.next_out, ch);
         self.next_out += cnt;
-        // Keep only the past-context needed by the next output.
+        // Keep only the past context needed by the next output.
         let keep_from = (self.next_out * self.base.m / self.base.n)
             .saturating_sub((self.base.kernel.len() - 1) / self.base.n);
-        let drop = (keep_from - self.pend_start) * ch;
+        let drop = keep_from - self.pend_start;
         if drop > 0 {
-            self.pend.drain(..drop);
+            for pend_c in self.pend.iter_mut() {
+                pend_c.drain(..drop);
+            }
             self.pend_start = keep_from;
         }
         out
     }
 
-    /// y[o] = sum_k x[q - k] * kernel[p + d + k*n] for o in [o_lo, o_hi),
-    /// reading from the pending window; out-of-window inputs are zero.
+    /// Emit out[o_lo..) interleaved; dot products use contiguous slices
+    /// (phase taps per output, per-channel pending), split across threads.
     fn emit_range(&self, out: &mut [f64], o_lo: usize, ch: usize) {
-        let l = self.base.kernel.len();
-        let n = self.base.n;
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(16);
+        if threads > 1 && out.len() >= ch * 16 * 1024 {
+            let frames = out.len() / ch;
+            let chunk_frames = frames.div_ceil(threads);
+            let chunk = chunk_frames * ch;
+            std::thread::scope(|s| {
+                for (idx, part) in out.chunks_mut(chunk).enumerate() {
+                    let o = o_lo + idx * chunk_frames;
+                    let this = &*self;
+                    s.spawn(move || this.emit_range_inner(part, o, ch));
+                }
+            });
+        } else {
+            self.emit_range_inner(out, o_lo, ch);
+        }
+    }
+
+    fn emit_range_inner(&self, out: &mut [f64], o_lo: usize, ch: usize) {
         let m = self.base.m;
-        let d = self.base.delay;
-        let kern = &self.base.kernel;
-        let frames = self.pend.len() / ch;
-        let n_as_isize = n as isize;
+        let n = self.base.n;
+        let pend_start = self.pend_start as isize;
+        let frames = self.pend[0].len() as isize;
         for (j, y) in out.iter_mut().enumerate() {
             let o = o_lo + j / ch;
             let c = j % ch;
             let pos = o * m;
-            let q = pos / n;
+            let q = (pos / n) as isize;
             let p = pos % n;
-            let s = p + d;
-            let k_hi = ((l - 1 - s) / n) as isize;
-            let k_lo = -((s / n) as isize);
-            let q_isize = q as isize;
+            let shift = self.base.phase_shift[p] as isize;
+            let taps = &self.base.phase_taps[p];
+            let len = taps.len() as isize;
+            // y[o] = sum_j x[q - (len-1) + shift + j] * taps[j]
+            let s0 = q - (len - 1) + shift - pend_start;
+            let lo = s0.max(0);
+            let hi = (s0 + len).min(frames);
             let mut acc = 0.0;
-            let mut k = k_lo;
-            while k <= k_hi {
-                let gi = q_isize - k;
-                let idx = gi - self.pend_start as isize;
-                if idx >= 0 && (idx as usize) < frames {
-                    let ker = kern[(s as isize + k * n_as_isize) as usize];
-                    acc += self.pend[(idx as usize) * ch + c] * ker;
+            if lo < hi {
+                let a = (lo - s0) as usize;
+                let b = (hi - s0) as usize;
+                let xa = lo as usize;
+                let x_slice = &self.pend[c][xa..xa + (b - a)];
+                // 8 independent accumulators: keeps FMA chains short and
+                // lets the compiler pipeline the scalar loop.
+                let mut accs = [0.0f64; 8];
+                let mut i = 0usize;
+                let t_slice = &taps[a..b];
+                while i + 8 <= x_slice.len() {
+                    for k in 0..8 {
+                        accs[k] += x_slice[i + k] * t_slice[i + k];
+                    }
+                    i += 8;
                 }
-                k += 1;
+                while i < x_slice.len() {
+                    accs[0] += x_slice[i] * t_slice[i];
+                    i += 1;
+                }
+                acc = accs.iter().sum();
             }
             *y = acc;
         }
@@ -492,6 +572,7 @@ pub struct CrossoverStream {
     emitted: usize,
     ch: usize,
     finishing: bool,
+    conv_cache: Option<ConvCache>,
 }
 
 impl CrossoverStream {
@@ -509,6 +590,7 @@ impl CrossoverStream {
             emitted: 0,
             ch: 0,
             finishing: false,
+            conv_cache: None,
         }
     }
 
@@ -551,16 +633,43 @@ impl CrossoverStream {
             return (Vec::new(), Vec::new());
         }
         let n = self.win.len() / ch;
-        let conv = fftconvolve_stereo(&self.win, self.h, ch, n);
+        let conv = self.win_convolve(ch, n);
         let mut low = vec![0.0; cnt * ch];
         let mut high = vec![0.0; cnt * ch];
-        for j in 0..cnt {
-            let gi = self.emitted + j;
-            let wi = gi - self.win_start;
-            for c in 0..ch {
-                let l = conv[(wi + self.d) * ch + c];
-                low[j * ch + c] = l;
-                high[j * ch + c] = self.win[wi * ch + c] - l;
+        // Every output is independent: fill in parallel for large chunks.
+        let threads = std::thread::available_parallelism()
+            .map(|t| t.get())
+            .unwrap_or(1)
+            .min(16);
+        if threads > 1 && cnt >= 16 * 1024 {
+            let chunk = cnt.div_ceil(threads);
+            std::thread::scope(|s| {
+                for (idx, (low_p, high_p)) in low.chunks_mut(chunk * ch).zip(high.chunks_mut(chunk * ch)).enumerate() {
+                    let j0 = idx * chunk;
+                    let self_ref = &*self;
+                    let conv_ref = &conv;
+                    s.spawn(move || {
+                        for (j, (lo, hi)) in low_p.chunks_mut(ch).zip(high_p.chunks_mut(ch)).enumerate() {
+                            let gi = self_ref.emitted + j0 + j;
+                            let wi = gi - self_ref.win_start;
+                            for c in 0..ch {
+                                let l = conv_ref[(wi + self_ref.d) * ch + c];
+                                lo[c] = l;
+                                hi[c] = self_ref.win[wi * ch + c] - l;
+                            }
+                        }
+                    });
+                }
+            });
+        } else {
+            for j in 0..cnt {
+                let gi = self.emitted + j;
+                let wi = gi - self.win_start;
+                for c in 0..ch {
+                    let l = conv[(wi + self.d) * ch + c];
+                    low[j * ch + c] = l;
+                    high[j * ch + c] = self.win[wi * ch + c] - l;
+                }
             }
         }
         self.emitted += cnt;
@@ -573,6 +682,51 @@ impl CrossoverStream {
         }
         (low, high)
     }
+
+    /// FFT convolution of the current window with the FIR kernel, reusing the
+    /// plan and kernel spectrum across chunks (the window length only changes
+    /// when the chunk size does, so the cache hits on every chunk).
+    fn win_convolve(&mut self, ch: usize, n: usize) -> Vec<f64> {
+        let out_len = n + self.h.len() - 1;
+        let fft_len = out_len.next_power_of_two();
+        let cache_ok = self.conv_cache.as_ref().map(|c| c.fft_len == fft_len).unwrap_or(false);
+        if !cache_ok {
+            let mut planner = FftPlanner::<f64>::new();
+            let fwd = planner.plan_fft_forward(fft_len);
+            let inv = planner.plan_fft_inverse(fft_len);
+            let mut hspec = vec![Complex64::default(); fft_len];
+            for (i, &v) in self.h.iter().enumerate() {
+                hspec[i] = Complex64::new(v, 0.0);
+            }
+            fwd.process(&mut hspec);
+            self.conv_cache = Some(ConvCache { fft_len, fwd, inv, hspec });
+        }
+        let c = self.conv_cache.as_ref().unwrap();
+        let mut out = vec![0.0; out_len * ch];
+        let mut buf = vec![Complex64::default(); fft_len];
+        for i in 0..ch {
+            for j in 0..fft_len {
+                buf[j] = Complex64::new(if j < n { self.win[j * ch + i] } else { 0.0 }, 0.0);
+            }
+            c.fwd.process(&mut buf);
+            for j in 0..fft_len {
+                buf[j] = buf[j] * c.hspec[j];
+            }
+            c.inv.process(&mut buf);
+            let scale = 1.0 / fft_len as f64;
+            for j in 0..out_len {
+                out[j * ch + i] = buf[j].re * scale;
+            }
+        }
+        out
+    }
+}
+
+struct ConvCache {
+    fft_len: usize,
+    fwd: std::sync::Arc<dyn rustfft::Fft<f64>>,
+    inv: std::sync::Arc<dyn rustfft::Fft<f64>>,
+    hspec: Vec<Complex64>,
 }
 
 #[cfg(test)]

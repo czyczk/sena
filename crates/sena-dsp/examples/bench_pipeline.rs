@@ -56,6 +56,9 @@ fn main() {
     stage("lf downsample 48k->16k", || {
         Resampler::new(48_000, 16_000).process(&x48, 2).len()
     });
+    stage("lf downsample 48k->32k", || {
+        Resampler::new(48_000, 32_000).process(&x48, 2).len()
+    });
     drop(x48);
 
     // decoder path: 16k LF -> 48k
@@ -63,4 +66,57 @@ fn main() {
     stage("lf upsample 16k->48k", || {
         Resampler::new(16_000, 48_000).process(&x16, 2).len()
     });
+
+    // streaming equivalents (chunk-fed, 1 s chunks)
+    let x48s = stereo(frames, 48_000, 4);
+    stage("stream normalize 44.1k->48k", || {
+        let mut s = sena_dsp::StreamResampler::new(44_100, 48_000);
+        let mut out = 0usize;
+        for c in x44_2().chunks(44_100) {
+            out += s.push(c, 2).len();
+        }
+        out += s.finish(2).len();
+        out
+    });
+    stage("stream lf-down 48k->16k", || {
+        let mut s = sena_dsp::StreamResampler::new(48_000, 16_000);
+        let mut out = 0usize;
+        for c in x48s.chunks(48_000) {
+            out += s.push(c, 2).len();
+        }
+        out += s.finish(2).len();
+        out
+    });
+    stage("stream lf-down 48k->32k", || {
+        let mut s = sena_dsp::StreamResampler::new(48_000, 32_000);
+        let mut out = 0usize;
+        for c in x48s.chunks(48_000) {
+            out += s.push(c, 2).len();
+        }
+        out += s.finish(2).len();
+        out
+    });
+    stage("stream split @300", || {
+        let mut s = sena_dsp::CrossoverStream::new(300.0);
+        let mut out = 0usize;
+        for c in x48s.chunks(48_000) {
+            let (l, h) = s.push(c, 2);
+            out += l.len() + h.len();
+        }
+        let (l, h) = s.finish(2);
+        out + l.len() + h.len()
+    });
+}
+
+fn x44_2() -> Vec<f64> {
+    let frames = 44_100 * 30;
+    let mut x = Vec::with_capacity(frames * 2);
+    for i in 0..frames {
+        for ch in 0..2 {
+            let t = i as f64 / 44_100.0;
+            let tone = (2.0 * std::f64::consts::PI * 130.0 * t).sin();
+            x.push(tone * 0.8 + (ch as f64) * 0.01);
+        }
+    }
+    x
 }
