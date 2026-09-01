@@ -167,7 +167,7 @@ void input_sena::retag(const file_info &info, abort_callback &abort) {
         // required. Skip them: the transfer then succeeds without pictures
         // instead of failing with "error transferring attached pictures".
         if (stricmp_utf8(key, "PICTURE") == 0) {
-            console::formatter() << "foo_input_sena: skipping attached picture (not supported in .sena tags);";
+            console::print("foo_input_sena: skipping attached picture (not supported in .sena tags)");
             return;
         }
         entries.add_item(SenaMetaEntry{key, value});

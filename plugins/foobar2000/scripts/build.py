@@ -401,8 +401,8 @@ def _build_windows_arch(arch, vs, sdk, wtmp, wtmp_win, libs_win):
          f"/p:SENA_LIB_DIR={libs_win}",
          f"/p:OutDir={out_win}\\",
          f"/p:IntDir={obj_win}\\",
-         "/m:1", "/p:UseMultiToolTask=false", "/p:PrecompiledHeader=NotUsing",
-         "/v:minimal"])
+         "/m:1", "/p:UseMultiToolTask=false", "/p:MultiProcessorCompilation=false",
+         "/p:PrecompiledHeader=NotUsing", "/v:minimal"])
     dll = outroot / arch / "foo_input_sena.dll"
     if not dll.exists():
         raise ToolError(f"MSBuild did not produce {dll}")
@@ -594,6 +594,7 @@ def build_mac_plugin(arches=MAC_ARCHES):
     }
     triples = {"arm64": "arm64-apple-macos11", "x86_64": "x86_64-apple-macos11"}
     rust_targets = {"arm64": "aarch64-apple-darwin", "x86_64": "x86_64-apple-darwin"}
+    failures = []
     common = ["-isysroot", str(sysroot), "-stdlib=libc++", "-std=gnu++20",
               "-fobjc-arc", "-DNDEBUG=1", "-O2",
               "-I", str(sdk), "-I", str(sdk / "foobar2000"),
