@@ -122,11 +122,18 @@ pub fn rewrite_attachments(original: &[u8], attachments: &[Attachment]) -> Resul
     let new_size = encode_vint_exact((out.len() - seg.payload_start) as u64, seg.elem.size_len)?;
     out.splice(size_pos..size_pos + seg.elem.size_len, new_size.iter().copied());
 
-    // Verify the result still parses and the immutable Sena tags survive.
+    // Verify the result still parses and the immutable Sena tags (including
+    // the pure-audio content hash) survive.
     let check = Demuxed::parse(out.clone()).map_err(|e| format!("rewritten file invalid: {e}"))?;
-    for key in ["SENA_PROFILE", "SENA_VERSION", "SENA_PLAYABLE_SAMPLES"] {
-        if check.immutable_tag(key).is_none() {
-            return Err(format!("immutable tag {key} lost after attachment rewrite"));
+    for key in ["SENA_PROFILE", "SENA_VERSION", "SENA_PLAYABLE_SAMPLES", "SENA_AUDIO_SHA256"] {
+        let before = Demuxed::parse(original.to_vec())
+            .map_err(|e| e.to_string())?
+            .immutable_tag(key)
+            .map(|s| s.to_string());
+        if let Some(v) = before {
+            if check.immutable_tag(key) != Some(v.as_str()) {
+                return Err(format!("immutable tag {key} changed after attachment rewrite"));
+            }
         }
     }
     Ok(out)
