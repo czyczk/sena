@@ -162,6 +162,7 @@ void input_sena::retag(const file_info &info, abort_callback &abort) {
 
     pfc::list_t<SenaMetaEntry> entries;
     t_size skipped = 0;
+    t_size rg_written = 0;
     info.meta_enumerate([&](const char *key, const char *value) {
         // Attached pictures reach the tag writer as "PICTURE" meta with a
         // binary payload that Matroska string tags cannot hold; pictures
@@ -172,10 +173,20 @@ void input_sena::retag(const file_info &info, abort_callback &abort) {
             skipped++;
             return;
         }
+        // ReplayGain values travel in file_info's info (replaygain_info),
+        // not in meta; some sources also carry the meta form - keep meta
+        // entries as-is (they are the same strings).
         entries.add_item(SenaMetaEntry{key, value});
     });
+    // ReplayGain: foobar stores these in the info section (replaygain_info);
+    // read them from there so the values actually reach the file.
+    info.get_replaygain().for_each([&](const char *key, const char *value) {
+        entries.add_item(SenaMetaEntry{key, value});
+        rg_written++;
+    });
     pfc::string8 dbg;
-    dbg << "foo_input_sena: retag writing " << entries.get_count() << " entries (skipped " << skipped << " pictures)";
+    dbg << "foo_input_sena: retag writing " << entries.get_count() << " entries (skipped " << skipped
+        << " pictures, " << rg_written << " replaygain from info)";
     console::print(dbg);
 
     SenaFileIo io{};
@@ -273,12 +284,21 @@ void input_sena::read_user_tags(file_info &info, abort_callback &abort) {
         return;
     }
     uint32_t n = sena_tags_count(tags);
+    replaygain_info rg;
     for (uint32_t i = 0; i < n; ++i) {
         const char *key = sena_tags_key(tags, i);
         const char *value = sena_tags_value(tags, i);
-        if (key && value) {
-            info.meta_add(key, value);
+        if (!key || !value) continue;
+        info.meta_add(key, value);
+        // ReplayGain must also be exposed through the info section
+        // (replaygain_info) for foobar's RG display/gain application.
+        if (replaygain_info::g_is_meta_replaygain(key)) {
+            rg.set_from_meta(key, value);
         }
+    }
+    if (rg.is_track_gain_present() || rg.is_album_gain_present()
+        || rg.is_track_peak_present() || rg.is_album_peak_present()) {
+        info.set_replaygain(rg);
     }
     pfc::string8 dbg;
     dbg << "foo_input_sena: read back " << n << " user tags";

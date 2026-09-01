@@ -895,6 +895,31 @@ mod tests {
     }
 
     #[test]
+    fn wav_stream_ignores_trailing_bytes_after_declared_data() {
+        // foobar-style pipes: the header declares the real data size; bytes
+        // after the data chunk (metadata/padding) must never become samples.
+        let mut bytes = synth_wav(3, 44100, false);
+        let declared = bytes.len() - 44;
+        bytes.extend_from_slice(b"LIST\x00\x00\x00\x80"); // fake trailing junk
+        bytes.extend_from_slice(&[0u8; 100]);
+        let (batch, _, _) = wav::read_f64_bytes(&bytes).unwrap();
+        let mut ws = wav::WavStream::new();
+        for chunk in bytes.chunks(1800) {
+            ws.feed(chunk).unwrap();
+        }
+        ws.finish().unwrap();
+        let mut got = Vec::new();
+        loop {
+            match ws.take(4096).unwrap() {
+                Some(x) => got.extend(x),
+                None => break,
+            }
+        }
+        assert_eq!(got.len(), batch.len());
+        assert_eq!(got.len() / 2 * 4, declared, "decoded bytes must equal the declared data size");
+    }
+
+    #[test]
     fn stream_dsp_matches_batch_dsp() {
         // Drive encode_stream far enough to write the temp band WAVs (the
         // codec step then fails on the fake exhale path), and compare those

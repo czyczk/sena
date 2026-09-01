@@ -142,12 +142,25 @@ pub struct WavStream {
     rate: u32,
     bits: usize,
     fmt: u16,
+    /// Maximum frames from the header's data-chunk size when sane
+    /// (streaming pipes often declare 0 / 0xFFFFFFFF -> run until EOF).
+    declared_frames: Option<usize>,
+    frames_taken: usize,
     buf: Vec<u8>, // after parse: data payload only
 }
 
 impl WavStream {
     pub fn new() -> Self {
-        Self { parsed: false, ch: 0, rate: 0, bits: 0, fmt: 0, buf: Vec::new() }
+        Self {
+            parsed: false,
+            ch: 0,
+            rate: 0,
+            bits: 0,
+            fmt: 0,
+            declared_frames: None,
+            frames_taken: 0,
+            buf: Vec::new(),
+        }
     }
 
     /// Append bytes; tries to parse the header once enough is available.
@@ -170,11 +183,13 @@ impl WavStream {
         let mut pos = 12;
         let mut fmt_info: Option<(usize, u32, usize, u16)> = None;
         let mut data = None;
+        let mut data_len = 0usize;
         while pos + 8 <= f.len() {
             let id = &f[pos..pos + 4];
             let sz = u32::from_le_bytes([f[pos + 4], f[pos + 5], f[pos + 6], f[pos + 7]]) as usize;
             if id == b"data" {
                 data = Some(pos + 8);
+                data_len = sz;
                 break;
             }
             if pos + 8 + sz > f.len() {
@@ -201,6 +216,13 @@ impl WavStream {
         self.rate = rate;
         self.bits = bits;
         self.fmt = fmt;
+        // The data chunk size as declared: sane sizes are authoritative so
+        // any trailing bytes after the audio (metadata/padding the pipe may
+        // append) are never decoded as samples. 0 / 0xFFFFFFFF = stream to
+        // EOF.
+        let block = bits / 8 * ch;
+        let dsz = if data_len == 0 || data_len == usize::MAX { None } else { Some(data_len) };
+        self.declared_frames = dsz.map(|d| d / block);
         self.buf.drain(..ds);
         Ok(())
     }
@@ -227,7 +249,14 @@ impl WavStream {
         if self.buf.len() < block {
             return Ok(None);
         }
-        let n = (self.buf.len() / block).min(target_frames);
+        let mut n = (self.buf.len() / block).min(target_frames);
+        if let Some(d) = self.declared_frames {
+            let left = d.saturating_sub(self.frames_taken);
+            if left == 0 {
+                return Ok(None);
+            }
+            n = n.min(left);
+        }
         let mut out = Vec::with_capacity(n * self.ch);
         match (self.fmt, self.bits) {
             (1, 8) => {
@@ -264,6 +293,7 @@ impl WavStream {
             _ => return Err(Error::Format(format!("unsupported WAV format {} {}bit", self.fmt, self.bits))),
         }
         self.buf.drain(..n * block);
+        self.frames_taken += n;
         Ok(Some(out))
     }
 
