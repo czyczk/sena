@@ -25,9 +25,14 @@ entry: symptom -> root cause -> fix. Companion to
 - Cause: `file_info::meta_enumerate()` does NOT include ReplayGain. RG is
   in `replaygain_info` (`get_replaygain()` / `set_replaygain()`); writers
   must enumerate it with `replaygain_info::for_each(...)` and readers must
-  `set_replaygain()` after parsing meta (use
+  `set_replaygain()` after parsing the stored tags (use
   `g_is_meta_replaygain`/`set_from_meta`, case-insensitive - foobar emits
   lowercase `replaygain_track_gain`, transferred tags are usually uppercase).
+- READ side: NEVER `meta_add()` the REPLAYGAIN_* keys - other formats'
+  readers expose RG exclusively through `set_replaygain()`, and the
+  Properties Metadata tab shows raw meta entries; adding them as meta
+  makes RG appear in BOTH tabs (wrong). The stored string tags stay the
+  same; only the exposure differs.
 
 ### `replaygain_info::for_each` reuses one transient text buffer
 - Symptom: stored values were garbage (`\x15;\x15`), or last-value-wins.

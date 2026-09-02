@@ -320,11 +320,14 @@ void input_sena::read_user_tags(file_info &info, abort_callback &abort) {
         const char *key = sena_tags_key(tags, i);
         const char *value = sena_tags_value(tags, i);
         if (!key || !value) continue;
-        info.meta_add(key, value);
-        // ReplayGain must also be exposed through the info section
-        // (replaygain_info) for foobar's RG display/gain application.
+        // ReplayGain is exposed ONLY through the info section
+        // (replaygain_info), like every other format's reader: adding the
+        // REPLAYGAIN_* keys as meta makes them show up in the Metadata tab,
+        // which FLAC/MP3 readers do not do.
         if (replaygain_info::g_is_meta_replaygain(key)) {
             rg.set_from_meta(key, value);
+        } else {
+            info.meta_add(key, value);
         }
     }
     if (rg.is_track_gain_present() || rg.is_album_gain_present()
