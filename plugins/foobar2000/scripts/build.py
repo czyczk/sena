@@ -684,6 +684,31 @@ def build_mac_plugin(arches=MAC_ARCHES):
 <key>CFBundlePackageType</key><string>BNDL</string>
 <key>CFBundleShortVersionString</key><string>0.1.0</string>
 <key>CFBundleVersion</key><string>1</string>
+<key>UTExportedTypeDeclarations</key>
+<array>
+  <dict>
+    <key>UTTypeIdentifier</key><string>io.sena.audio</string>
+    <key>UTTypeDescription</key><string>Sena audio</string>
+    <key>UTTypeConformsTo</key><array><string>public.audio</string><string>public.data</string></array>
+    <key>UTTypeTagSpecification</key>
+    <dict>
+      <key>public.filename-extension</key>
+      <array><string>sena</string></array>
+    </dict>
+  </dict>
+</array>
+<key>CFBundleDocumentTypes</key>
+<array>
+  <dict>
+    <key>CFBundleTypeName</key><string>Sena audio</string>
+    <key>CFBundleTypeRole</key><string>Viewer</string>
+    <key>LSHandlerRank</key><string>Owner</string>
+    <key>CFBundleTypeExtensions</key>
+    <array><string>sena</string><string>mka</string></array>
+    <key>LSItemContentTypes</key>
+    <array><string>io.sena.audio</string><string>org.matroska.mka</string></array>
+  </dict>
+</array>
 </dict></plist>''')
     print("macOS component written to", bundle_dir)
 

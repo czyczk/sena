@@ -147,6 +147,22 @@ entry: symptom -> root cause -> fix. Companion to
   never resolves on Windows - the classic "exhale.exe is right there"
   bug).
 
+## File association / "Open With"
+
+- Windows: the component declares its extensions via
+  `DECLARE_FILE_TYPE("Sena files", "*.SENA;*.MKA")`. foobar2000 itself
+  handles shell registration: Preferences -> Shell Integration lists the
+  component's file types and applying them pops the UAC prompt the user
+  saw. Nothing else is needed from the component; if the OS still asks
+  for a program, apply the association once in foobar's Shell
+  Integration page.
+- macOS: `Open With` / Recommended Applications come from
+  CFBundleDocumentTypes. Add them (plus a UTExportedTypeDeclarations UTI
+  for the private extension) to the component bundle's Info.plist;
+  LaunchServices picks them up from bundles nested in the host app. The
+  app itself may also need its association applied once from foobar's
+  settings.
+
 ## ABI growth
 - Appending fields to a `#[repr(C)]` info struct is fine only when the
   plugin and the Rust lib ship together (they do, in one package). Keep
