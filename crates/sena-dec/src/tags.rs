@@ -243,7 +243,7 @@ pub fn rewrite_user_tags(original: &[u8], entries: &[(String, String)]) -> Resul
     out.splice(size_pos..size_pos + seg.elem.size_len, new_size.iter().copied());
 
     // Verify the result still parses and the immutable Sena tags (including
-    // the pure-audio content hash) remain at the head.
+    // the encoded-audio stream hash) remain at the head.
     let check = Demuxed::parse(out.clone()).map_err(|e| format!("rewritten file invalid: {e}"))?;
     for key in ["SENA_PROFILE", "SENA_VERSION", "SENA_PLAYABLE_SAMPLES", "SENA_AUDIO_SHA256"] {
         let before = Demuxed::parse(original.to_vec())

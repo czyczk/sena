@@ -8,7 +8,7 @@ description = "Sena decoder core: demux, external codec adapters, trim/mix, C AB
 
 [features]
 default = ["simd"]
-simd = ["opus-decoder/simd"]
+simd = ["opus-decoder/simd", "rxaac-dec-lib/simd"]
 
 [dependencies]
 sena-core.workspace = true

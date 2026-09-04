@@ -49,8 +49,8 @@ pub struct DecodedInfo {
     pub playable_frames: u64,
     pub profile: u32,
     pub sena_version: u32,
-    /// SENA_AUDIO_SHA256 tag (content hash of the normalized 48 kHz stereo
-    /// f32 PCM); empty for files that predate the tag.
+    /// SENA_AUDIO_SHA256 tag (hash of the encoded Opus + xHE-AAC elementary
+    /// streams carried by the container); empty for files that predate the tag.
     pub audio_sha256: String,
 }
 
@@ -125,13 +125,8 @@ pub(crate) fn parse_opus_head(data: &[u8]) -> Result<OpusHead, DecodeError> {
     })
 }
 
-fn decode_lf(
-    track: &Track,
-    frames: &[Frame],
-    asc: &AudioSpecificConfig,
-) -> Result<(Vec<f32>, Vec<LfAuInfo>, usize, usize), DecodeError> {
-    let mut dec = UsacDecoder::new(asc)
-        .map_err(|e| DecodeError::Codec(format!("rxaac init: {e}")))?;
+fn lf_decoder(track: &Track, asc: &AudioSpecificConfig) -> Result<UsacDecoder, DecodeError> {
+    let dec = UsacDecoder::new(asc).map_err(|e| DecodeError::Codec(format!("rxaac init: {e}")))?;
     if dec.num_channels() != 2 {
         return Err(DecodeError::Unsupported(format!(
             "rxaac channels {}, expected 2",
@@ -145,32 +140,56 @@ fn decode_lf(
             track.sample_rate
         )));
     }
+    Ok(dec)
+}
+
+fn decode_lf(
+    track: &Track,
+    frames: &[Frame],
+    asc: &AudioSpecificConfig,
+) -> Result<(Vec<f32>, Vec<LfAuInfo>, usize, usize), DecodeError> {
+    let mut dec = lf_decoder(track, asc)?;
+    let core_rate = dec.output_rate();
+    // Cache the valid frame geometry before any decode so failed-frame
+    // padding never has to query a decoder that may have been left in an
+    // inconsistent state by the failed AU.
+    let frame_samples = dec.output_samples() * dec.num_channels();
     let mut pcm: Vec<f32> = Vec::new();
     let mut infos = Vec::with_capacity(frames.len());
     let mut errors = 0usize;
     for frame in frames {
 
         let before = pcm.len();
+        // rxaac's contract is Result, and the current deterministic fuzz
+        // corpus (upstream + `tests/rxaac_fuzz.rs`) is panic-free. Keep this
+        // catch only as a thin last resort so a future decoder panic becomes
+        // a clean DecodeError for the host instead of aborting the process.
+        // A panic means the decoder state can no longer be trusted, so we
+        // fail the decode instead of trying to continue.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             dec.decode_au(&frame.data, &mut pcm)
         }));
-        let failed = match result {
+        match result {
             Ok(Err(e)) => {
                 eprintln!("warning: LF AU decode error ({}): {e}", frame.t_ns);
-                true
+                // decode_au may append preroll frames before the main AU
+                // fails. A failed AU can also leave decoder state partially
+                // mutated, and rxaac exposes no reset(); recreate from the
+                // container ASC so one bad AU cannot poison the following
+                // frames. The silence length comes from the cached valid
+                // geometry above.
+                pcm.truncate(before);
+                pcm.resize(before + frame_samples, 0.0);
+                errors += 1;
+                dec = lf_decoder(track, asc)?;
             }
             Err(_) => {
-                eprintln!("warning: LF AU decoder panic ({}); replacing with silence", frame.t_ns);
-                true
+                return Err(DecodeError::Codec(format!(
+                    "rxaac decoder panicked on LF AU ({}); aborting decode",
+                    frame.t_ns
+                )));
             }
-            Ok(Ok(())) => false,
-        };
-        if failed {
-            // A panicking decode_au may have appended a partial frame.
-            pcm.truncate(before);
-            let n = dec.output_samples() * dec.num_channels();
-            pcm.resize(before + n, 0.0);
-            errors += 1;
+            Ok(Ok(())) => {}
         }
         let after = pcm.len();
         let ch = dec.num_channels();

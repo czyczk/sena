@@ -49,7 +49,8 @@ pub struct SenaDecInfo {
     pub playable_frames: u64,
     pub profile: u32,
     pub sena_version: u32,
-    /// SENA_AUDIO_SHA256 (64 hex chars + NUL); empty for files without it.
+    /// SENA_AUDIO_SHA256, hash of the encoded Opus + xHE-AAC streams
+    /// (64 hex chars + NUL); empty for files without it.
     pub audio_sha256: [c_char; 65],
 }
 

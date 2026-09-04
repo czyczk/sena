@@ -54,20 +54,39 @@ authority for trimming.
 
 ### Requirement: Audio content hash
 The container SHALL carry a top-level tag `SENA_AUDIO_SHA256` whose value
-is the SHA-256 (64 lowercase hex characters) of the canonical audio
-content: the normalized 48 kHz stereo PCM stream (interleaved float32,
-little-endian) that represents the playable timeline. It is the FLAC
-Audio-MD5 equivalent for Sena: deterministic for the same source audio
-regardless of the input sample rate or bit depth (the input is
-normalized to 48 kHz before hashing). Files produced before the tag was
-introduced simply do not carry it.
+is the SHA-256 (64 lowercase hex characters) of the encoded audio elementary
+streams carried by the container, not of the input PCM or the decoded output.
 
-#### Scenario: Content hash present
+The canonical byte sequence hashed SHALL be:
+
+1. the ASCII domain separator `SENA encoded audio sha256 v1\0`;
+2. `u32` little-endian stream count (`2`);
+3. for each stream, in Sena track order (`A_OPUS` first, then `A_SENALF`):
+   - `u32` little-endian byte length of the codec ID, then its UTF-8 bytes;
+   - `u32` little-endian byte length of the stream's CodecPrivate bytes,
+     then those bytes (`OpusHead` for the Opus track, the ASC for the LF
+     xHE-AAC track);
+   - `u64` little-endian packet/frame count;
+   - for each packet/frame in decode order: `u32` little-endian byte length,
+     then the packet bytes.
+
+The Opus stream contributes the OpusHead packet plus all Opus audio packets
+(excluding the discarded OpusTags packet). The xHE-AAC stream contributes
+the ASC plus all raw AUs. Container timestamps, tags, cluster layout, and
+any file metadata SHALL NOT affect the hash.
+
+Files produced before this requirement was finalized may carry no tag or a
+legacy normalized-PCM hash; they are accepted but their hash does not match
+this algorithm.
+
+#### Scenario: Content hash is the encoded streams
 - GIVEN a Sena file encoded by a tag-aware encoder
-- THEN SENA_AUDIO_SHA256 is a 64-char hex SHA-256 of the normalized
-  48 kHz stereo f32 PCM (verifiable by re-computing from the source:
-  for a 48 kHz source it equals SHA-256 of the interleaved float32
-  samples).
+- THEN SENA_AUDIO_SHA256 is a 64-char hex SHA-256 of the encoded Opus and
+  xHE-AAC elementary streams as defined above, and equals a re-computation
+  from the file's CodecPrivate elements and packet/frame payloads.
+- AND encoding the same source with different codec parameters (bitrate,
+  profile, or codec version) SHALL produce a different hash whenever the
+  encoded streams differ.
 
 ### Requirement: Playable length metadata
 The container SHALL carry a top-level tag `SENA_PLAYABLE_SAMPLES` whose

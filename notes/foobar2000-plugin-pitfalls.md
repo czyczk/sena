@@ -101,13 +101,17 @@ entry: symptom -> root cause -> fix. Companion to
   batch reader and the streaming reader consistent.
 
 ### Audio content hash (SENA_AUDIO_SHA256)
-- Hash ONLY the canonical audio (normalized 48 kHz stereo interleaved
-  f32 LE - the playable timeline); never container layout, timestamps,
-  tags, attachments/FileUID, or codec payloads. Preserve it across tag /
-  attachment rewrites (tests enforce byte equality when present).
-- Cross-library known-vector tests: avoid transcendental functions
-  (libm sin differs by 1 ULP across implementations -> different hashes).
-  Use exactly-representable signals (linear ramps).
+- Hash the encoded elementary streams carried in the file, not the input
+  PCM or decoded output: OpusHead + Opus packets for A_OPUS, ASC + raw AUs
+  for A_SENALF, length-prefixed in track order (`encoded_audio_sha256`).
+- Never include container layout, timestamps, tags, attachments/FileUID,
+  or Ogg/M4A container bytes in the hash. Preserve the tag byte-for-byte
+  across tag / attachment rewrites (tests enforce this).
+- Different codec parameters MUST change the tag: if two .sena files made
+  with different parameters still have equal SENA_AUDIO_SHA256, the hash is
+  hashing the wrong thing (this was the original PCM-hash bug).
+- Known-vector test uses synthetic byte streams; no transcendental
+  functions are involved.
 
 ## Build / cross-compile traps
 

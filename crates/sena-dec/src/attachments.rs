@@ -123,7 +123,7 @@ pub fn rewrite_attachments(original: &[u8], attachments: &[Attachment]) -> Resul
     out.splice(size_pos..size_pos + seg.elem.size_len, new_size.iter().copied());
 
     // Verify the result still parses and the immutable Sena tags (including
-    // the pure-audio content hash) survive.
+    // the encoded-audio stream hash) survive.
     let check = Demuxed::parse(out.clone()).map_err(|e| format!("rewritten file invalid: {e}"))?;
     for key in ["SENA_PROFILE", "SENA_VERSION", "SENA_PLAYABLE_SAMPLES", "SENA_AUDIO_SHA256"] {
         let before = Demuxed::parse(original.to_vec())
