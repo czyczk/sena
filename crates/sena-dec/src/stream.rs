@@ -557,6 +557,16 @@ impl StreamingDecoder {
             frames: got,
             payload_bits: (bits_end - bits_start).max(0.0).round() as u64,
         };
+        // Entries at/below the cursor can never be read again (a seek resets
+        // the prefix), so rebase the vector onto the cursor after every read.
+        // Without this the prefix grows by 8 B per produced frame for the
+        // whole track (~90 MB for a 4 min track) - steady in-track growth on
+        // the host, and fatal on a 32-bit address space.
+        let consumed = (self.cursor - self.bits_base) as usize;
+        if consumed > 0 {
+            self.bits_prefix.drain(..consumed);
+            self.bits_base = self.cursor;
+        }
         Ok(got)
     }
 
@@ -638,4 +648,48 @@ impl StreamingDecoder {
         }
     }
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::demux::Demuxed;
+
+    /// The bit-accounting prefix must stay bounded to produced-but-unread
+    /// frames; it used to grow by one f64 per frame for the whole track
+    /// (steady memory growth visible in the host during playback).
+    #[test]
+    fn bits_prefix_stays_bounded_over_full_decode() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/e2e/01__p300__lfa__hf144.sena");
+        let bytes = std::fs::read(path).unwrap();
+        let mut dec = StreamingDecoder::open(Demuxed::parse(bytes).unwrap()).unwrap();
+        let playable = dec.info().playable_frames;
+        let mut buf = vec![0.0f32; 4096 * 2];
+        let mut total = 0u64;
+        let mut max_prefix = 0usize;
+        loop {
+            let n = dec.read_f32(&mut buf, 4096).unwrap();
+            if n == 0 {
+                break;
+            }
+            total += n;
+            max_prefix = max_prefix.max(dec.bits_prefix.len());
+        }
+        assert_eq!(total, playable);
+        // A read produces at most a couple of ~100 ms decode chunks ahead of
+        // the cursor; before the fix this reached playable_frames + 1
+        // (960001 entries for this asset).
+        assert!(max_prefix <= 100_000, "bits_prefix grew to {max_prefix} entries");
+
+        // Seeking mid-stream and reading on must stay bounded too.
+        dec.seek(playable / 2).unwrap();
+        loop {
+            let n = dec.read_f32(&mut buf, 4096).unwrap();
+            if n == 0 {
+                break;
+            }
+            max_prefix = max_prefix.max(dec.bits_prefix.len());
+        }
+        assert!(max_prefix <= 100_000, "bits_prefix grew to {max_prefix} entries after seek");
+    }
 }

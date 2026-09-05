@@ -6,6 +6,14 @@
 
 class input_sena : public input_stubs {
 public:
+    // The decoder handle is a raw pointer into the Rust staticlib and is NOT
+    // freed by close-on-reopen alone: foobar destroys this instance after
+    // playback / info read / RG scan, and without a destructor the whole
+    // Rust-side decoder (frame index, decode buffers) leaks per track.
+    // (input_stubs is non-polymorphic and this class is stored by value in
+    // the SDK wrapper, so this is a plain dtor, not an override.)
+    ~input_sena();
+
     void open(service_ptr_t<file> hint, const char *path,
               t_input_open_reason reason, abort_callback &abort);
     void get_info(file_info &info, abort_callback &abort);

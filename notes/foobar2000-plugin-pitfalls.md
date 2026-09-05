@@ -201,3 +201,25 @@ entry: symptom -> root cause -> fix. Companion to
 - Downstream note: no changes were needed in `ropus` / `rxaac-dec`; their
   decoders are per-instance and allocate only bounded per-frame buffers.
   Keep it that way (no global mutable state, no whole-file buffers).
+
+### Leaks: the host never calls any "decode end" cleanup
+- Symptom: memory climbs DURING playback of one track, climbs again per
+  track switch; RG scan memory is never released afterwards. On 32-bit
+  this is a guaranteed crash after enough tracks.
+- Cause 1 (C++): foobar2000 destroys the input instance when done - there
+  is no "stop/close" callback. `input_sena` held `SenaDec*` and only freed
+  it on the next `open_decoder()`; every played/scanned track leaked the
+  whole Rust decoder. Fix: `~input_sena()` calls `close_decoder()`. Any
+  native handle member in an input class MUST be released from the dtor
+  (cf. vgmstream's `~input_vgmstream` doing `libvgmstream_free`).
+  `input_stubs` is non-polymorphic and the SDK wrapper stores the instance
+  by value, so a plain dtor suffices (no `override`).
+- Cause 2 (Rust): `StreamingDecoder::bits_prefix` appended one f64 per
+  produced frame and only reset on seek - ~90 MB for a 4 min track, i.e.
+  growth even within one file. Fix: rebase the prefix onto the read cursor
+  after every `read_f32` (entries at/below the cursor are unreachable; a
+  seek resets the prefix anyway). Test:
+  `stream::tests::bits_prefix_stays_bounded_over_full_decode`.
+- Diagnosis tip: "grows within one track" = per-frame/chunk accounting
+  structure; "grows per track, never released" = missing dtor/close. The
+  two are independent and both were present.

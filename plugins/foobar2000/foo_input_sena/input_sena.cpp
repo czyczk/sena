@@ -22,6 +22,13 @@ void throw_sena_error(int code) {
 
 } // namespace
 
+input_sena::~input_sena() {
+    // Drops the Rust decoder handle (index + buffers). Pure deallocation:
+    // no io callbacks fire during sena_dec_close, so no abort_callback is
+    // needed here.
+    close_decoder();
+}
+
 void input_sena::open(service_ptr_t<file> hint, const char *path,
                       t_input_open_reason reason, abort_callback &abort) {
     m_file = hint;
