@@ -116,7 +116,7 @@ Notes:
 just doctor                          # build-environment check
 just test                            # workspace tests
 just senadec-plugin-fb2k-all         # windows x86/x64/arm64ec + macOS + zipped .fb2k-component
-just senaenc                         # encoder CLI release binaries (windows x64/arm64 + macOS Universal)
+just senaenc                         # encoder CLI release binaries (windows x64/arm64 + Linux x64/arm64 + macOS Universal)
 just senadec-bin                     # decoder CLI release binaries (same targets)
 ```
 
@@ -143,12 +143,14 @@ Standalone `senaenc` release builds (no `opusenc`/`exhale` needed at build
 time; they are runtime dependencies only):
 
 ```bash
-just senaenc                                        # Windows x64 + arm64 + macOS Universal -> build/senaenc
+just senaenc                                        # Windows x64/arm64 + Linux x64/arm64 + macOS Universal -> build/senaenc
 just senaenc "linux-x64"                            # any supported alias/full Rust triple
 SENAENC_OUT=/tmp/x SENAENC_VS=2026 just senaenc     # env overrides
 just --set senaenc_out /tmp/x --set senaenc_vs 2022 senaenc
 just senaenc-win-x64
 just senaenc-win-arm64
+just senaenc-linux-x64
+just senaenc-linux-arm64
 just senaenc-macos-universal
 just senaenc-list-targets
 ```

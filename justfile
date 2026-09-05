@@ -19,6 +19,8 @@ senaenc_out := env_var_or_default("SENAENC_OUT", "build/senaenc")
 senadec_out := env_var_or_default("SENADEC_OUT", "build/senadec")
 senaenc_vs := env_var_or_default("SENAENC_VS", "auto")
 senaenc_linker := env_var_or_default("SENAENC_LINKER", "auto")
+# Default release targets shared by the senaenc and senadec-bin recipes.
+release_targets := "windows-x64 windows-arm64 linux-x64 linux-arm64 macos-universal"
 FOOBAR_SDK := env_var_or_default("FOOBAR_SDK", "~/src/public/foobar2000-research/SDK-2025-03-07")
 FOOBAR_EXE := env_var_or_default("FOOBAR_EXE", "C:\\Program Files\\foobar2000\\foobar2000.exe")
 
@@ -109,17 +111,17 @@ senadec-plugin-fb2k-install:
 
 # ---------------------------------------------------------------------------
 # senaenc release binaries (encoder CLI; no opusenc/exhale needed at build
-# time - runtime deps only). Default: Windows x64 + Windows arm64 + macOS
-# Universal into build/senaenc (repo-local, git-ignored).
+# time - runtime deps only). Default: Windows x64 + arm64, Linux x64 + arm64
+# and macOS Universal into build/senaenc (repo-local, git-ignored).
 #
-#   just senaenc                        # the three requested targets
+#   just senaenc                        # the five default targets
 #   just senaenc "linux-x64"            # any supported alias/full triple
 #   SENAENC_OUT=/tmp/x just senaenc     # output elsewhere (--set senaenc_out)
 #   SENAENC_VS=2022 just senaenc        # VS auto/2022/2026
 #   SENAENC_LINKER=xwin just senaenc    # auto/xwin/vs/cargo
 # ---------------------------------------------------------------------------
 
-senaenc targets="windows-x64 windows-arm64 macos-universal":
+senaenc targets=release_targets:
     @python3 "{{release_bin_script}}" --pkg senaenc --out "{{senaenc_out}}" --vs "{{senaenc_vs}}" --linker "{{senaenc_linker}}" {{targets}}
 
 senaenc-win-x64:
@@ -127,6 +129,12 @@ senaenc-win-x64:
 
 senaenc-win-arm64:
     @python3 "{{release_bin_script}}" --pkg senaenc --target windows-arm64 --out "{{senaenc_out}}" --vs "{{senaenc_vs}}" --linker "{{senaenc_linker}}"
+
+senaenc-linux-x64:
+    @python3 "{{release_bin_script}}" --pkg senaenc --target linux-x64 --out "{{senaenc_out}}"
+
+senaenc-linux-arm64:
+    @python3 "{{release_bin_script}}" --pkg senaenc --target linux-arm64 --out "{{senaenc_out}}"
 
 senaenc-macos-universal:
     @python3 "{{release_bin_script}}" --pkg senaenc --target macos-universal --out "{{senaenc_out}}"
@@ -139,7 +147,7 @@ senaenc-list-targets:
 # senaenc; outputs go to build/senadec by default.
 # ---------------------------------------------------------------------------
 
-senadec-bin targets="windows-x64 windows-arm64 macos-universal":
+senadec-bin targets=release_targets:
     @python3 "{{release_bin_script}}" --pkg senadec --out "{{senadec_out}}" --vs "{{senaenc_vs}}" --linker "{{senaenc_linker}}" {{targets}}
 
 senadec-bin-win-x64:
@@ -147,6 +155,12 @@ senadec-bin-win-x64:
 
 senadec-bin-win-arm64:
     @python3 "{{release_bin_script}}" --pkg senadec --target windows-arm64 --out "{{senadec_out}}" --vs "{{senaenc_vs}}" --linker "{{senaenc_linker}}"
+
+senadec-bin-linux-x64:
+    @python3 "{{release_bin_script}}" --pkg senadec --target linux-x64 --out "{{senadec_out}}"
+
+senadec-bin-linux-arm64:
+    @python3 "{{release_bin_script}}" --pkg senadec --target linux-arm64 --out "{{senadec_out}}"
 
 senadec-bin-macos-universal:
     @python3 "{{release_bin_script}}" --pkg senadec --target macos-universal --out "{{senadec_out}}"
