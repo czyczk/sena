@@ -166,7 +166,12 @@ elsewhere; relative paths resolve against the repo root.
 Supported targets: `windows-x86`, `windows-x64`, `windows-arm64`,
 `windows-arm64ec`, `macos-x64`, `macos-arm64`, `macos-universal`,
 `linux-x64`, `linux-arm64`, or the equivalent full Rust target triples.
-Unsupported targets fail with an explicit error. Windows linker modes are
+Unsupported targets fail with an explicit error. Linux triples matching the
+host arch build natively; cross ones (e.g. `linux-x64` on an aarch64 host)
+are linked through `cargo zigbuild` when zig is present under
+`.cache/tools/zig`, or an installed `<arch>-linux-gnu-gcc`. All targets
+need their rust-std inside the repo's copied toolchain `.toolchains/stable`
+(not rustup's); see `notes/build-and-cross.md`. Windows linker modes are
 `auto` (real MSVC link.exe via VS when available, otherwise cargo-xwin),
 `xwin`, `vs`, and `cargo`; `--vs auto|2022|2026` selects the Visual Studio
 instance when VS linking is used.

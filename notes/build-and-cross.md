@@ -179,3 +179,20 @@ this Linux host; the binaries are structurally verified as above.
   (exit 3). Rationale: @600 measured ~+32k over the request (Opus VBR
   float ~+16k + LF ~16k over the old 24k deduction), so the nominal split
   now matches reality and 160k @600 lands at ~176k as expected.
+
+## 2026-09-05: linux-x64 added to senaenc/senadec-bin release builds
+
+- The build scripts always use the repo-local copied toolchain
+  `.toolchains/stable` (system `~/.rustup` is read-only), so a bare
+  `rustup target add <triple>` never satisfies them. The
+  `x86_64-unknown-linux-gnu` std (62 rlibs) was copied from the same-version
+  system toolchain (`~/.rustup/toolchains/stable-aarch64-unknown-linux-gnu`,
+  rustc 1.97.1) into `.toolchains/stable/lib/rustlib/`. `build-release-bin.py`
+  now says so in its missing-std error instead of suggesting rustup.
+- Linking x86_64 GNU output on this aarch64 host needs a cross linker. zig
+  0.15.1 was downloaded to `.cache/tools/zig/` (git-ignored; `~/.cargo/bin`
+  and `~/.cache` are read-only). `build_linux()` now routes non-native GNU
+  triples through `cargo zigbuild` when zig is present (cache forced to
+  `.cache/cargo-zigbuild` via `CARGO_ZIGBUILD_CACHE_DIR`), falling back to an
+  installed `<arch>-linux-gnu-gcc`. Native-arch Linux builds still use plain
+  `cargo build`.

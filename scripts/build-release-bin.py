@@ -13,6 +13,13 @@ Targets (aliases or full Rust triples):
   linux-x64         x86_64-unknown-linux-gnu
   linux-arm64       aarch64-unknown-linux-gnu
 
+Linux linker selection (builds always use the repo-local copied toolchain
+.toolchains/stable, never rustup's; see notes/build-and-cross.md):
+  native arch       plain cargo build (host std ships with the toolchain)
+  cross arch        cargo-zigbuild when zig is present (repo .cache/tools/zig;
+                    zig carries its own glibc sysroot for the target), else an
+                    installed <arch>-linux-gnu-gcc cross compiler.
+
 Windows linker selection:
   auto            WSL/Linux: real MSVC link.exe via VS if a VS instance is
                   found (prefers 2022, then 2026), else cargo-xwin.
@@ -137,9 +144,17 @@ def rust_std_present(triple):
 def ensure_rust_target(triple):
     if rust_std_present(triple):
         return
-    raise SystemExit(
-        f"error: Rust standard library for {triple} is not installed.\n"
-        f"       Install it with: rustup target add {triple}"
+    raise SystemExit(f"error: {std_missing_hint(triple)}")
+
+
+def std_missing_hint(triple):
+    rustlib = ROOT / ".toolchains" / "stable" / "lib" / "rustlib"
+    return (
+        f"Rust standard library for {triple} is not installed in the repo toolchain "
+        f"({rustlib}/{triple}); this build uses the copied .toolchains/stable "
+        f"toolchain, not the rustup-managed one. Copy/extract the matching rust-std "
+        f"component for this rustc into that directory (e.g. from a same-version "
+        f"rustup toolchain), then rerun."
     )
 
 
@@ -361,10 +376,52 @@ def fat_macho(slices):
 
 
 # ---------------------------------------------------------------- Linux
+def host_arch():
+    m = platform.machine().lower()
+    return {"x86_64": "x86_64", "amd64": "x86_64",
+            "aarch64": "aarch64", "arm64": "aarch64"}.get(m, m)
+
+
+def zig_bin():
+    # zig kept in the repo's git-ignored cache (same idea as .cache/cargo-xwin).
+    cand = ROOT / ".cache" / "tools" / "zig" / "zig"
+    return cand if cand.exists() else which("zig")
+
+
 def build_linux(triple, args):
     ensure_rust_target(triple)
     env = cargo_env()
-    run(["cargo", "build", "-p", PKG, "--target", triple, "--release"], env=env)
+    target_arch = triple.split("-", 1)[0]  # x86_64 / aarch64
+    if target_arch != host_arch():
+        # Cross GNU target on this host: needs a linker that can emit the
+        # target arch. Prefer cargo-zigbuild (zig bundles a glibc sysroot for
+        # the target), then an installed <arch>-linux-gnu-gcc.
+        gcc = which(f"{target_arch}-linux-gnu-gcc")
+        zig = zig_bin()
+        if zig is not None and which("cargo-zigbuild") is not None:
+            env["PATH"] = str(zig.parent) + os.pathsep + env.get("PATH", "")
+            # HOME is a read-only mount on this box; keep zigbuild's cache in
+            # the repo's git-ignored .cache, like XWIN_CACHE_DIR above.
+            env["CARGO_ZIGBUILD_CACHE_DIR"] = str(ROOT / ".cache" / "cargo-zigbuild")
+            env["CARGO_ZIGBUILD_ZIG_PATH"] = str(zig)
+            # zig's own caches default under ~/.cache/zig (read-only here too).
+            zig_cache = ROOT / ".cache" / "zig"
+            env["ZIG_GLOBAL_CACHE_DIR"] = str(zig_cache / "global")
+            env["ZIG_LOCAL_CACHE_DIR"] = str(zig_cache / "local")
+            run(["cargo", "zigbuild", "-p", PKG, "--target", triple, "--release"],
+                env=env)
+        elif gcc is not None:
+            env["CARGO_TARGET_" + triple.replace("-", "_").upper() + "_LINKER"] = str(gcc)
+            run(["cargo", "build", "-p", PKG, "--target", triple, "--release"], env=env)
+        else:
+            raise SystemExit(
+                f"error: {triple} is a cross target on this {host_arch()} host and no "
+                f"cross linker is installed. Drop zig into {ROOT / '.cache' / 'tools' / 'zig'}"
+                f" (cargo-zigbuild route, no root needed) or install the "
+                f"{target_arch}-linux-gnu-gcc cross compiler."
+            )
+    else:
+        run(["cargo", "build", "-p", PKG, "--target", triple, "--release"], env=env)
     src = ROOT / "target" / triple / "release" / PKG
     if not src.exists():
         raise SystemExit(f"error: cargo did not produce {src}")
@@ -531,8 +588,7 @@ def main():
     alias_of = {v: k for k, v in TARGETS.items()}
     for t in [t for t in build_triples if not rust_std_present(t)]:
         build_triples.remove(t)
-        failures.append((alias_of.get(t, t),
-                         f"Rust std not installed; fix: rustup target add {t}"))
+        failures.append((alias_of.get(t, t), std_missing_hint(t)))
         print(f"SKIP {t} (preflight): {failures[-1][1]}", file=sys.stderr)
     if not build_triples:
         print("error: no requested target can be built (all missing rust-std)", file=sys.stderr)
