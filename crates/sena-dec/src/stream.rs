@@ -1,9 +1,14 @@
-//! Streaming decoder: parses the container at open time, then decodes codec
+//! Streaming decoder: indexes the container at open time, then decodes codec
 //! frames incrementally as `read_f32` requests PCM. LF and HF codec frames are
 //! consumed independently and any unconsumed prefix is retained across chunks,
 //! so a short chunk on one track never discards samples from the other track.
 //! The zero-phase rational resampler runs on whole LF prefixes, and chunks are
 //! cut at exact resampler input/output boundaries.
+//!
+//! Frame payloads are read lazily through [`FrameStore`]: over callback IO
+//! (the foobar2000 plugin) only a small frame index is kept in memory and
+//! each packet is fetched with a positioned read when decoded, so per-instance
+//! memory stays bounded no matter the file size (32-bit hosts).
 
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -14,7 +19,7 @@ use rxaac_dec_lib::usac::UsacDecoder;
 use sena_core::PRE_GAIN;
 use sena_dsp::Resampler;
 
-use crate::demux::Demuxed;
+use crate::demux::{Demuxed, FrameRef, IndexedFile, Track};
 use crate::pipeline::{
     DecodeError, DecodedInfo, LfAuInfo, OpusPacketInfo, ReadInfo, SAMPLE_RATE,
     add_bits_interval, parse_opus_head,
@@ -22,8 +27,70 @@ use crate::pipeline::{
 
 const MIN_CHUNK_FRAMES: u64 = 4800; // 100 ms @48k
 
+/// Where codec frame payloads come from. Both variants share the same
+/// `FrameRef` index; only the payload fetch differs.
+pub enum FrameStore {
+    /// Whole file in memory (non-seekable inputs, examples): payloads are
+    /// copied out of the buffer on demand. Peak memory is ~1x file size.
+    Memory { bytes: Vec<u8>, frames: Vec<FrameRef> },
+    /// Lazy positioned reads through the host's io callbacks: the index is
+    /// the only per-file state, decode fetches one packet at a time. A small
+    /// read-ahead window keeps linear decode from doing a seek+read syscall
+    /// per frame (~600 B blocks would otherwise mean one per frame).
+    Lazy {
+        frames: Vec<FrameRef>,
+        read_at: Box<dyn FnMut(u64, usize) -> Result<Vec<u8>, String>>,
+        /// `(absolute offset of window[0], window bytes)`.
+        window: (u64, Vec<u8>),
+    },
+}
+
+/// Read-ahead for lazy frame fetches; frames are consumed in file order, so
+/// one window covers hundreds of blocks.
+const LAZY_READ_AHEAD: usize = 256 * 1024;
+
+impl FrameStore {
+    fn frames(&self) -> &[FrameRef] {
+        match self {
+            FrameStore::Memory { frames, .. } => frames,
+            FrameStore::Lazy { frames, .. } => frames,
+        }
+    }
+
+    /// Fetch the payload of frame `index` (one bounded allocation per call).
+    fn read(&mut self, index: usize) -> Result<Vec<u8>, DecodeError> {
+        let fr = self.frames()[index];
+        match self {
+            FrameStore::Memory { bytes, .. } => {
+                let start = usize::try_from(fr.offset)
+                    .map_err(|_| DecodeError::Format("frame offset too large".into()))?;
+                bytes
+                    .get(start..start + fr.len as usize)
+                    .map(|s| s.to_vec())
+                    .ok_or_else(|| DecodeError::Format("frame range outside file".into()))
+            }
+            FrameStore::Lazy { read_at, window, .. } => {
+                let len = fr.len as usize;
+                let end = fr.offset + len as u64;
+                let wend = window.0 + window.1.len() as u64;
+                if fr.offset < window.0 || end > wend {
+                    let fetch = len.max(LAZY_READ_AHEAD);
+                    let buf = read_at(fr.offset, fetch).map_err(DecodeError::Io)?;
+                    if buf.len() < len {
+                        return Err(DecodeError::Format("truncated frame payload".into()));
+                    }
+                    *window = (fr.offset, buf);
+                }
+                let off = (fr.offset - window.0) as usize;
+                Ok(window.1[off..off + len].to_vec())
+            }
+        }
+    }
+}
+
 pub struct StreamingDecoder {
-    demux: Demuxed,
+    tracks: Vec<Track>,
+    store: FrameStore,
     info: DecodedInfo,
     pub warnings: Vec<String>,
     cursor: u64,
@@ -66,10 +133,29 @@ struct State {
 }
 
 impl StreamingDecoder {
+    /// Whole-file constructor (examples/tests): re-indexes the parsed
+    /// container's bytes so the decode path is identical to the lazy one.
     pub fn open(demux: Demuxed) -> Result<Self, DecodeError> {
-        let (info, warnings) = crate::pipeline::probe(&demux)?;
+        let bytes = demux.into_bytes();
+        let mut indexed = {
+            let slice = &bytes;
+            crate::demux::index_container(
+                &mut |pos: u64, len: usize| crate::demux::mem_read_at(slice, pos, len),
+                true,
+            )
+            .map_err(DecodeError::Format)?
+        };
+        let frames = std::mem::take(&mut indexed.frames);
+        Self::open_indexed(indexed, FrameStore::Memory { bytes, frames })
+    }
+
+    /// Bounded-memory constructor: `indexed` came from
+    /// [`crate::demux::index_container`], `store` serves frame payloads.
+    pub fn open_indexed(indexed: IndexedFile, store: FrameStore) -> Result<Self, DecodeError> {
+        let (info, warnings) = crate::pipeline::probe(&indexed)?;
         Ok(Self {
-            demux,
+            tracks: indexed.tracks,
+            store,
             info,
             warnings,
             cursor: 0,
@@ -80,13 +166,18 @@ impl StreamingDecoder {
         })
     }
 
+    fn track(&self, codec_id: &str) -> &Track {
+        // probe() already validated the two Sena tracks exist.
+        self.tracks.iter().find(|t| t.codec_id == codec_id).unwrap()
+    }
+
     pub fn info(&self) -> DecodedInfo {
         self.info.clone()
     }
 
     fn init_state(&mut self) -> Result<(), DecodeError> {
-        let lf_track = self.demux.track("A_SENALF").unwrap();
-        let hf_track = self.demux.track("A_OPUS").unwrap();
+        let lf_track = self.track("A_SENALF");
+        let hf_track = self.track("A_OPUS");
         let lf_rate = lf_track.sample_rate.round() as u32;
         let asc = AudioSpecificConfig::parse(&lf_track.codec_private)
             .map_err(|e| DecodeError::Format(format!("ASC parse: {e}")))?;
@@ -129,14 +220,18 @@ impl StreamingDecoder {
     }
 
     fn decode_next_frame(&mut self) -> Result<bool, DecodeError> {
-        let st = self.state.as_mut().unwrap();
-        if st.frame_index >= self.demux.frames.len() {
-            st.finished = true;
+        let frame_index = self.state.as_ref().unwrap().frame_index;
+        if frame_index >= self.store.frames().len() {
+            self.state.as_mut().unwrap().finished = true;
             return Ok(false);
         }
-        let frame = self.demux.frames[st.frame_index].clone();
+        // Fetch the payload before borrowing the decode state (the store
+        // needs &mut self for lazy io reads).
+        let frame = self.store.frames()[frame_index];
+        let data = self.store.read(frame_index)?;
+        let lf_num = self.track("A_SENALF").number;
+        let st = self.state.as_mut().unwrap();
         st.frame_index += 1;
-        let lf_num = self.demux.track("A_SENALF").unwrap().number;
         if frame.track == lf_num {
             if st.lf_skip_aus > 0 {
                 st.lf_skip_aus -= 1;
@@ -146,7 +241,7 @@ impl StreamingDecoder {
             // leave partial samples in the stream queue.
             let mut out: Vec<f32> = Vec::new();
             let result = catch_unwind(AssertUnwindSafe(|| {
-                st.xdec.decode_au(&frame.data, &mut out)
+                st.xdec.decode_au(&data, &mut out)
             }));
             let failed = match result {
                 Ok(Err(e)) => {
@@ -173,7 +268,7 @@ impl StreamingDecoder {
             st.lf_infos.push(LfAuInfo {
                 start_core: st.lf_total_before,
                 samples_core: samples as i128,
-                bits: (frame.data.len() * 8) as u64,
+                bits: (data.len() * 8) as u64,
             });
             st.lf_total_before += samples as i128;
         } else {
@@ -182,7 +277,7 @@ impl StreamingDecoder {
                 return Ok(true);
             }
             let mut buf = vec![0.0f32; 5760 * 2];
-            let mut n = match st.opus.decode_float(Some(&frame.data), &mut buf, DecodeMode::Normal) {
+            let mut n = match st.opus.decode_float(Some(&data), &mut buf, DecodeMode::Normal) {
                 Ok(n) => n,
                 Err(e) => {
                     eprintln!("warning: Opus packet decode error ({}): {e}; using PLC", frame.t_ns);
@@ -196,7 +291,7 @@ impl StreamingDecoder {
             st.opus_infos.push(OpusPacketInfo {
                 start_48k: st.opus_total_before,
                 samples_48k: n as i128,
-                bits: (frame.data.len() * 8) as u64,
+                bits: (data.len() * 8) as u64,
             });
             st.opus_total_before += n as i128;
         }
@@ -483,8 +578,8 @@ impl StreamingDecoder {
             return Err(DecodeError::Format("seek past playable length".into()));
         }
         let f = frame as usize;
-        let lf_track = self.demux.track("A_SENALF").unwrap().clone();
-        let hf_track = self.demux.track("A_OPUS").unwrap().clone();
+        let lf_track = self.track("A_SENALF").clone();
+        let hf_track = self.track("A_OPUS").clone();
         let lf_rate = lf_track.sample_rate.round() as u32;
         // playable core c = f * lf_rate / 48000; the raw core at that point is
         // c + 1024 (one warmup AU was trimmed at the stream start).
@@ -524,10 +619,10 @@ impl StreamingDecoder {
     /// independency flag (bit 7 of the first byte), i.e. a bit-exact random
     /// access point. AU 0 is by construction such a point.
     fn prev_indep_au(&self, au: usize) -> usize {
-        let lf_num = self.demux.track("A_SENALF").unwrap().number;
+        let lf_num = self.track("A_SENALF").number;
         let positions: Vec<usize> = self
-            .demux
-            .frames
+            .store
+            .frames()
             .iter()
             .enumerate()
             .filter(|(_, f)| f.track == lf_num)
@@ -535,8 +630,8 @@ impl StreamingDecoder {
             .collect();
         let mut idx = au.min(positions.len().saturating_sub(1));
         loop {
-            let f = &self.demux.frames[positions[idx]];
-            if f.data.first().map(|b| b >> 7 != 0).unwrap_or(false) || idx == 0 {
+            let f = self.store.frames()[positions[idx]];
+            if f.first >> 7 != 0 || idx == 0 {
                 return idx;
             }
             idx -= 1;

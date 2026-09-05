@@ -1,11 +1,14 @@
 //! Matroska Attachments: parse and in-place rewrite of embedded files
 //! (album art lives here in Matroska, NOT in string Tags).
+//!
+//! Rewrites are planned as positioned writes ([`plan_attachment_rewrite`])
+//! from a bounded-memory [`index_container`](crate::demux::index_container)
+//! scan, like the tag rewriter; no whole-file copies.
 
 use sena_mux::ebml;
 
-use crate::demux::{Demuxed, Elem};
+use crate::demux::{self, Demuxed, Elem, IndexedFile, WriteOp};
 
-const ATTACHMENTS_ID: &[u8] = &[0x19, 0x41, 0xA4, 0x69];
 const ATTACHED_FILE_ID: &[u8] = &[0x61, 0xA7];
 const FILE_NAME_ID: &[u8] = &[0x45, 0xE0];
 const FILE_MIME_ID: &[u8] = &[0x46, 0x60];
@@ -26,40 +29,49 @@ impl Attachment {
 }
 
 /// Parse the top-level Attachments element(s) of a Demuxed file.
-pub fn parse_attachments(demux: &Demuxed) -> Vec<Attachment> {
-    let bytes = demux.bytes();
+pub fn parse_attachments(demuxed: &Demuxed) -> Vec<Attachment> {
+    let bytes = demuxed.bytes();
     let mut out = Vec::new();
     // Attachments is a top-level Segment child.
-    let seg = demux.segment.elem.clone();
+    let seg = demuxed.segment.elem;
     let _result = for_each_child(bytes, seg, |id, elem| {
-        if id != ATTACHMENTS_ID {
+        if id != demux::ATTACHMENTS_ID {
             return Ok(());
         }
-        for_each_child(bytes, elem, |cid, cchild| {
-            if cid != ATTACHED_FILE_ID {
-                return Ok(());
-            }
-            let mut name = None;
-            let mut mime = None;
-            let mut data = None;
-            for_each_child(bytes, cchild, |fid, ff| {
-                match fid {
-                    FILE_NAME_ID => name = Some(String::from_utf8_lossy(bytes.get(ff.payload()).unwrap_or(&[])).into_owned()),
-                    FILE_MIME_ID => mime = Some(String::from_utf8_lossy(bytes.get(ff.payload()).unwrap_or(&[])).into_owned()),
-                    FILE_DATA_ID => data = Some(bytes.get(ff.payload()).unwrap_or(&[]).to_vec()),
-                    _ => {}
-                }
-                Ok(())
-            })?;
-            if let (Some(name), Some(mime), Some(data)) = (name, mime, data) {
-                out.push(Attachment { name, mime, data });
-            }
-            Ok(())
-        })?;
+        out.extend(parse_attachments_payload(bytes.get(elem.payload()).unwrap_or(&[])));
         Ok(())
     });
     // errors in the walk stop scanning (tolerated)
     let _ = _result;
+    out
+}
+
+/// Parse one Attachments element payload (a series of AttachedFile children).
+/// Tolerates malformed trailing data by stopping.
+pub fn parse_attachments_payload(payload: &[u8]) -> Vec<Attachment> {
+    let mut out = Vec::new();
+    let top = Elem { start: 0, id_len: 0, size_len: 0, data_start: 0, data_end: payload.len() };
+    let _ = for_each_child(payload, top, |cid, cchild| {
+        if cid != ATTACHED_FILE_ID {
+            return Ok(());
+        }
+        let mut name = None;
+        let mut mime = None;
+        let mut data = None;
+        for_each_child(payload, cchild, |fid, ff| {
+            match fid {
+                FILE_NAME_ID => name = Some(String::from_utf8_lossy(payload.get(ff.payload()).unwrap_or(&[])).into_owned()),
+                FILE_MIME_ID => mime = Some(String::from_utf8_lossy(payload.get(ff.payload()).unwrap_or(&[])).into_owned()),
+                FILE_DATA_ID => data = Some(payload.get(ff.payload()).unwrap_or(&[]).to_vec()),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        if let (Some(name), Some(mime), Some(data)) = (name, mime, data) {
+            out.push(Attachment { name, mime, data });
+        }
+        Ok(())
+    });
     out
 }
 
@@ -88,54 +100,47 @@ pub fn encode_attachments(attachments: &[Attachment]) -> Vec<u8> {
         payload.extend(encode_attached_file(a));
     }
     let mut out = Vec::new();
-    out.extend_from_slice(ATTACHMENTS_ID);
+    out.extend_from_slice(demux::ATTACHMENTS_ID);
     ebml::write_vint(&mut out, payload.len() as u64);
     out.extend_from_slice(&payload);
     out
 }
 
-/// In-place rewrite: void existing top-level Attachments element(s) (Void of
-/// the same encoded length), append the replacement at the Segment tail and
-/// patch the Segment size. Clusters/Cues/Tags are never moved.
-pub fn rewrite_attachments(original: &[u8], attachments: &[Attachment]) -> Result<Vec<u8>, String> {
-    let demux = Demuxed::parse(original.to_vec()).map_err(|e| e.to_string())?;
-    let seg = demux.segment.clone();
-    let mut out = original.to_vec();
-
-    // Void every existing top-level Attachments element in place.
-    let mut pos = seg.payload_start;
-    while pos < seg.payload_end {
-        let elem = crate::demux::read_elem_public(out.as_slice(), pos).map_err(|e| e.to_string())?;
-        let id = out[elem.start..elem.start + elem.id_len].to_vec();
-        if id == ATTACHMENTS_ID {
-            let void = make_void(elem.data_end - elem.start)?;
-            out.splice(elem.start..elem.data_end, void);
-        }
-        pos = elem.data_end;
+/// Compute the positioned writes that replace the full attachment set of a
+/// scanned file: void every existing Attachments element, append the
+/// replacement at the Segment tail, re-patch the Segment size.
+pub fn plan_attachment_rewrite(
+    scan: &IndexedFile,
+    attachments: &[Attachment],
+) -> Result<Vec<WriteOp>, String> {
+    let mut ops = Vec::new();
+    for &(start, _, end) in &scan.attachment_ranges {
+        demux::push_void_ops(&mut ops, start, end)?;
     }
-
     let appended = if attachments.is_empty() { Vec::new() } else { encode_attachments(attachments) };
-    let insert_at = seg.payload_end;
-    out.splice(insert_at..insert_at, appended.iter().copied());
+    demux::push_append_ops(&mut ops, scan, appended)?;
+    Ok(ops)
+}
 
-    let size_pos = seg.elem.start + seg.elem.id_len;
-    let new_size = encode_vint_exact((out.len() - seg.payload_start) as u64, seg.elem.size_len)?;
-    out.splice(size_pos..size_pos + seg.elem.size_len, new_size.iter().copied());
+/// Rewrite the attachment set in a complete file buffer; the FFI write path
+/// applies the same plan through io callbacks.
+pub fn rewrite_attachments(original: &[u8], attachments: &[Attachment]) -> Result<Vec<u8>, String> {
+    let scan = demux::index_container(
+        &mut |pos: u64, len: usize| demux::mem_read_at(original, pos, len),
+        false,
+    )?;
+    let ops = plan_attachment_rewrite(&scan, attachments)?;
+    let mut out = original.to_vec();
+    demux::apply_write_ops_to_vec(&mut out, &ops);
 
-    // Verify the result still parses and the immutable Sena tags (including
+    // Verify the result still scans and the immutable Sena tags (including
     // the encoded-audio stream hash) survive.
-    let check = Demuxed::parse(out.clone()).map_err(|e| format!("rewritten file invalid: {e}"))?;
-    for key in ["SENA_PROFILE", "SENA_VERSION", "SENA_PLAYABLE_SAMPLES", "SENA_AUDIO_SHA256"] {
-        let before = Demuxed::parse(original.to_vec())
-            .map_err(|e| e.to_string())?
-            .immutable_tag(key)
-            .map(|s| s.to_string());
-        if let Some(v) = before {
-            if check.immutable_tag(key) != Some(v.as_str()) {
-                return Err(format!("immutable tag {key} changed after attachment rewrite"));
-            }
-        }
-    }
+    let check = demux::index_container(
+        &mut |pos: u64, len: usize| demux::mem_read_at(&out, pos, len),
+        false,
+    )
+    .map_err(|e| format!("rewritten file invalid: {e}"))?;
+    demux::check_immutable_survived(&scan, &check)?;
     Ok(out)
 }
 
@@ -154,45 +159,6 @@ fn for_each_child(
         p = child.data_end;
     }
     Ok(())
-}
-
-fn vint_size(v: u64) -> usize {
-    ebml::vint_size(v)
-}
-
-fn encode_vint_exact(value: u64, len: usize) -> Result<Vec<u8>, String> {
-    if len == 0 || len > 8 {
-        return Err("bad vint length".into());
-    }
-    let max = (1u64 << (7 * len)) - 1;
-    if value >= max {
-        return Err(format!("value {value} does not fit {len}-byte vint"));
-    }
-    let mut b = [0u8; 8];
-    let mut t = value;
-    for i in (0..len).rev() {
-        b[i] = (t & 0xFF) as u8;
-        t >>= 8;
-    }
-    b[0] |= 1u8 << (8 - len);
-    Ok(b[..len].to_vec())
-}
-
-fn make_void(total_len: usize) -> Result<Vec<u8>, String> {
-    for size_len in 1..=8usize {
-        if total_len < 1 + size_len {
-            continue;
-        }
-        let payload = total_len - 1 - size_len;
-        if vint_size(payload as u64) == size_len {
-            let mut out = Vec::with_capacity(total_len);
-            out.extend_from_slice(&[0xEC]);
-            out.extend_from_slice(&encode_vint_exact(payload as u64, size_len)?);
-            out.resize(total_len, 0);
-            return Ok(out);
-        }
-    }
-    Err(format!("cannot encode {total_len}-byte Void element"))
 }
 
 #[cfg(test)]

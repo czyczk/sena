@@ -1,56 +1,22 @@
 //! In-place Matroska user-tag rewriting (void old tail Tags, append new one,
 //! patch the Segment size). Immutable Sena tags stay in the first Tags
 //! element and are never modified.
+//!
+//! The rewrite is planned as a handful of positioned writes
+//! ([`plan_user_tag_rewrite`]) computed from a bounded-memory
+//! [`index_container`](crate::demux::index_container) scan, so neither the
+//! in-buffer helper nor the FFI path materializes a rewritten copy of the
+//! whole file (32-bit hosts).
 
 use sena_mux::ebml;
 
-use crate::demux::Demuxed;
+use crate::demux::{self, IndexedFile, WriteOp};
 
 const TAGS_ID: &[u8] = &[0x12, 0x54, 0xC3, 0x67];
 const TAG_ID: &[u8] = &[0x73, 0x73];
 const SIMPLE_TAG_ID: &[u8] = &[0x67, 0xC8];
 const TAG_NAME_ID: &[u8] = &[0x45, 0xA3];
 const TAG_STRING_ID: &[u8] = &[0x44, 0x87];
-const VOID_ID: &[u8] = &[0xEC];
-
-fn vint_size(v: u64) -> usize {
-    ebml::vint_size(v)
-}
-
-fn encode_vint_exact(value: u64, len: usize) -> Result<Vec<u8>, String> {
-    if len == 0 || len > 8 {
-        return Err("bad vint length".into());
-    }
-    let max = (1u64 << (7 * len)) - 1;
-    if value >= max {
-        return Err(format!("value {value} does not fit {len}-byte vint"));
-    }
-    let mut b = [0u8; 8];
-    let mut t = value;
-    for i in (0..len).rev() {
-        b[i] = (t & 0xFF) as u8;
-        t >>= 8;
-    }
-    b[0] |= 1u8 << (8 - len);
-    Ok(b[..len].to_vec())
-}
-
-fn make_void(total_len: usize) -> Result<Vec<u8>, String> {
-    for size_len in 1..=8usize {
-        if total_len < 1 + size_len {
-            continue;
-        }
-        let payload = total_len - 1 - size_len;
-        if vint_size(payload as u64) == size_len {
-            let mut out = Vec::with_capacity(total_len);
-            out.extend_from_slice(VOID_ID);
-            out.extend_from_slice(&encode_vint_exact(payload as u64, size_len)?);
-            out.resize(total_len, 0);
-            return Ok(out);
-        }
-    }
-    Err(format!("cannot encode {total_len}-byte Void element"))
-}
 
 fn build_user_tags(entries: &[(String, String)]) -> Vec<u8> {
     let mut tag = Vec::new();
@@ -210,66 +176,64 @@ fn sanitize_entries(entries: &[(String, String)]) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Rewrite user metadata in a complete Sena file buffer.
-///
-/// The first top-level `Tags` element is treated as immutable and is left
-/// untouched. Every later top-level `Tags` element is voided in place with an
-/// EBML `Void` of exactly the same encoded length. A replacement user `Tags`
-/// element is appended at the Segment tail (or omitted when `entries` is
-/// empty), and the Segment size is re-patched with its original size-vint
-/// width. Cluster and Cue bytes are never moved.
-pub fn rewrite_user_tags(original: &[u8], entries: &[(String, String)]) -> Result<Vec<u8>, String> {
+/// Compute the positioned writes that replace the user tags of a scanned
+/// file with `entries`: void every Tags block after the immutable first one,
+/// append the replacement at the Segment tail, re-patch the Segment size.
+pub fn plan_user_tag_rewrite(
+    scan: &IndexedFile,
+    entries: &[(String, String)],
+) -> Result<Vec<WriteOp>, String> {
     let entries = sanitize_entries(entries);
-    let demux = Demuxed::parse(original.to_vec()).map_err(|e| e.to_string())?;
-    let seg = demux.segment.clone();
-    let mut out = original.to_vec();
-
-    let user_tags: Vec<_> = demux.tags.iter().skip(1).collect();
-    for tag in user_tags {
-        let start = tag.elem.start;
-        let end = tag.elem.data_end;
-        let void = make_void(end - start)?;
-        out.splice(start..end, void);
+    let mut ops = Vec::new();
+    for &(start, end) in scan.tag_ranges.iter().skip(1) {
+        demux::push_void_ops(&mut ops, start, end)?;
     }
-
-    let old_payload_len = seg.payload_end - seg.payload_start;
     let appended = if entries.is_empty() { Vec::new() } else { build_user_tags(&entries) };
-    let new_payload_len = old_payload_len + appended.len();
-    let insert_at = seg.payload_end;
-    out.splice(insert_at..insert_at, appended.iter().copied());
+    demux::push_append_ops(&mut ops, scan, appended)?;
+    Ok(ops)
+}
 
-    let size_pos = seg.elem.start + seg.elem.id_len;
-    let new_size = encode_vint_exact(new_payload_len as u64, seg.elem.size_len)?;
-    out.splice(size_pos..size_pos + seg.elem.size_len, new_size.iter().copied());
+/// Rewrite user metadata in a complete Sena file buffer. Equivalent to
+/// planning the rewrite on the buffer and applying it in place; kept for the
+/// CLI/tests, the FFI write path applies the same plan through io callbacks.
+pub fn rewrite_user_tags(original: &[u8], entries: &[(String, String)]) -> Result<Vec<u8>, String> {
+    let scan = demux::index_container(
+        &mut |pos: u64, len: usize| demux::mem_read_at(original, pos, len),
+        false,
+    )?;
+    let ops = plan_user_tag_rewrite(&scan, entries)?;
+    let mut out = original.to_vec();
+    demux::apply_write_ops_to_vec(&mut out, &ops);
 
-    // Verify the result still parses and the immutable Sena tags (including
+    // Verify the result still scans and the immutable Sena tags (including
     // the encoded-audio stream hash) remain at the head.
-    let check = Demuxed::parse(out.clone()).map_err(|e| format!("rewritten file invalid: {e}"))?;
-    for key in ["SENA_PROFILE", "SENA_VERSION", "SENA_PLAYABLE_SAMPLES", "SENA_AUDIO_SHA256"] {
-        let before = Demuxed::parse(original.to_vec())
-            .map_err(|e| e.to_string())?
-            .immutable_tag(key)
-            .map(|s| s.to_string());
-        if let Some(v) = before {
-            if check.immutable_tag(key) != Some(v.as_str()) {
-                return Err(format!("immutable tag {key} changed after rewrite"));
-            }
-        }
-    }
+    let check = demux::index_container(
+        &mut |pos: u64, len: usize| demux::mem_read_at(&out, pos, len),
+        false,
+    )
+    .map_err(|e| format!("rewritten file invalid: {e}"))?;
+    demux::check_immutable_survived(&scan, &check)?;
     Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::demux::Demuxed;
     use crate::pipeline::Decoder;
 
     #[test]
     fn void_and_vint_exact() {
-        let v = encode_vint_exact(0x15b, 2).unwrap();
+        let v = demux::encode_vint_exact(0x15b, 2).unwrap();
         assert_eq!(v, vec![0x41, 0x5b]);
-        let void = make_void(3).unwrap();
-        assert_eq!(void, vec![0xEC, 0x81, 0x00]);
+        let header = demux::void_header(3).unwrap();
+        assert_eq!(header, vec![0xEC, 0x81]);
+        // The header plus the zeroed payload is exactly the old full Void.
+        let mut ops = Vec::new();
+        demux::push_void_ops(&mut ops, 10, 13).unwrap();
+        let mut buf = vec![0xAA; 20];
+        demux::apply_write_ops_to_vec(&mut buf, &ops);
+        assert_eq!(&buf[10..13], &[0xEC, 0x81, 0x00]);
     }
 
     #[test]

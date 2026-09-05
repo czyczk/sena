@@ -30,20 +30,6 @@ pfc::string8 guid_art_name(const GUID & g) {
     return out;
 }
 
-GUID art_guid_for_name(const char * name) {
-    pfc::string8 head;
-    head.set_string(name, 11);
-    if (stricmp_utf8(head, "cover_front") == 0) return album_art_ids::cover_front;
-    head.set_string(name, 10);
-    if (stricmp_utf8(head, "cover_back") == 0) return album_art_ids::cover_back;
-    head.set_string(name, 4);
-    if (stricmp_utf8(head, "disc") == 0) return album_art_ids::disc;
-    if (stricmp_utf8(head, "icon") == 0) return album_art_ids::icon;
-    head.set_string(name, 6);
-    if (stricmp_utf8(head, "artist") == 0) return album_art_ids::artist;
-    return album_art_ids::cover_front;
-}
-
 const char * sniff_mime(const uint8_t * d, size_t n) {
     if (n >= 3 && d[0] == 0xFF && d[1] == 0xD8 && d[2] == 0xFF) return "image/jpeg";
     if (n >= 8 && d[0] == 0x89 && d[1] == 0x50 && d[2] == 0x4E && d[3] == 0x47) return "image/png";
@@ -173,7 +159,7 @@ public:
             if (stricmp_utf8(m_entries[i].name, name) == 0) {
                 art_entry & e = m_entries[i];
                 e.data.set_size(len);
-                memcpy(e.data.get_ptr(), bytes, len);
+                if (len) memcpy(e.data.get_ptr(), bytes, len);
                 e.mime = sniff_mime((const uint8_t*)bytes, len);
                 return;
             }
@@ -182,7 +168,7 @@ public:
         e.name = name;
         e.mime = sniff_mime((const uint8_t*)bytes, len);
         e.data.set_size(len);
-        memcpy(e.data.get_ptr(), bytes, len);
+        if (len) memcpy(e.data.get_ptr(), bytes, len);
         m_entries.add_item(e);
     }
 

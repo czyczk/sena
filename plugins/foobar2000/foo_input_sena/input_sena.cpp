@@ -7,7 +7,7 @@ constexpr unsigned kChannels = 2;
 constexpr unsigned kSampleRate = 48000;
 constexpr uint64_t kFramesPerChunk = 4096;
 
-void throw_sena_error(int code, const char *what) {
+void throw_sena_error(int code) {
     switch (code) {
         case SENA_DEC_ERR_IO:
         case SENA_DEC_ERR_DECODE:
@@ -26,12 +26,11 @@ void input_sena::open(service_ptr_t<file> hint, const char *path,
                       t_input_open_reason reason, abort_callback &abort) {
     m_file = hint;
     input_open_file_helper(m_file, path, reason, abort);
-    m_abort = &abort;
-    // Info/tag-read must not decode the file. Decode is opened lazily by
-    // decode_initialize(); get_info() uses the lightweight probe ABI.
-    if (reason == input_open_decode) {
-        open_decoder(abort);
-    }
+    // Decode opens lazily in decode_initialize() (decode_run()/decode_seek()
+    // also handle a null decoder); get_info() uses the lightweight probe ABI.
+    // Opening the decoder here would read + demux the whole file through the
+    // io callbacks and decode_initialize() would immediately close it and do
+    // the same work again - two full-file reads per decode session.
 }
 
 void input_sena::get_info(file_info &info, abort_callback &abort) {
@@ -53,7 +52,7 @@ void input_sena::get_info(file_info &info, abort_callback &abort) {
             char errbuf[256];
             int rc = sena_dec_probe_info(&io, &m_probe_info, errbuf, sizeof(errbuf));
             if (rc != SENA_DEC_OK) {
-                throw_sena_error(rc, errbuf);
+                throw_sena_error(rc);
             }
             m_has_probe = true;
         }
@@ -86,9 +85,7 @@ t_filestats2 input_sena::get_stats2(uint32_t f, abort_callback &abort) {
 }
 
 void input_sena::decode_initialize(unsigned, abort_callback &abort) {
-    close_decoder();
-    m_file->reopen(abort);
-    open_decoder(abort);
+    open_decoder(abort); // closes any previous decoder and rewinds the file
     m_bitrate.reset();
     m_can_seek = m_file->can_seek();
 }
@@ -105,7 +102,7 @@ bool input_sena::decode_run(audio_chunk &chunk, abort_callback &abort) {
         return false;
     }
     if (rc != SENA_DEC_OK) {
-        throw_sena_error(rc, "sena_dec_read_f32");
+        throw_sena_error(rc);
     }
     if (got == 0) {
         return false;
@@ -165,8 +162,6 @@ void input_sena::retag(const file_info &info, abort_callback &abort) {
 
     pfc::list_t<SenaMetaEntry> entries;
     pfc::list_t<SenaMetaEntry> meta_rg_entries; // RG arriving as plain meta
-    t_size skipped = 0;
-    t_size rg_written = 0;
     info.meta_enumerate([&](const char *key, const char *value) {
         // Attached pictures reach the tag writer as "PICTURE" meta with a
         // binary payload that Matroska string tags cannot hold; pictures
@@ -174,7 +169,6 @@ void input_sena::retag(const file_info &info, abort_callback &abort) {
         // (Matroska Attachments). Skip them so the transfer succeeds
         // instead of failing with "error transferring attached pictures".
         if (stricmp_utf8(key, "PICTURE") == 0) {
-            skipped++;
             return;
         }
         // ReplayGain may arrive in meta (transferred tags) AND in the info
@@ -195,7 +189,6 @@ void input_sena::retag(const file_info &info, abort_callback &abort) {
     info.get_replaygain().for_each([&](const char *key, const char *value) {
         rg_names.add_item(key);
         rg_values.add_item(value);
-        rg_written++;
     });
     auto rg_key_present = [&](const char *key) {
         for (t_size i = 0; i < rg_names.get_count(); i++) {
@@ -215,10 +208,6 @@ void input_sena::retag(const file_info &info, abort_callback &abort) {
     for (t_size i = 0; i < rg_names.get_count(); i++) {
         entries.add_item(SenaMetaEntry{rg_names[i].get_ptr(), rg_values[i].get_ptr()});
     }
-    pfc::string8 dbg;
-    dbg << "foo_input_sena: retag writing " << entries.get_count() << " entries (skipped " << skipped
-        << " pictures, " << rg_written << " replaygain from info)";
-    console::print(dbg);
 
     SenaFileIo io{};
     io.user_data = this;
@@ -228,11 +217,10 @@ void input_sena::retag(const file_info &info, abort_callback &abort) {
     io.tell = io_tell;
     io.size = io_size;
 
-    pfc::string8 err;
     char errbuf[256];
     int rc = sena_file_write_tags(&io, entries.get_ptr(), (uint32_t)entries.get_count(), errbuf, sizeof(errbuf));
     if (rc != SENA_DEC_OK) {
-        throw_sena_error(rc, errbuf);
+        throw_sena_error(rc);
     }
 }
 
@@ -250,7 +238,7 @@ void input_sena::remove_tags(abort_callback &abort) {
     char errbuf[256];
     int rc = sena_file_remove_tags(&io, errbuf, sizeof(errbuf));
     if (rc != SENA_DEC_OK) {
-        throw_sena_error(rc, errbuf);
+        throw_sena_error(rc);
     }
 }
 
@@ -275,6 +263,10 @@ GUID input_sena::g_get_guid() {
 void input_sena::open_decoder(abort_callback &abort) {
     close_decoder();
     m_abort = &abort;
+    // sena_dec_open slurps from the current file position, so rewind first;
+    // do it here rather than at every call site (decode_initialize, the lazy
+    // decode_run/decode_seek fallback).
+    m_file->reopen(abort);
     SenaDecIo io{};
     io.user_data = this;
     io.read = io_read;
@@ -284,7 +276,7 @@ void input_sena::open_decoder(abort_callback &abort) {
     char errbuf[256];
     int rc = sena_dec_open(&io, &m_dec, errbuf, sizeof(errbuf));
     if (rc != SENA_DEC_OK) {
-        throw_sena_error(rc, errbuf);
+        throw_sena_error(rc);
     }
 }
 
@@ -334,9 +326,6 @@ void input_sena::read_user_tags(file_info &info, abort_callback &abort) {
         || rg.is_track_peak_present() || rg.is_album_peak_present()) {
         info.set_replaygain(rg);
     }
-    pfc::string8 dbg;
-    dbg << "foo_input_sena: read back " << n << " user tags";
-    console::print(dbg);
     sena_tags_close(tags);
     m_file->reopen(abort);
 }

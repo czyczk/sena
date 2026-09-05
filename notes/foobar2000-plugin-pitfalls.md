@@ -172,3 +172,32 @@ entry: symptom -> root cause -> fix. Companion to
   plugin and the Rust lib ship together (they do, in one package). Keep
   probe and decode info paths filled consistently, and default-construct
   new fields in tests.
+
+## 32-bit hosts (foobar2000 x86): every FFI path must be memory-bounded
+- Symptom: playback fine, single-file RG scan fine, but a batch scan of 6+
+  tracks (one decode thread per track) probabilistically kills the whole
+  player with NOTHING in the console.
+- Cause: 32-bit process = 2 GiB address space. The FFI used to
+  `read_all()` the whole file and `Demuxed::parse()` copied every frame
+  again (>= 2x file size per decoder instance; Rust OOM is a silent
+  `abort()`, and the `Vec` growth transient needs old+new buffers). N
+  concurrent scan threads multiply it. Same slurp existed in probe
+  (`get_info`), album-art read, and the tag/art rewrite paths.
+- Fix: `demux::index_container` scans the file through positioned reads
+  with a sliding window - head elements parsed, audio frames enter as a
+  compact index (`FrameRef`: offset/len/first byte, ~32 B per frame), no
+  payload copies. `StreamingDecoder` fetches frame payloads lazily via
+  `FrameStore::Lazy` (256 KiB read-ahead window, frames are consumed in
+  file order). Tag/attachment rewrites are computed as a handful of
+  positioned writes (`WriteOp`: void in place + append at Segment tail +
+  size patch) instead of a rewritten whole-file copy. Non-seekable inputs
+  fall back to the old in-memory path (pipe input cannot do random
+  access); seekability is probed with a no-op `seek(0, SEEK_CUR)`.
+- Sanity caps against hostile files: 16 MiB per frame/master payload,
+  64 MiB per Attachments element, 2M indexed frames max.
+- Also: every `extern "C"` entry point that touches decode state MUST be
+  wrapped in `catch_unwind` - a panic escaping an `extern "C"` fn aborts
+  the process with the message lost on stderr (invisible in a GUI host).
+- Downstream note: no changes were needed in `ropus` / `rxaac-dec`; their
+  decoders are per-instance and allocate only bounded per-frame buffers.
+  Keep it that way (no global mutable state, no whole-file buffers).

@@ -8,7 +8,7 @@ use rxaac_dec_lib::usac::UsacDecoder;
 use sena_core::PRE_GAIN;
 use sena_dsp::Resampler;
 
-use crate::demux::{Demuxed, Frame, Track};
+use crate::demux::{ContainerMeta, Demuxed, Frame, Track};
 
 pub const SAMPLE_RATE: u32 = 48000;
 pub const XHE_TRIM_CORE_SAMPLES: usize = 1024;
@@ -18,6 +18,8 @@ pub enum DecodeError {
     Format(String),
     Unsupported(String),
     Codec(String),
+    /// Failure of the host's read/seek callbacks (FFI io layer).
+    Io(String),
     ShortOutput { have: u64, need: u64 },
 }
 
@@ -27,6 +29,8 @@ impl fmt::Display for DecodeError {
             DecodeError::Format(s) => write!(f, "format: {s}"),
             DecodeError::Unsupported(s) => write!(f, "unsupported: {s}"),
             DecodeError::Codec(s) => write!(f, "codec: {s}"),
+            // "io:" prefix matches the FFI error-code mapping.
+            DecodeError::Io(s) => write!(f, "io: {s}"),
             DecodeError::ShortOutput { have, need } => {
                 write!(f, "decoded output too short: {have} frames, need {need}")
             }
@@ -298,10 +302,12 @@ fn build_bit_accounting(
 }
 
 /// Parse and validate a Sena container without decoding audio. This is the
-/// fast path used by playlist "read info" and tag-read operations.
-pub fn probe(demux: &Demuxed) -> Result<(DecodedInfo, Vec<String>), DecodeError> {
+/// fast path used by playlist "read info" and tag-read operations. Works on
+/// any [`ContainerMeta`] view: a fully parsed in-memory `Demuxed` or a
+/// bounded-memory `IndexedFile` head scan.
+pub fn probe<M: ContainerMeta>(demux: &M) -> Result<(DecodedInfo, Vec<String>), DecodeError> {
     let profile = demux
-        .immutable_tag("SENA_PROFILE")
+        .meta_immutable_tag("SENA_PROFILE")
         .ok_or_else(|| DecodeError::Unsupported("missing SENA_PROFILE tag".into()))?;
     let profile_num: u32 = profile
         .parse()
@@ -310,7 +316,7 @@ pub fn probe(demux: &Demuxed) -> Result<(DecodedInfo, Vec<String>), DecodeError>
         return Err(DecodeError::Unsupported(format!("SENA_PROFILE {profile_num}")));
     }
     let version = demux
-        .immutable_tag("SENA_VERSION")
+        .meta_immutable_tag("SENA_VERSION")
         .ok_or_else(|| DecodeError::Unsupported("missing SENA_VERSION tag".into()))?;
     let version_num: u32 = version
         .parse()
@@ -319,7 +325,7 @@ pub fn probe(demux: &Demuxed) -> Result<(DecodedInfo, Vec<String>), DecodeError>
         return Err(DecodeError::Unsupported(format!("SENA_VERSION {version_num}")));
     }
     let playable: u64 = demux
-        .immutable_tag("SENA_PLAYABLE_SAMPLES")
+        .meta_immutable_tag("SENA_PLAYABLE_SAMPLES")
         .ok_or_else(|| DecodeError::Unsupported("missing SENA_PLAYABLE_SAMPLES tag".into()))?
         .parse()
         .map_err(|_| DecodeError::Unsupported("bad SENA_PLAYABLE_SAMPLES".into()))?;
@@ -327,12 +333,12 @@ pub fn probe(demux: &Demuxed) -> Result<(DecodedInfo, Vec<String>), DecodeError>
         return Err(DecodeError::Unsupported("SENA_PLAYABLE_SAMPLES is zero".into()));
     }
 
-    let mut warnings = demux.warnings.clone();
+    let mut warnings = demux.meta_warnings().to_vec();
     let lf_track = demux
-        .track("A_SENALF")
+        .meta_track("A_SENALF")
         .ok_or_else(|| DecodeError::Format("missing A_SENALF track".into()))?;
     let hf_track = demux
-        .track("A_OPUS")
+        .meta_track("A_OPUS")
         .ok_or_else(|| DecodeError::Format("missing A_OPUS track".into()))?;
     let lf_rate = lf_track.sample_rate.round() as u32;
     if lf_rate != 16_000 && lf_rate != 32_000 {
@@ -364,7 +370,7 @@ pub fn probe(demux: &Demuxed) -> Result<(DecodedInfo, Vec<String>), DecodeError>
         .map_err(|e| DecodeError::Format(format!("ASC parse: {e}")))?;
 
     let audio_sha256 = demux
-        .immutable_tag("SENA_AUDIO_SHA256")
+        .meta_immutable_tag("SENA_AUDIO_SHA256")
         .unwrap_or("")
         .to_string();
     Ok((DecodedInfo {

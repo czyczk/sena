@@ -17,6 +17,9 @@ pub const SENA_DEC_ERR_DECODE: i32 = -4;
 pub const SENA_DEC_ERR_INVALID: i32 = -5;
 pub const SENA_DEC_EOF: i32 = -6;
 
+/// Album art is a few MB in practice; beyond this the container is corrupt.
+const MAX_ART_ELEMENT_BYTES: u64 = 64 * 1024 * 1024;
+
 pub type IoRead = Option<unsafe extern "C" fn(*mut c_void, *mut c_void, u64) -> i64>;
 pub type IoWrite = Option<unsafe extern "C" fn(*mut c_void, *const c_void, u64) -> i64>;
 pub type IoSeek = Option<unsafe extern "C" fn(*mut c_void, i64, i32) -> i64>;
@@ -98,9 +101,34 @@ pub unsafe extern "C" fn sena_file_art_read(
             return Err("invalid argument: NULL io/out".into());
         }
         let io = unsafe { &*io };
-        let bytes = unsafe { read_all_file(io) }?;
-        let demux = Demuxed::parse(bytes).map_err(|e| e.to_string())?;
-        let arts = crate::attachments::parse_attachments(&demux);
+        let read = io.read.ok_or("io: read callback is NULL")?;
+        let arts = match io.seek.and_then(|seek| range_reader(io.user_data, read, seek)) {
+            // Range-read only the Attachments elements; the audio payload is
+            // never touched.
+            Some(mut read_at) => {
+                let indexed = crate::demux::index_container(&mut read_at, false)?;
+                let mut arts = Vec::new();
+                for &(_, payload_start, end) in &indexed.attachment_ranges {
+                    let len = end - payload_start;
+                    if len > MAX_ART_ELEMENT_BYTES {
+                        return Err(format!(
+                            "unsupported: Attachments element of {len} bytes exceeds the {MAX_ART_ELEMENT_BYTES}-byte sanity cap"
+                        ));
+                    }
+                    let payload = read_at(payload_start, len as usize)?;
+                    if payload.len() != len as usize {
+                        return Err("io: truncated Attachments element".into());
+                    }
+                    arts.extend(crate::attachments::parse_attachments_payload(&payload));
+                }
+                arts
+            }
+            None => {
+                let bytes = unsafe { read_all_file(io) }?;
+                let demux = Demuxed::parse(bytes).map_err(|e| e.to_string())?;
+                crate::attachments::parse_attachments(&demux)
+            }
+        };
         let mut names = Vec::new();
         let mut mimes = Vec::new();
         let mut datas = Vec::new();
@@ -215,9 +243,13 @@ pub unsafe extern "C" fn sena_file_art_write(
             }
         }
         let io = unsafe { &*io };
-        let original = unsafe { read_all_file(io) }?;
-        let rewritten = crate::attachments::rewrite_attachments(&original, &arts)?;
-        unsafe { write_rewrite_tail(io, &original, &rewritten) }
+        unsafe {
+            rewrite_via_plan(
+                io,
+                |original| crate::attachments::rewrite_attachments(original, &arts),
+                |scan| crate::attachments::plan_attachment_rewrite(scan, &arts),
+            )
+        }
     }));
     match result {
         Ok(Ok(())) => SENA_DEC_OK,
@@ -372,8 +404,153 @@ fn map_decode_error(e: &crate::pipeline::DecodeError) -> i32 {
     match e {
         crate::pipeline::DecodeError::Unsupported(_) => SENA_DEC_ERR_UNSUPPORTED,
         crate::pipeline::DecodeError::Codec(_) => SENA_DEC_ERR_DECODE,
+        crate::pipeline::DecodeError::Io(_) => SENA_DEC_ERR_IO,
         _ => SENA_DEC_ERR_FORMAT,
     }
+}
+
+type RawReadFn = unsafe extern "C" fn(*mut c_void, *mut c_void, u64) -> i64;
+type RawWriteFn = unsafe extern "C" fn(*mut c_void, *const c_void, u64) -> i64;
+type RawSeekFn = unsafe extern "C" fn(*mut c_void, i64, i32) -> i64;
+
+/// Builds a positioned reader over the host's io callbacks, or `None` when
+/// the stream is not seekable (probed with a no-op reposition; whence 1 =
+/// current position, matching foobar2000's `file::t_seek_mode`). This is the
+/// building block of the bounded-memory paths: the container is scanned via
+/// [`crate::demux::index_container`] and audio payloads are fetched on
+/// demand instead of slurping the whole file.
+fn range_reader(
+    user: *mut c_void,
+    read: RawReadFn,
+    seek: RawSeekFn,
+) -> Option<impl FnMut(u64, usize) -> Result<Vec<u8>, String>> {
+    if unsafe { seek(user, 0, 1) } < 0 {
+        return None;
+    }
+    Some(move |pos: u64, len: usize| -> Result<Vec<u8>, String> {
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        if unsafe { seek(user, pos as i64, 0) } < 0 {
+            return Err(format!("io: seek to {pos} failed"));
+        }
+        let mut out = vec![0u8; len];
+        let mut off = 0usize;
+        while off < len {
+            let n = unsafe { read(user, out[off..].as_mut_ptr().cast(), (len - off) as u64) };
+            if n < 0 {
+                return Err(format!("io: read failed ({n})"));
+            }
+            if n == 0 {
+                break; // EOF: short buffer; callers decide if that is an error
+            }
+            let n = n as usize;
+            if n > len - off {
+                return Err("io: read callback returned more than requested".into());
+            }
+            off += n;
+        }
+        out.truncate(off);
+        Ok(out)
+    })
+}
+
+/// Write all of `data` at absolute `pos` through the io callbacks.
+unsafe fn write_all_at(
+    user: *mut c_void,
+    write: RawWriteFn,
+    seek: RawSeekFn,
+    pos: u64,
+    data: &[u8],
+) -> Result<(), String> {
+    if unsafe { seek(user, pos as i64, 0) } < 0 {
+        return Err(format!("io: seek to {pos} failed"));
+    }
+    let mut off = 0usize;
+    while off < data.len() {
+        let n = unsafe { write(user, data[off..].as_ptr().cast(), (data.len() - off) as u64) };
+        if n <= 0 {
+            return Err(format!("io: write failed at {off} ({n})"));
+        }
+        off += n as usize;
+    }
+    Ok(())
+}
+
+/// Apply a rewrite plan through the write/seek callbacks. `Insert` ops only
+/// ever target EOF (the caller checked the Segment ends at the file end), so
+/// a positioned write is the correct primitive. Zero runs go out in chunks
+/// to stay allocation-free.
+unsafe fn apply_write_ops_io(
+    user: *mut c_void,
+    write: RawWriteFn,
+    seek: RawSeekFn,
+    ops: &[crate::demux::WriteOp],
+) -> Result<(), String> {
+    use crate::demux::WriteOp;
+    const ZEROS: [u8; 16 * 1024] = [0u8; 16 * 1024];
+    for op in ops {
+        match op {
+            WriteOp::Bytes { offset, data } | WriteOp::Insert { offset, data } => unsafe {
+                write_all_at(user, write, seek, *offset, data)?;
+            },
+            WriteOp::Zero { offset, len } => {
+                if unsafe { seek(user, *offset as i64, 0) } < 0 {
+                    return Err(format!("io: seek to {offset} failed"));
+                }
+                let mut left = *len;
+                while left > 0 {
+                    let chunk = left.min(ZEROS.len() as u64);
+                    let n = unsafe { write(user, ZEROS.as_ptr().cast(), chunk) };
+                    if n <= 0 {
+                        return Err(format!("io: write failed ({n})"));
+                    }
+                    left -= n as u64;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Shared plan-then-write tag/attachment rewrite: scan the container through
+/// positioned reads, apply the planned ops, verify the immutable tags. Falls
+/// back to `buffered` (whole-file rewrite) when the stream is not seekable
+/// or the Segment does not end exactly at EOF (trailing data would not
+/// survive an append-as-write).
+unsafe fn rewrite_via_plan<Plan>(
+    io: &SenaFileIo,
+    buffered: impl FnOnce(&[u8]) -> Result<Vec<u8>, String>,
+    plan: Plan,
+) -> Result<(), String>
+where
+    Plan: FnOnce(&crate::demux::IndexedFile) -> Result<Vec<crate::demux::WriteOp>, String>,
+{
+    let read = io.read.ok_or("io: read callback is NULL")?;
+    let write = io.write.ok_or("io: write callback is NULL")?;
+    let prepared = io
+        .seek
+        .zip(io.size)
+        .and_then(|(seek, size)| {
+            let mut ra = range_reader(io.user_data, read, seek)?;
+            let scan = crate::demux::index_container(&mut ra, false).ok()?;
+            let file_size = unsafe { size(io.user_data) };
+            if file_size != scan.segment_payload_end {
+                return None;
+            }
+            Some((scan, seek))
+        });
+    if let Some((scan, seek)) = prepared {
+        let ops = plan(&scan)?;
+        unsafe { apply_write_ops_io(io.user_data, write, seek, &ops) }?;
+        let mut ra = range_reader(io.user_data, read, seek).ok_or("io: stream became unseekable")?;
+        let check = crate::demux::index_container(&mut ra, false)
+            .map_err(|e| format!("rewritten file invalid: {e}"))?;
+        return crate::demux::check_immutable_survived(&scan, &check);
+    }
+    let original = unsafe { read_all_file(io) }?;
+    let rewritten = buffered(&original)?;
+    unsafe { write_rewrite_tail(io, &original, &rewritten) }
 }
 
 #[unsafe(no_mangle)]
@@ -388,9 +565,25 @@ pub unsafe extern "C" fn sena_dec_open(
             return Err("invalid argument: NULL io/out".to_string());
         }
         let io = unsafe { &*io };
-        let bytes = unsafe { read_all(io) }?;
-        let demux = Demuxed::parse(bytes).map_err(|e| e.to_string())?;
-        let decoder = StreamingDecoder::open(demux).map_err(|e| e.to_string())?;
+        let read = io.read.ok_or("io: read callback is NULL")?;
+        let decoder = match io.seek.and_then(|seek| range_reader(io.user_data, read, seek)) {
+            // Seekable input: index the container, fetch frame payloads
+            // lazily - per-instance memory stays bounded no matter the file
+            // size (32-bit foobar2000 has a 2 GiB address space and runs
+            // several decode threads concurrently for ReplayGain scans).
+            Some(mut read_at) => {
+                let mut indexed = crate::demux::index_container(&mut read_at, true)?;
+                let frames = std::mem::take(&mut indexed.frames);
+                let store = crate::stream::FrameStore::Lazy { frames, read_at: Box::new(read_at), window: (0, Vec::new()) };
+                StreamingDecoder::open_indexed(indexed, store).map_err(|e| e.to_string())?
+            }
+            // Non-seekable input: one pass into memory, as before.
+            None => {
+                let bytes = unsafe { read_all(io) }?;
+                let demux = Demuxed::parse(bytes).map_err(|e| e.to_string())?;
+                StreamingDecoder::open(demux).map_err(|e| e.to_string())?
+            }
+        };
         unsafe { *out = Box::into_raw(Box::new(SenaDecHandle { decoder })) };
         Ok(())
     }));
@@ -414,6 +607,18 @@ pub unsafe extern "C" fn sena_dec_close(dec: *mut SenaDecHandle) {
     }
 }
 
+/// Runs `f` and converts an escaping panic into `panic_code` instead of
+/// aborting the host process: an unwind crossing an `extern "C"` boundary
+/// kills the whole player instantly, with the panic message lost on stderr
+/// (invisible in a GUI host). The decode-path entry points below are the
+/// hottest and most complex code in the crate, so they must never unwind.
+fn guard<T>(panic_code: i32, f: impl FnOnce() -> Result<T, i32>) -> Result<T, i32> {
+    match catch_unwind(AssertUnwindSafe(f)) {
+        Ok(r) => r,
+        Err(_) => Err(panic_code),
+    }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sena_dec_get_info(
     dec: *mut SenaDecHandle,
@@ -422,14 +627,17 @@ pub unsafe extern "C" fn sena_dec_get_info(
     if dec.is_null() || info.is_null() {
         return SENA_DEC_ERR_INVALID;
     }
-    let d = unsafe { &*dec };
-    let i = d.decoder.info();
-    let mut sha = [0 as c_char; 65];
-    for (k, c) in i.audio_sha256.as_bytes().iter().take(64).enumerate() {
-        sha[k] = *c as c_char;
-    }
-    unsafe { *info = SenaDecInfo { sample_rate: i.sample_rate, channels: i.channels, playable_frames: i.playable_frames, profile: i.profile, sena_version: i.sena_version, audio_sha256: sha } };
-    SENA_DEC_OK
+    guard(SENA_DEC_ERR_DECODE, || {
+        let d = unsafe { &*dec };
+        let i = d.decoder.info();
+        let mut sha = [0 as c_char; 65];
+        for (k, c) in i.audio_sha256.as_bytes().iter().take(64).enumerate() {
+            sha[k] = *c as c_char;
+        }
+        unsafe { *info = SenaDecInfo { sample_rate: i.sample_rate, channels: i.channels, playable_frames: i.playable_frames, profile: i.profile, sena_version: i.sena_version, audio_sha256: sha } };
+        Ok(SENA_DEC_OK)
+    })
+    .unwrap_or_else(|e| e)
 }
 
 #[unsafe(no_mangle)]
@@ -442,23 +650,23 @@ pub unsafe extern "C" fn sena_dec_read_f32(
     if dec.is_null() || interleaved.is_null() || out_frames.is_null() {
         return SENA_DEC_ERR_INVALID;
     }
-    let d = unsafe { &mut *dec };
-    let want = frames as usize;
-    let n2 = match want.checked_mul(2) {
-        Some(n) => n,
-        None => return SENA_DEC_ERR_INVALID,
-    };
-    let slice = unsafe { std::slice::from_raw_parts_mut(interleaved, n2) };
-    match d.decoder.read_f32(slice, frames) {
-        Ok(n) => {
-            unsafe { *out_frames = n };
-            if n == 0 { SENA_DEC_EOF } else { SENA_DEC_OK }
+    guard(SENA_DEC_ERR_DECODE, || {
+        let d = unsafe { &mut *dec };
+        let want = frames as usize;
+        let n2 = match want.checked_mul(2) {
+            Some(n) => n,
+            None => return Err(SENA_DEC_ERR_INVALID),
+        };
+        let slice = unsafe { std::slice::from_raw_parts_mut(interleaved, n2) };
+        match d.decoder.read_f32(slice, frames) {
+            Ok(n) => {
+                unsafe { *out_frames = n };
+                Ok(if n == 0 { SENA_DEC_EOF } else { SENA_DEC_OK })
+            }
+            Err(e) => Err(map_decode_error(&e)),
         }
-        Err(e) => {
-            write_err(ptr::null_mut(), 0, &e.to_string());
-            map_decode_error(&e)
-        }
-    }
+    })
+    .unwrap_or_else(|e| e)
 }
 
 #[unsafe(no_mangle)]
@@ -469,10 +677,13 @@ pub unsafe extern "C" fn sena_dec_get_read_info(
     if dec.is_null() || info.is_null() {
         return SENA_DEC_ERR_INVALID;
     }
-    let d = unsafe { &*dec };
-    let i = d.decoder.read_info();
-    unsafe { *info = SenaDecReadInfo { start_frame: i.start_frame, frames: i.frames, payload_bits: i.payload_bits } };
-    SENA_DEC_OK
+    guard(SENA_DEC_ERR_DECODE, || {
+        let d = unsafe { &*dec };
+        let i = d.decoder.read_info();
+        unsafe { *info = SenaDecReadInfo { start_frame: i.start_frame, frames: i.frames, payload_bits: i.payload_bits } };
+        Ok(SENA_DEC_OK)
+    })
+    .unwrap_or_else(|e| e)
 }
 
 #[unsafe(no_mangle)]
@@ -480,11 +691,14 @@ pub unsafe extern "C" fn sena_dec_seek(dec: *mut SenaDecHandle, frame: u64) -> i
     if dec.is_null() {
         return SENA_DEC_ERR_INVALID;
     }
-    let d = unsafe { &mut *dec };
-    match d.decoder.seek(frame) {
-        Ok(()) => SENA_DEC_OK,
-        Err(e) => map_decode_error(&e),
-    }
+    guard(SENA_DEC_ERR_DECODE, || {
+        let d = unsafe { &mut *dec };
+        match d.decoder.seek(frame) {
+            Ok(()) => Ok(SENA_DEC_OK),
+            Err(e) => Err(map_decode_error(&e)),
+        }
+    })
+    .unwrap_or_else(|e| e)
 }
 
 #[unsafe(no_mangle)]
@@ -504,9 +718,20 @@ pub unsafe extern "C" fn sena_dec_probe_info(
             return Err("invalid argument: NULL io/info".into());
         }
         let io = unsafe { &*io };
-        let bytes = unsafe { read_all(io) }?;
-        let demux = Demuxed::parse(bytes).map_err(|e| e.to_string())?;
-        let (probe, _warnings) = crate::pipeline::probe(&demux).map_err(|e| e.to_string())?;
+        let read = io.read.ok_or("io: read callback is NULL")?;
+        let (probe, _warnings) = match io.seek.and_then(|seek| range_reader(io.user_data, read, seek)) {
+            // Head-only scan: tracks + immutable tags, cluster payloads and
+            // even the frame index are skipped.
+            Some(mut read_at) => {
+                let indexed = crate::demux::index_container(&mut read_at, false)?;
+                crate::pipeline::probe(&indexed).map_err(|e| e.to_string())?
+            }
+            None => {
+                let bytes = unsafe { read_all(io) }?;
+                let demux = Demuxed::parse(bytes).map_err(|e| e.to_string())?;
+                crate::pipeline::probe(&demux).map_err(|e| e.to_string())?
+            }
+        };
         let mut sha = [0 as c_char; 65];
         for (k, c) in probe.audio_sha256.as_bytes().iter().take(64).enumerate() {
             sha[k] = *c as c_char;
@@ -558,10 +783,13 @@ unsafe fn file_rewrite(io: *const SenaFileIo, entries: &[(String, String)], err:
             return Err("invalid argument: NULL io".into());
         }
         let io = unsafe { &*io };
-        let original = unsafe { read_all_file(io) }?;
-        let rewritten = rewrite_user_tags(&original, entries)?;
-        unsafe { write_rewrite_tail(io, &original, &rewritten) }?;
-        Ok(())
+        unsafe {
+            rewrite_via_plan(
+                io,
+                |original| rewrite_user_tags(original, entries),
+                |scan| crate::tags::plan_user_tag_rewrite(scan, entries),
+            )
+        }
     }));
     match result {
         Ok(Ok(())) => SENA_DEC_OK,
@@ -731,6 +959,11 @@ mod tests {
         0
     }
 
+    unsafe extern "C" fn mem_size(user: *mut c_void) -> u64 {
+        let f = unsafe { &*(user as *const MemFile) };
+        unsafe { &*f.data.get() }.len() as u64
+    }
+
     fn open_mem(path: &str) -> MemFile {
         let full = format!("{}/../../{}", env!("CARGO_MANIFEST_DIR"), path);
         MemFile::new(std::fs::read(full).unwrap())
@@ -806,5 +1039,144 @@ mod tests {
         assert_eq!(unsafe { std::ffi::CStr::from_ptr(sena_tags_key(handle, 0)) }.to_bytes(), b"TITLE");
         assert_eq!(unsafe { std::ffi::CStr::from_ptr(sena_tags_value(handle, 0)) }.to_bytes(), b"test song");
         unsafe { sena_tags_close(handle) };
+    }
+
+    /// Same as `abi_tag_rewrite`, but with a working `size` callback so the
+    /// write goes through the positioned-write plan (no whole-file copies).
+    #[test]
+    fn abi_tag_rewrite_planned_ops() {
+        let mem = open_mem("assets/e2e/01__p300__lfa__hf144.sena");
+        let before_len = unsafe { &*mem.data.get() }.len();
+        let io = SenaFileIo {
+            user_data: (&mem as *const MemFile).cast_mut().cast(),
+            read: Some(mem_read),
+            write: Some(mem_write),
+            seek: Some(mem_seek),
+            tell: None,
+            size: Some(mem_size),
+        };
+        let key = c"TITLE".as_ptr();
+        let value = c"test song".as_ptr();
+        let entries = [SenaMetaEntry { key, value }];
+        let mut err = [0u8; 256];
+        assert_eq!(unsafe { sena_file_write_tags(&io, entries.as_ptr(), 1, err.as_mut_ptr().cast(), err.len()) }, SENA_DEC_OK);
+        let data = unsafe { &*mem.data.get() };
+        // The file grew by exactly the appended tail Tags element; everything
+        // else was written in place.
+        assert!(data.len() > before_len);
+        let demux = Demuxed::parse(data.clone()).unwrap();
+        assert_eq!(demux.tags.last().unwrap().get("TITLE"), Some("test song"));
+        assert_eq!(demux.immutable_tag("SENA_PROFILE"), Some("300"));
+        // Clusters untouched: a full decode still yields the same length.
+        let dec = crate::pipeline::Decoder::open(&demux).unwrap();
+        assert_eq!(dec.info().playable_frames, 960000);
+    }
+
+    /// `sena_dec_probe_info` over a seekable stream uses the bounded head
+    /// scan and returns the same info as the decode handle.
+    #[test]
+    fn abi_probe_info_head_scan() {
+        let mem = open_mem("assets/e2e/01__p300__lfa__hf144.sena");
+        let io = SenaDecIo {
+            user_data: (&mem as *const MemFile).cast_mut().cast(),
+            read: Some(mem_read),
+            seek: Some(mem_seek),
+            tell: None,
+            size: Some(mem_size),
+        };
+        let mut info = SenaDecInfo { sample_rate: 0, channels: 0, playable_frames: 0, profile: 0, sena_version: 0, audio_sha256: [0; 65] };
+        let mut err = [0u8; 256];
+        assert_eq!(unsafe { sena_dec_probe_info(&io, &mut info, err.as_mut_ptr().cast(), err.len()) }, SENA_DEC_OK);
+        assert_eq!((info.sample_rate, info.channels, info.playable_frames, info.profile), (48000, 2, 960000, 300));
+    }
+
+    /// The lazy io path must be bit-exact with the in-memory store: same
+    /// streaming decoder, same bytes, only the payload source differs. (The
+    /// separate whole-file `pipeline::Decoder` is NOT bit-identical to the
+    /// streaming decoder by design - the zero-phase resampler sees different
+    /// context - so it is not a reference here.)
+    #[test]
+    fn abi_lazy_decode_matches_reference() {
+        let bytes = std::fs::read(format!("{}/../../assets/e2e/01__p300__lfa__hf144.sena", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let reference = {
+            let demux = Demuxed::parse(bytes.clone()).unwrap();
+            let mut dec = crate::stream::StreamingDecoder::open(demux).unwrap();
+            let mut pcm = Vec::new();
+            let mut buf = vec![0.0f32; 4096 * 2];
+            loop {
+                let n = dec.read_f32(&mut buf, 4096).unwrap();
+                if n == 0 {
+                    break;
+                }
+                pcm.extend_from_slice(&buf[..n as usize * 2]);
+            }
+            pcm
+        };
+
+        let mem = MemFile::new(bytes);
+        let io = SenaDecIo {
+            user_data: (&mem as *const MemFile).cast_mut().cast(),
+            read: Some(mem_read),
+            seek: Some(mem_seek),
+            tell: None,
+            size: Some(mem_size),
+        };
+        let mut handle: *mut SenaDecHandle = std::ptr::null_mut();
+        let mut err = [0u8; 256];
+        assert_eq!(unsafe { sena_dec_open(&io, &mut handle, err.as_mut_ptr().cast(), err.len()) }, SENA_DEC_OK);
+        let mut lazy = Vec::new();
+        let mut buf = vec![0.0f32; 4096 * 2];
+        loop {
+            let mut got = 0u64;
+            let rc = unsafe { sena_dec_read_f32(handle, buf.as_mut_ptr(), 4096, &mut got) };
+            assert!(rc == SENA_DEC_OK || rc == SENA_DEC_EOF);
+            lazy.extend_from_slice(&buf[..got as usize * 2]);
+            if rc == SENA_DEC_EOF {
+                break;
+            }
+        }
+        unsafe { sena_dec_close(handle) };
+        assert_eq!(lazy.len(), reference.len());
+        assert_eq!(lazy, reference);
+    }
+
+    /// Mirrors the foobar2000 ReplayGain batch scanner: many threads each
+    /// run an independent decoder over the lazy io path to EOF.
+    #[test]
+    fn abi_concurrent_decode() {
+        let bytes = std::fs::read(format!("{}/../../assets/e2e/01__p300__lfa__hf144.sena", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let bytes = bytes.clone();
+            handles.push(std::thread::spawn(move || {
+                let mem = MemFile::new(bytes);
+                let io = SenaDecIo {
+                    user_data: (&mem as *const MemFile).cast_mut().cast(),
+                    read: Some(mem_read),
+                    seek: Some(mem_seek),
+                    tell: None,
+                    size: Some(mem_size),
+                };
+                let mut handle: *mut SenaDecHandle = std::ptr::null_mut();
+                let mut err = [0u8; 256];
+                assert_eq!(unsafe { sena_dec_open(&io, &mut handle, err.as_mut_ptr().cast(), err.len()) }, SENA_DEC_OK);
+                let mut buf = vec![0.0f32; 4096 * 2];
+                let mut total = 0u64;
+                loop {
+                    let mut got = 0u64;
+                    let rc = unsafe { sena_dec_read_f32(handle, buf.as_mut_ptr(), 4096, &mut got) };
+                    assert!(rc == SENA_DEC_OK || rc == SENA_DEC_EOF);
+                    total += got;
+                    if rc == SENA_DEC_EOF {
+                        break;
+                    }
+                }
+                assert_eq!(total, 960000);
+                unsafe { sena_dec_close(handle) };
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 }
