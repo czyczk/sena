@@ -1,16 +1,19 @@
 //! senaenc CLI.
 
-use sena_core::{account, Profile, MIN_TOTAL_KBPS, SENAV_THRESHOLD_KBPS};
+use sena_core::{account, Profile, RECOMMENDED_MIN_TOTAL_KBPS, SENAV_THRESHOLD_KBPS};
 use sena_enc::{check_version, exhale_version, opusenc_version, version_ge, EncoderConfig};
 use std::path::{Path, PathBuf};
 
 fn usage() -> ! {
     eprintln!(
-        "usage: senaenc [--profile 300|600] [--opus-original|--opus-senav] \
+        "usage: senaenc [--profile 300|600] [--opus-original|--opus-senav] [--bypass-recommendations] \
          <bitrate_kbps> <in.wav|-> <out.sena>\n\
          senaenc doctor                              check required encoder tools\n\
-         bitrate >= {MIN_TOTAL_KBPS} kbit/s (below that, use plain Opus)\n\
-         default profile: 600; default opus: original <= {SENAV_THRESHOLD_KBPS}k, senav above"
+         minimum bitrate: {}k (@600) / {}k (@300); below {RECOMMENDED_MIN_TOTAL_KBPS}k plain Opus\n\
+         is recommended and senaenc refuses unless --bypass-recommendations is given\n\
+         default profile: 600; default opus: original <= {SENAV_THRESHOLD_KBPS}k, senav above",
+        Profile::At600.min_total_kbps(),
+        Profile::At300.min_total_kbps(),
     );
     std::process::exit(2);
 }
@@ -174,6 +177,7 @@ fn main() {
     let mut opus_mode: Option<bool> = None; // None = auto
     let keep_workdir = args.iter().any(|a| a == "--keep-workdir");
     let force = args.iter().any(|a| a == "--force");
+    let bypass = args.iter().any(|a| a == "--bypass-recommendations");
     let mut rest = vec![];
     let mut i = 0;
     while i < args.len() {
@@ -190,6 +194,7 @@ fn main() {
             "--opus-senav" => opus_mode = Some(true),
             "--keep-workdir" => {}
             "--force" => {}
+            "--bypass-recommendations" => {}
             a if a.starts_with('-') && rest.is_empty() => usage(),
             a => rest.push(a.to_string()),
         }
@@ -203,8 +208,23 @@ fn main() {
     let output = PathBuf::from(&rest[2]);
 
     if account(kbps, profile).is_none() {
-        eprintln!("error: total bitrate {kbps} kbit/s is below the Sena minimum ({MIN_TOTAL_KBPS} kbit/s); use plain Opus.");
+        let min = profile.min_total_kbps();
+        eprintln!(
+            "error: minimum bitrate for profile @{} is {min} kbit/s ({}k xHE-AAC + 32k Opus floor); requested {kbps}k. Use plain Opus at this rate.",
+            profile.crossover_hz(),
+            profile.deduct_kbps(),
+        );
         std::process::exit(3);
+    }
+    if kbps < RECOMMENDED_MIN_TOTAL_KBPS && !bypass {
+        eprintln!(
+            "error: {kbps} kbit/s is below the recommended Sena minimum ({RECOMMENDED_MIN_TOTAL_KBPS} kbit/s)."
+        );
+        eprintln!(
+            "       at this rate a plain Opus encode serves better: opusenc --bitrate {kbps} in.wav out.opus"
+        );
+        eprintln!("       re-run with --bypass-recommendations to encode Sena anyway.");
+        std::process::exit(5);
     }
     let (xhe_k, opus_k) = account(kbps, profile).unwrap();
     let use_senav = opus_mode.unwrap_or(kbps > SENAV_THRESHOLD_KBPS);

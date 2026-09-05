@@ -41,16 +41,32 @@ test:
 #   just senadec-plugin-fb2k-windows           # Windows x64 + arm64ec DLLs
 #   just senadec-plugin-fb2k-windows-x86       # one specific arch
 #   just senadec-plugin-fb2k-mac               # macOS universal component
-#   just senadec-plugin-fb2k-package           # zip everything into one
-#                                              # .fb2k-component
 #   just senadec-plugin-fb2k-all               # Windows + macOS + package
 #
-# Per-arch failures are reported and skipped (keep going with the rest).
-# The packaged file lands in plugins/foobar2000/foo_input_sena/dist/
+#   just senadec-plugin-fb2k-package           # zip everything in dist/ into
+#                                              # one .fb2k-component
+#   just senadec-plugin-fb2k-package windows-x64
+#                                              # scoped package (named
+#                                              # ...-windows-x64.fb2k-component)
+#   just senadec-plugin-fb2k-windows-x64-package
+#                                              # build one arch + scoped package
+#   just senadec-plugin-fb2k-check             # preflight only: can it build?
+#   just senadec-plugin-fb2k-check x64         # ... for one arch
+#
+# Every build runs a per-scope preflight BEFORE compiling (a piece whose
+# toolchain is incomplete is skipped, the rest continues; the mac build
+# compiles the Rust staticlib before any C++). Runs end with a summary that
+# names the gaps and the exact catch-up recipes: build the missing piece,
+# then `just senadec-plugin-fb2k-package` re-packages everything in dist/
+# without rebuilding. The packaged file lands in
+# plugins/foobar2000/foo_input_sena/dist/
 # ---------------------------------------------------------------------------
 
 senadec-plugin-fb2k-doctor:
     @python3 "{{script}}" doctor
+
+senadec-plugin-fb2k-check arch="":
+    @python3 "{{script}}" check {{ if arch == "" { "" } else { "--arch " + arch } }}
 
 senadec-plugin-fb2k-rust-libs arch="":
     @python3 "{{script}}" rust-libs {{ if arch == "" { "" } else { "--arch " + arch } }}
@@ -70,8 +86,20 @@ senadec-plugin-fb2k-windows-arm64ec vs="auto":
 senadec-plugin-fb2k-mac:
     @python3 "{{script}}" mac
 
-senadec-plugin-fb2k-package:
-    @python3 "{{script}}" package
+senadec-plugin-fb2k-package scope="all":
+    @python3 "{{script}}" package --scope {{scope}}
+
+senadec-plugin-fb2k-windows-x86-package vs="auto":
+    @python3 "{{script}}" windows --arch x86 --vs {{vs}} && python3 "{{script}}" package --scope windows-x86
+
+senadec-plugin-fb2k-windows-x64-package vs="auto":
+    @python3 "{{script}}" windows --arch x64 --vs {{vs}} && python3 "{{script}}" package --scope windows-x64
+
+senadec-plugin-fb2k-windows-arm64ec-package vs="auto":
+    @python3 "{{script}}" windows --arch arm64ec --vs {{vs}} && python3 "{{script}}" package --scope windows-arm64ec
+
+senadec-plugin-fb2k-mac-package:
+    @python3 "{{script}}" mac && python3 "{{script}}" package --scope mac
 
 senadec-plugin-fb2k-all vs="auto":
     @python3 "{{script}}" all --vs {{vs}}

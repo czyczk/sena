@@ -16,11 +16,17 @@ Workspace crates:
 ## senaenc command line
 
 ```text
-senaenc [--profile 300|600] [--opus-original|--opus-senav] <bitrate_kbps> <in.wav|-> <out.sena>
+senaenc [--profile 300|600] [--opus-original|--opus-senav] [--bypass-recommendations] <bitrate_kbps> <in.wav|-> <out.sena>
 ```
 
-- `<bitrate_kbps>`: total Sena bitrate; >= 160. At 160k the xHE-AAC track is
-  deducted (16k for @300, 24k for @600) and the remainder goes to Opus.
+- `<bitrate_kbps>`: total Sena bitrate. Hard minimum: 64k for @600, 56k for
+  @300 (the xHE-AAC allotment plus a 32k Opus floor); lower requests are
+  rejected. Below 128k a plain Opus encode is recommended instead and
+  senaenc refuses (exit 5) unless `--bypass-recommendations` is given.
+- The xHE-AAC track is allotted its measured average spend (24k for @300,
+  32k for @600) and the remainder goes to Opus as its nominal VBR bitrate.
+  Opus' own VBR float (~+16k) is accepted, so e.g. 160k at @600 yields
+  ~176k actual (32k xHE-AAC + 128k Opus + float).
 - Input `-` reads a WAV stream from stdin (foobar2000 converter style).
 - Input WAV may be 8/16/24-bit PCM or 32-bit IEEE float, any sample rate
   (24k, 32k, 44.1k, 48k, 88.2k, 96k, ...). senaenc normalizes it to 48 kHz
@@ -109,16 +115,29 @@ Notes:
 ```bash
 just doctor                          # build-environment check
 just test                            # workspace tests
-just senadec-plugin-fb2k-all         # windows x64/arm64ec + macOS + zipped .fb2k-component
+just senadec-plugin-fb2k-all         # windows x86/x64/arm64ec + macOS + zipped .fb2k-component
 just senaenc                         # encoder CLI release binaries (windows x64/arm64 + macOS Universal)
 just senadec-bin                     # decoder CLI release binaries (same targets)
 ```
 
-Plugin recipe names are namespaced (`senadec-plugin-fb2k-*`); per-arch
-failures are reported and skipped so one broken arch does not abort the
-rest (`just senadec-plugin-fb2k-windows-x86` shows the exact WARN). The
-packaged plugin lands in `plugins/foobar2000/foo_input_sena/dist/
-foo_input_sena-0.1.0.fb2k-component`.
+Plugin recipe names are namespaced (`senadec-plugin-fb2k-*`). Every build
+runs a per-scope preflight before compiling anything; a piece whose
+toolchain is incomplete is skipped while the rest continues, and each run
+ends with a summary that names the gaps plus the exact catch-up recipes
+(build the missing piece, then re-package). Useful subsets:
+
+```bash
+just senadec-plugin-fb2k-check x64            # preflight only: can x64 build?
+just senadec-plugin-fb2k-windows-x64          # build just the x64 DLL
+just senadec-plugin-fb2k-package windows-x64  # zip dist/ into a scope-named
+                                              # foo_input_sena-0.1.0-windows-x64.fb2k-component
+just senadec-plugin-fb2k-windows-x64-package  # build x64 + scoped package
+just senadec-plugin-fb2k-package              # re-package everything in dist/ (no rebuild)
+```
+
+The full-platform package lands in `plugins/foobar2000/foo_input_sena/dist/
+foo_input_sena-0.1.0.fb2k-component`; scoped packages carry the scope in
+the file name.
 
 Standalone `senaenc` release builds (no `opusenc`/`exhale` needed at build
 time; they are runtime dependencies only):
@@ -133,6 +152,10 @@ just senaenc-win-arm64
 just senaenc-macos-universal
 just senaenc-list-targets
 ```
+
+Multi-target runs check every target's `rust-std` up front, skip failed
+targets instead of aborting, and end with a summary naming the failures
+plus the `just senaenc "<targets>"` command that retries only them.
 
 The default output directory is `build/senaenc` (repo-local; `/build/` is
 git-ignored). Pass `--out` / `SENAENC_OUT` / `--set senaenc_out ...` to write

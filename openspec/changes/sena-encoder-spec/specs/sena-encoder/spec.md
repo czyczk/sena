@@ -104,15 +104,27 @@ deterministically (16 kHz in -> 16 kHz out; preset >= 5 floors the core at
 ### Requirement: Bitrate accounting
 Bitrate accounting SHALL follow these rules (rule B):
 
-- Total requested bitrate below 160 kbit/s: encode plain Opus only.
-- Deduction for the xHE-AAC track: 16 kbit/s for @300, 24 kbit/s for @600.
+- Hard minimum total bitrate: the profile's xHE-AAC allotment plus a 32
+  kbit/s Opus floor - 64 kbit/s for @600, 56 kbit/s for @300. Lower
+  requests SHALL be rejected.
+- Below 128 kbit/s a plain Opus encode is recommended instead; senaenc
+  SHALL refuse to encode unless `--bypass-recommendations` is given.
+- Deduction for the xHE-AAC track (its measured average spend): 24 kbit/s
+  for @300, 32 kbit/s for @600. The xHE-AAC encoder parameters themselves
+  are unchanged by this number.
 - Remaining budget goes to the Opus track as its nominal VBR bitrate.
-- Actual spend of the xHE-AAC track may exceed the deduction by up to the
-  measured float (approximately 4-8 kbit/s); this float is accepted.
+- Opus' own VBR float above the nominal parameter (approximately 16
+  kbit/s) is accepted, so the delivered total lands one float step above
+  the request (e.g. 160k requested at @600 -> ~176k delivered).
 
 #### Scenario: 160 kbit/s with @300
 - GIVEN total 160 kbit/s and profile @300
-- THEN xHE-AAC is allotted ~16 kbit/s and Opus the remainder.
+- THEN xHE-AAC is allotted ~24 kbit/s and Opus the remainder.
+
+#### Scenario: 100 kbit/s request
+- GIVEN total 100 kbit/s at any profile
+- THEN senaenc refuses and recommends a plain Opus encode, unless
+  `--bypass-recommendations` is given.
 
 ### Requirement: Opus encoder selection
 - If the requested total bitrate is <= 192 kbit/s, the standard `opusenc`

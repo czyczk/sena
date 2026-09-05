@@ -147,3 +147,35 @@ this Linux host; the binaries are structurally verified as above.
   play test through foobar was not completed (WSL Windows interop stalls on
   a headless UI launch attempt; installed DLL copy is byte-identical to the
   packaged x64 payload).
+
+## Build-flow ergonomics + encoder bitrate policy (2026-09-05)
+
+- `build.py` now preflights per scope BEFORE compiling: shared toolchain
+  (cargo/SDK/VS/cargo-xwin resp. clang/ld64/ar) aborts the leg, per-arch
+  rust-std gaps skip just that arch. The macOS slice build compiles the
+  Rust staticlib before any C++ (a Rust failure no longer wastes the SDK
+  compile). `build.py check [--arch ...]` is the preflight-only gate.
+- `build.py all` tolerates per-leg/per-arch failure, packages whatever is
+  in `dist/`, and ends with a summary naming gaps + catch-up recipes
+  (`just senadec-plugin-fb2k-<piece>` then `just senadec-plugin-fb2k-package`,
+  which only re-zips dist/, never rebuilds).
+- `build.py package --scope all|windows|windows-x86|windows-x64|windows-arm64ec|mac`;
+  scoped packages are scope-named (e.g. `foo_input_sena-0.1.0-windows-x64
+  .fb2k-component`), `all` keeps the canonical name and warns when
+  INCOMPLETE. justfile gained `...-package` combined recipes and `check`.
+- `scripts/build-release-bin.py` (senaenc/senadec): rust-std preflight up
+  front (skips only the affected targets), per-target failure tolerance,
+  final summary with a `just <recipe> "<targets>"` retry line; non-zero
+  exit only when nothing was delivered.
+- Fixed latent bugs: `rust-libs --arch x64` KeyError (short names are now
+  aliased to the RUST_TARGETS keys); macOS fat-binary arch header now
+  follows the built-slice list instead of the requested-arch list.
+- Encoder accounting (rule B) re-based on measured spends: xHE-AAC
+  allotment is 24k (@300) / 32k (@600) nominal - encoder parameters
+  unchanged, only the budget split moved. Hard minimums are per-profile
+  (allotment + 32k Opus floor): 56k @300 / 64k @600. 64k..127k is a soft
+  reject recommending plain Opus, overridable with
+  `--bypass-recommendations` (exit 5); below the floor is a hard reject
+  (exit 3). Rationale: @600 measured ~+32k over the request (Opus VBR
+  float ~+16k + LF ~16k over the old 24k deduction), so the nominal split
+  now matches reality and 160k @600 lands at ~176k as expected.

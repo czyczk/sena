@@ -10,6 +10,13 @@ Supported host views:
   * macOS         -> macOS targets with Xcode CLT / Apple clang.
 
 Minimum versions are enforced by `doctor`.
+
+Every build command runs a per-scope preflight BEFORE compiling anything;
+a piece whose toolchain is incomplete is skipped while the rest continues.
+Runs end with a summary naming the gaps and the exact catch-up recipes
+(build the missing piece, then re-run `package` to re-zip dist/ without
+rebuilding). `package --scope <what>` produces a scope-named component
+(e.g. foo_input_sena-<ver>-windows-x64.fb2k-component).
 """
 
 from __future__ import annotations
@@ -34,6 +41,7 @@ SCRIPTS = PLUGIN / "scripts"
 DIST = PLUGIN / "dist"
 BUILD = ROOT / "build" / "foobar2000"
 RUST_MIN = (1, 88)
+PKG_VERSION = "0.1.0"
 MACOS_SDK_URL = "https://github.com/phracker/MacOSX-SDKs/releases/download/11.3/MacOSX11.3.sdk.tar.xz"
 
 WINDOWS_ARCHES = ("x86", "x64", "arm64ec")
@@ -226,6 +234,163 @@ def foobar_sdk() -> pathlib.Path:
     )
 
 
+# ---------------------------------------------------------------- preflight
+# Per-scope readiness checks that run BEFORE anything is compiled, so a
+# broken toolchain fails fast instead of wasting a build, and `all` can
+# skip a broken leg while still completing the others. Every function
+# returns a list of human-readable problems (empty = ready); the matching
+# fix command is part of the message.
+
+def _try(fn, *args) -> str | None:
+    try:
+        fn(*args)
+        return None
+    except Exception as e:
+        return str(e)
+
+
+def preflight_cargo() -> list[str]:
+    p = _try(require_cargo)
+    return [p] if p else []
+
+
+def preflight_rust_target(target: str) -> list[str]:
+    if rust_target_libdir(target) is not None:
+        return []
+    return [f"Rust target '{target}' std libs are not installed; fix: rustup target add {target}"]
+
+
+def preflight_windows_shared(vs_pref: str) -> list[str]:
+    """Toolchain shared by all Windows arches (rust stds are per-arch)."""
+    problems = preflight_cargo()
+    if p := _try(foobar_sdk):
+        problems.append(p)
+    if host_os() == "linux" and which("cargo-xwin") is None:
+        problems.append("cargo-xwin not found (Windows Rust libs on Linux); fix: cargo install cargo-xwin")
+    if host_os() in ("linux", "windows"):
+        if p := _try(lambda: msbuild_exe(pick_vs(vs_pref))):
+            problems.append(f"Visual Studio/MSBuild: {p}")
+    return problems
+
+
+def preflight_windows_arch(arch: str) -> list[str]:
+    return preflight_rust_target(RUST_TARGETS[f"windows-{arch}"])
+
+
+def preflight_mac_shared() -> list[str]:
+    problems = preflight_cargo()
+    if p := _try(foobar_sdk):
+        problems.append(p)
+    if p := _try(clang_for_mac):
+        problems.append(p)
+    if p := _try(mac_archiver):
+        problems.append(p)
+    if host_os() == "linux":
+        # ld64.lld: build-time auto-provisioning needs apt-get + dpkg-deb.
+        cached = ROOT / ".cache" / "tools" / "lld14" / "usr" / "lib" / "llvm-14" / "bin" / "ld64.lld"
+        found = (os.environ.get("LD64_LLD") or which("ld64.lld")
+                 or list(pathlib.Path("/usr/lib").glob("llvm-*/bin/ld64.lld"))
+                 or cached.exists())
+        if not found and (which("apt-get") is None or which("dpkg-deb") is None):
+            problems.append("ld64.lld not found and auto-provisioning unavailable "
+                            "(no apt-get/dpkg-deb); fix: apt-get install lld (or set LD64_LLD)")
+    # The MacOSX SDK is downloaded on demand by mac_sdk_path(); that step
+    # runs before any compilation, so it is not a preflight problem.
+    return problems
+
+
+def preflight_mac_arch(arch: str) -> list[str]:
+    key = {"arm64": "mac-arm64", "x86_64": "mac-x64"}[arch]
+    return preflight_rust_target(RUST_TARGETS[key])
+
+
+def _preflight_or_raise(scope: str, problems: list[str]):
+    if problems:
+        raise ToolError(f"{scope} preflight failed:\n  - " + "\n  - ".join(problems))
+
+
+# ---------------------------------------------------------------- report
+#: Gap piece -> the just recipe that rebuilds exactly that piece.
+CATCHUP_RECIPES = {
+    "windows-x86": "just senadec-plugin-fb2k-windows-x86",
+    "windows-x64": "just senadec-plugin-fb2k-windows-x64",
+    "windows-arm64ec": "just senadec-plugin-fb2k-windows-arm64ec",
+    "mac-arm64": "just senadec-plugin-fb2k-mac",
+    "mac-x86_64": "just senadec-plugin-fb2k-mac",
+    "mac": "just senadec-plugin-fb2k-mac",
+}
+
+
+class Report:
+    """Collects per-piece outcomes and prints the end-of-run summary:
+    what was built, what was skipped/failed (with the reason), which
+    package(s) were written, and the exact catch-up recipes for the gaps."""
+
+    def __init__(self):
+        self.entries: list[list[str]] = []   # [piece, status, detail]
+        self.packages: list[tuple] = []      # (path, included, missing)
+
+    def add(self, piece: str, status: str, detail: str = ""):
+        for e in self.entries:
+            if e[0] == piece:
+                e[1], e[2] = status, detail
+                return
+        self.entries.append([piece, status, detail])
+
+    def status_of(self, piece: str) -> str | None:
+        for e in self.entries:
+            if e[0] == piece:
+                return e[1]
+        return None
+
+    def add_package(self, path, included: list[str], missing: list[str]):
+        self.packages.append((path, included, missing))
+
+    def gaps(self) -> list[list[str]]:
+        return [e for e in self.entries if e[1] in ("skipped", "failed")]
+
+    def any_delivery(self) -> bool:
+        return bool(self.packages) or any(e[1] == "ok" for e in self.entries)
+
+    def summary(self):
+        print("=" * 72)
+        print("summary")
+        print("=" * 72)
+        for piece, status, detail in self.entries:
+            mark = {"ok": "OK     ", "skipped": "SKIPPED", "failed": "FAILED "}.get(status, status)
+            line = f"  {mark}  {piece}"
+            if status == "ok" and detail:
+                line += f"  -> {detail}"
+            print(line)
+            if status in ("skipped", "failed") and detail:
+                for ln in str(detail).splitlines():
+                    print(f"          {ln}")
+        reused = []
+        for path, included, missing in self.packages:
+            line = f"  PACKAGE {path}"
+            if missing:
+                line += f"  (INCOMPLETE - missing: {', '.join(missing)})"
+            print(line)
+            print(f"          contains: {', '.join(included)}")
+            reused += [p for p in included if self.status_of(p) != "ok"]
+        if reused:
+            print(f"  note: {', '.join(sorted(set(reused)))} come(s) from artifacts already "
+                  f"present in dist/ (this command did not rebuild them)")
+        gaps = self.gaps()
+        if gaps:
+            print("-" * 72)
+            print("catch-up: build the missing piece(s), then re-package:")
+            seen = set()
+            for piece, _, _ in gaps:
+                r = CATCHUP_RECIPES.get(piece)
+                if r and r not in seen:
+                    seen.add(r)
+                    print(f"  {r}")
+            print("then re-package everything already in dist/ (nothing is rebuilt):")
+            print("  just senadec-plugin-fb2k-package")
+        print("=" * 72)
+
+
 # ---------------------------------------------------------------- Rust libs
 RUST_TARGETS = {
     "windows-x86": "i686-pc-windows-msvc",
@@ -366,11 +531,12 @@ def build_sdk_lib(vs: pathlib.Path, sdk: pathlib.Path, arch: str, out: pathlib.P
             raise ToolError(f"SDK build did not produce {name} in {out}")
 
 
-def build_windows_plugin(arches=WINDOWS_ARCHES, vs_pref="auto"):
-    """Build Windows plugin DLLs; per-arch failures are reported and skipped
-    (keep going with the arches that can build; e.g. missing target std
-    libs for one arch must not abort the rest)."""
-    require_cargo()
+def build_windows_plugin(arches=WINDOWS_ARCHES, vs_pref="auto", report: Report | None = None):
+    """Build Windows plugin DLLs. Shared toolchain problems abort up front
+    (before anything is compiled); per-arch problems skip just that arch
+    and keep going with the rest."""
+    report = report if report is not None else Report()
+    _preflight_or_raise("windows", preflight_windows_shared(vs_pref))
     sdk = foobar_sdk()
     vs = pick_vs(vs_pref)
     print(f"Visual Studio: {vs}")
@@ -379,18 +545,22 @@ def build_windows_plugin(arches=WINDOWS_ARCHES, vs_pref="auto"):
     wtmp = windows_temp_dir() / "sena-fb2k" / "windows"
     wtmp_win = lin_to_win(wtmp) if is_wsl() else str(wtmp)
     libs_win = f"{wtmp_win}\\libs"
-    failures = []
-    built = []
     for arch in arches:
+        piece = f"windows-{arch}"
+        problems = preflight_windows_arch(arch)
+        if problems:
+            report.add(piece, "skipped", "; ".join(problems))
+            print(f"SKIP {piece} (preflight): {'; '.join(problems)}", file=sys.stderr)
+            continue
         try:
             _build_windows_arch(arch, vs, sdk, wtmp, wtmp_win, libs_win)
-            built.append(arch)
+            report.add(piece, "ok", str(DIST / "windows" / arch / "foo_input_sena.dll"))
             print(f"OK: windows arch {arch}")
         except Exception as e:
-            failures.append((arch, str(e)))
+            report.add(piece, "failed", str(e))
             print(f"WARN: windows arch {arch} failed, skipping: {e}", file=sys.stderr)
     print("Windows plugin artifacts written to", DIST / "windows")
-    _report_failures("windows", failures, built)
+    return report
 
 
 def _build_windows_arch(arch, vs, sdk, wtmp, wtmp_win, libs_win):
@@ -436,14 +606,6 @@ def _build_windows_arch(arch, vs, sdk, wtmp, wtmp_win, libs_win):
         raise ToolError(f"MSBuild did not produce {dll}")
     (DIST / "windows" / arch).mkdir(parents=True, exist_ok=True)
     shutil.copy2(dll, DIST / "windows" / arch / "foo_input_sena.dll")
-
-
-def _report_failures(what, failures, built=None):
-    if not failures:
-        return
-    for arch, err in failures:
-        print(f"SKIPPED ({what}): {arch} -> {err}", file=sys.stderr)
-    print(f"built {what} arches: {built or 'none'}; skipped: {[a for a, _ in failures]}", file=sys.stderr)
 
 # ---------------------------------------------------------------- macOS
 def mac_sdk_path() -> pathlib.Path:
@@ -568,6 +730,9 @@ def mac_sources_from_xcode_project(proj: pathlib.Path, base: pathlib.Path) -> li
 
 def _build_mac_slice(arch, sdk, sysroot, clang, ld, ar, ranlib, tmp, triples, rust_targets, common, proj_sources):
     triple = triples[arch]
+    # Rust staticlib FIRST: if this arch's Rust build is broken we fail fast
+    # instead of wasting minutes compiling the SDK/plugin C++ for nothing.
+    rust = build_rust_lib(rust_targets[arch])
     outroot = tmp / arch
     (outroot / "sdk-objs").mkdir(parents=True)
     (outroot / "libs").mkdir(parents=True)
@@ -586,7 +751,6 @@ def _build_mac_slice(arch, sdk, sysroot, clang, ld, ar, ranlib, tmp, triples, ru
         obj = outroot / "sdk-objs" / f"{srcname}.o"
         run([str(clang), "-target", triple] + common + ["-c", str(PLUGIN / srcname), "-o", str(obj)])
         plug_objs.append(obj)
-    rust = build_rust_lib(rust_targets[arch])
     bundle = outroot / "foo_input_sena"
     link_cmd = [str(clang), "-target", triple, "-isysroot", str(sysroot),
                "-stdlib=libc++", "-fobjc-arc"]
@@ -599,8 +763,11 @@ def _build_mac_slice(arch, sdk, sysroot, clang, ld, ar, ranlib, tmp, triples, ru
         [str(outroot / "libs" / f"lib{n}.a") for n in ["sdk", "pfc", "client", "shared"]] +
         [str(rust), "-framework", "Cocoa", "-framework", "CoreFoundation", "-framework", "Foundation"])
     return bundle
-def build_mac_plugin(arches=MAC_ARCHES):
-    require_cargo()
+def build_mac_plugin(arches=MAC_ARCHES, report: Report | None = None):
+    """Build the macOS component. Shared toolchain problems abort up front;
+    per-arch problems skip just that slice."""
+    report = report if report is not None else Report()
+    _preflight_or_raise("mac", preflight_mac_shared())
     sdk = foobar_sdk()
     sysroot = mac_sdk_path()
     clang = clang_for_mac()
@@ -622,25 +789,33 @@ def build_mac_plugin(arches=MAC_ARCHES):
     }
     triples = {"arm64": "arm64-apple-macos11", "x86_64": "x86_64-apple-macos11"}
     rust_targets = {"arm64": "aarch64-apple-darwin", "x86_64": "x86_64-apple-darwin"}
-    failures = []
     common = ["-isysroot", str(sysroot), "-stdlib=libc++", "-std=gnu++20",
               "-fobjc-arc", "-DNDEBUG=1", "-O2",
               "-I", str(sdk), "-I", str(sdk / "foobar2000"),
               "-I", str(sdk / "foobar2000" / "helpers"),
               "-I", str(PLUGIN)]
     slices = []
+    built_arches = []
     for arch in arches:
+        piece = f"mac-{arch}"
+        problems = preflight_mac_arch(arch)
+        if problems:
+            report.add(piece, "skipped", "; ".join(problems))
+            print(f"SKIP {piece} (preflight): {'; '.join(problems)}", file=sys.stderr)
+            continue
         try:
             bundle = _build_mac_slice(arch, sdk, sysroot, clang, ld, ar, ranlib, tmp,
                                       triples, rust_targets, common, proj_sources)
             slices.append(bundle)
+            built_arches.append(arch)
+            report.add(piece, "ok")
             print(f"OK: mac arch {arch}")
         except Exception as e:
-            failures.append((arch, str(e)))
+            report.add(piece, "failed", str(e))
             print(f"WARN: mac arch {arch} failed, skipping: {e}", file=sys.stderr)
     if not slices:
-        raise ToolError(f"mac: no arch built; failures: {failures}")
-    # (per-arch WARN lines were already printed above)
+        report.add("mac", "failed", "no slice built")
+        raise ToolError("mac: no arch built (see per-slice warnings above)")
     # fat binary (Mach-O fat_arch entries are 20 bytes)
     if len(slices) > 1 and host_os() == "macos" and which("lipo"):
         out = tmp / "foo_input_sena"
@@ -656,8 +831,8 @@ def build_mac_plugin(arches=MAC_ARCHES):
         hdr += (0xCAFEBABE).to_bytes(4, "big")
         hdr += len(slices).to_bytes(4, "big")
         for i, d in enumerate(data):
-            cpu = 0x0100000C if arches[i] == "arm64" else 0x01000007
-            sub = 0 if arches[i] == "arm64" else 3
+            cpu = 0x0100000C if built_arches[i] == "arm64" else 0x01000007
+            sub = 0 if built_arches[i] == "arm64" else 3
             offs.append(pos)
             hdr += cpu.to_bytes(4, "big") + sub.to_bytes(4, "big") + pos.to_bytes(4, "big") + len(d).to_bytes(4, "big") + (14).to_bytes(4, "big")
             pos = (pos + len(d) + align - 1) & ~(align - 1)
@@ -711,27 +886,74 @@ def build_mac_plugin(arches=MAC_ARCHES):
 </array>
 </dict></plist>''')
     print("macOS component written to", bundle_dir)
+    report.add("mac", "ok", str(bundle_dir))
+    return report
 
 
 # ---------------------------------------------------------------- package
-def make_package():
-    pkg = DIST / "foo_input_sena-0.1.0.fb2k-component"
-    pkg.unlink(missing_ok=True)
-    with zipfile.ZipFile(pkg, "w", zipfile.ZIP_DEFLATED) as z:
-        for arch in WINDOWS_ARCHES:
-            src = DIST / "windows" / arch / "foo_input_sena.dll"
-            if not src.exists():
-                continue
+#: Package scopes: which dist/ artifacts go into the .fb2k-component, and
+#: how the resulting file is named. "all" keeps the canonical name; scoped
+#: packages carry the scope in the file name.
+PKG_SCOPES = ("all", "windows", "windows-x86", "windows-x64", "windows-arm64ec", "mac")
+
+
+def make_package(scope: str = "all", report: Report | None = None):
+    if scope not in PKG_SCOPES:
+        raise ToolError(f"unknown package scope {scope!r}; supported: {', '.join(PKG_SCOPES)}")
+    win_arches: tuple = ()
+    want_mac = False
+    if scope == "all":
+        win_arches, want_mac = WINDOWS_ARCHES, True
+    elif scope == "windows":
+        win_arches = WINDOWS_ARCHES
+    elif scope == "mac":
+        want_mac = True
+    else:  # windows-<arch>
+        win_arches = (scope[len("windows-"):],)
+
+    files: list[tuple[pathlib.Path, str]] = []
+    included: list[str] = []
+    missing: list[str] = []
+    for arch in win_arches:
+        src = DIST / "windows" / arch / "foo_input_sena.dll"
+        if src.exists():
             # .fb2k-component layout: legacy x86 payload lives at the archive
             # root; x64 and arm64ec payloads live in their own directories.
             arc = "foo_input_sena.dll" if arch == "x86" else f"{arch}/foo_input_sena.dll"
-            z.write(src, arc)
+            files.append((src, arc))
+            included.append(f"windows-{arch}")
+        else:
+            missing.append(f"windows-{arch}")
+    if want_mac:
         mac = DIST / "mac" / "foo_input_sena.component"
         if mac.exists():
             for f in sorted(mac.rglob("*")):
                 if f.is_file():
-                    z.write(f, "mac/foo_input_sena.component/" + f.relative_to(mac).as_posix())
-    print("package:", pkg, pkg.stat().st_size, "bytes")
+                    files.append((f, "mac/foo_input_sena.component/" + f.relative_to(mac).as_posix()))
+            included.append("mac")
+        else:
+            missing.append("mac")
+
+    if scope != "all" and missing:
+        hints = "; ".join(f"build it first with {CATCHUP_RECIPES.get(m, m)}" for m in missing)
+        raise ToolError(f"scope {scope!r} has no built artifacts for: {', '.join(missing)}; {hints}")
+    if not files:
+        raise ToolError(f"nothing to package: {DIST} has no built artifacts "
+                        f"(build some first, e.g. just senadec-plugin-fb2k-windows)")
+
+    name = (f"foo_input_sena-{PKG_VERSION}.fb2k-component" if scope == "all"
+            else f"foo_input_sena-{PKG_VERSION}-{scope}.fb2k-component")
+    pkg = DIST / name
+    pkg.unlink(missing_ok=True)
+    with zipfile.ZipFile(pkg, "w", zipfile.ZIP_DEFLATED) as z:
+        for src, arc in files:
+            z.write(src, arc)
+    print(f"package: {pkg} ({pkg.stat().st_size} bytes)")
+    print(f"  contents: {', '.join(included)}")
+    if missing:
+        print(f"  INCOMPLETE - missing: {', '.join(missing)}", file=sys.stderr)
+    if report is not None:
+        report.add_package(pkg, included, missing)
     return pkg
 
 
@@ -849,36 +1071,143 @@ def doctor():
     print("foobar2000:", find_foobar_exe())
 
 
+def cmd_check(args) -> int:
+    """Scoped preflight: report whether the requested pieces can build,
+    without compiling anything. Exit 1 when any problem is found."""
+    arches = args.arch or []
+    win = [a for a in arches if a in WINDOWS_ARCHES]
+    mac = [a for a in arches if a in MAC_ARCHES]
+    if not arches:
+        win, mac = list(WINDOWS_ARCHES), list(MAC_ARCHES)
+    problems = 0
+    if win:
+        shared = preflight_windows_shared(args.vs)
+        for p in shared:
+            problems += 1
+            print(f"[problem] windows (shared): {p}")
+        if not shared:
+            print("[ok] windows shared toolchain")
+        for a in win:
+            ps = preflight_windows_arch(a)
+            if ps:
+                problems += len(ps)
+                for p in ps:
+                    print(f"[problem] windows-{a}: {p}")
+            else:
+                print(f"[ok] windows-{a}")
+    if mac:
+        shared = preflight_mac_shared()
+        for p in shared:
+            problems += 1
+            print(f"[problem] mac (shared): {p}")
+        if not shared:
+            print("[ok] mac shared toolchain")
+        for a in mac:
+            ps = preflight_mac_arch(a)
+            if ps:
+                problems += len(ps)
+                for p in ps:
+                    print(f"[problem] mac-{a}: {p}")
+            else:
+                print(f"[ok] mac-{a}")
+    if not win and not mac:
+        print("nothing to check for the given --arch selection")
+    print(f"check: {'ready' if problems == 0 else f'{problems} problem(s)'}" )
+    return 0 if problems == 0 else 1
+
+
+def cmd_all(args) -> int:
+    """Build every piece, tolerating per-leg and per-arch failures, then
+    package whatever ended up in dist/ and finish with a summary naming the
+    gaps and the recipes that fill them."""
+    report = Report()
+    legs = [
+        ("windows", [f"windows-{a}" for a in WINDOWS_ARCHES],
+         lambda: build_windows_plugin(WINDOWS_ARCHES, args.vs, report)),
+        ("mac", ["mac"],
+         lambda: build_mac_plugin(MAC_ARCHES, report)),
+    ]
+    for leg, pieces, fn in legs:
+        try:
+            fn()
+        except Exception as e:
+            # A whole leg aborted (shared preflight or zero slices): mark the
+            # pieces that never got a per-piece result and keep going.
+            for p in pieces:
+                if report.status_of(p) is None:
+                    report.add(p, "failed", str(e))
+            print(f"WARN: {leg} leg aborted: {e}", file=sys.stderr)
+    try:
+        make_package("all", report)
+    except ToolError as e:
+        print(f"WARN: package failed: {e}", file=sys.stderr)
+    report.summary()
+    return 0 if report.any_delivery() else 1
+
+
+#: `rust-libs --arch` accepts the short arch names (x64, ...) as well as the
+#: full RUST_TARGETS keys (windows-x64, ...).
+RUST_LIB_ALIASES = {
+    "x86": "windows-x86",
+    "x64": "windows-x64",
+    "arm64ec": "windows-arm64ec",
+    "arm64": "mac-arm64",
+    "x86_64": "mac-x64",
+}
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("command", choices=["doctor", "rust-libs", "windows", "mac", "package", "install", "all"])
+    ap.add_argument("command", choices=["doctor", "check", "rust-libs", "windows", "mac", "package", "install", "all"])
     ap.add_argument("--arch", action="append", choices=["x86", "x64", "arm64ec", "arm64", "x86_64"])
+    ap.add_argument("--scope", choices=list(PKG_SCOPES), default=None,
+                    help="package scope: which dist/ artifacts go into the .fb2k-component "
+                         "(default for `package`: all)")
     ap.add_argument("--vs", choices=["auto", "2022", "2026"], default="auto")
     ap.add_argument("--debug", action="store_true")
     args = ap.parse_args()
     if args.command == "doctor":
         doctor()
+    elif args.command == "check":
+        sys.exit(cmd_check(args))
     elif args.command == "rust-libs":
-        targets = args.arch or ["windows-x64", "windows-arm64ec", "mac-arm64", "mac-x64"]
+        targets = [RUST_LIB_ALIASES.get(a, a) for a in args.arch] if args.arch else \
+            ["windows-x64", "windows-arm64ec", "mac-arm64", "mac-x64"]
+        problems = preflight_cargo()
+        for t in targets:
+            problems += preflight_rust_target(RUST_TARGETS[t])
+        _preflight_or_raise("rust-libs", problems)
         for t in targets:
             build_rust_lib(RUST_TARGETS[t], release=not args.debug)
     elif args.command == "windows":
         arches = [a for a in (args.arch or ["x64", "arm64ec"]) if a in WINDOWS_ARCHES]
-        build_windows_plugin(arches, args.vs)
+        report = build_windows_plugin(arches, args.vs)
+        report.summary()
+        if not any(report.status_of(f"windows-{a}") == "ok" for a in arches):
+            sys.exit(1)
     elif args.command == "mac":
         arches = [a for a in (args.arch or ["arm64", "x86_64"]) if a in MAC_ARCHES]
-        build_mac_plugin(arches)
+        report = build_mac_plugin(arches)
+        report.summary()
     elif args.command == "package":
-        make_package()
+        report = Report()
+        make_package(args.scope or "all", report)
+        report.summary()
     elif args.command == "install":
         install_component()
     elif args.command == "all":
         # Per-arch failures are tolerated inside each builder (they report
-        # and skip), so `all` keeps building what it can and still packages.
-        build_windows_plugin(WINDOWS_ARCHES, args.vs)
-        build_mac_plugin(MAC_ARCHES)
-        make_package()
+        # and skip), and a whole leg aborting (broken shared toolchain) only
+        # skips that leg: `all` always completes what it can, packages what
+        # is present in dist/ and ends with the catch-up summary.
+        sys.exit(cmd_all(args))
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except ToolError as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)

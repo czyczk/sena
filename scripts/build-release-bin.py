@@ -29,6 +29,13 @@ a read-only mount (e.g. the WSL Linux ~/temp on this box) is detected and,
 when WSL interop is available, the files are delivered to the equivalent
 Windows profile temp directory (normally C:\\Users\\<you>\\temp) and the
 real location is printed.
+
+Every requested target's rust-std is checked up front, before any
+compilation; a target whose std is missing is skipped immediately.
+Per-target build failures are then tolerated the same way: the failing
+target is skipped, the rest is still built and delivered, and the final
+summary names the failed targets plus the exact `just` recipe that retries
+only them. The run exits non-zero only when nothing was delivered at all.
 """
 
 import argparse
@@ -118,18 +125,21 @@ def cargo_env():
     return env
 
 
-def ensure_rust_target(triple):
+def rust_std_present(triple):
     env = cargo_env()
     r = subprocess.run(
         ["rustc", "--print", "target-libdir", "--target", triple],
         env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
-    if r.returncode == 0 and Path(r.stdout.strip()).exists():
+    return r.returncode == 0 and Path(r.stdout.strip()).exists()
+
+
+def ensure_rust_target(triple):
+    if rust_std_present(triple):
         return
     raise SystemExit(
         f"error: Rust standard library for {triple} is not installed.\n"
-        f"       Install it with: rustup target add {triple}\n"
-        f"       (rustc said: {r.stderr.strip()})"
+        f"       Install it with: rustup target add {triple}"
     )
 
 
@@ -512,55 +522,100 @@ def main():
         out = ROOT / out
     out = out.resolve()
     delivered = []
+    failures = []  # (requested-name, one-line reason)
     mac_slices = []
 
+    # Preflight: check every requested target's rust-std BEFORE compiling
+    # anything, so a target whose std is missing is skipped immediately
+    # instead of after the other targets have already burned build time.
+    alias_of = {v: k for k, v in TARGETS.items()}
+    for t in [t for t in build_triples if not rust_std_present(t)]:
+        build_triples.remove(t)
+        failures.append((alias_of.get(t, t),
+                         f"Rust std not installed; fix: rustup target add {t}"))
+        print(f"SKIP {t} (preflight): {failures[-1][1]}", file=sys.stderr)
+    if not build_triples:
+        print("error: no requested target can be built (all missing rust-std)", file=sys.stderr)
+        sys.exit(1)
+
+    def record_failure(name, exc):
+        if isinstance(exc, SystemExit):
+            msg = str(exc.code)
+        elif isinstance(exc, subprocess.CalledProcessError):
+            msg = f"build command failed with exit code {exc.returncode}"
+        else:
+            msg = str(exc)
+        failures.append((name, msg.strip().splitlines()[0] if msg.strip() else "failed"))
+        print(f"WARN: {name} failed, continuing with the rest: {failures[-1][1]}",
+              file=sys.stderr)
+
     for triple in build_triples:
+        name = alias_of.get(triple, triple)
         if args.debug:
             print(f"warning: debug builds are not implemented; building release", file=sys.stderr)
-        if triple.endswith("pc-windows-msvc"):
-            src = build_windows(triple, args)
-            name = output_name("windows", triple)
-            staged = STAGE / name
-            shutil.copy2(src, staged)
-            verify(staged, triple)
-            delivered.append(deliver(staged, out, name))
-        elif triple.endswith("apple-darwin"):
-            src = build_macos(triple, args)
-            mac_slices.append((triple, src))
-            if not want_universal:
-                name = output_name("mac", triple)
-                staged = STAGE / name
+        try:
+            if triple.endswith("pc-windows-msvc"):
+                src = build_windows(triple, args)
+                out_name = output_name("windows", triple)
+                staged = STAGE / out_name
+                shutil.copy2(src, staged)
+                verify(staged, triple)
+                delivered.append(deliver(staged, out, out_name))
+            elif triple.endswith("apple-darwin"):
+                src = build_macos(triple, args)
+                mac_slices.append((triple, src))
+                if not want_universal:
+                    out_name = output_name("mac", triple)
+                    staged = STAGE / out_name
+                    shutil.copy2(src, staged)
+                    verify(staged, None)
+                    delivered.append(deliver(staged, out, out_name))
+            elif triple.endswith("unknown-linux-gnu"):
+                src = build_linux(triple, args)
+                out_name = output_name("linux", triple)
+                staged = STAGE / out_name
                 shutil.copy2(src, staged)
                 verify(staged, None)
-                delivered.append(deliver(staged, out, name))
-        elif triple.endswith("unknown-linux-gnu"):
-            src = build_linux(triple, args)
-            name = output_name("linux", triple)
-            staged = STAGE / name
-            shutil.copy2(src, staged)
-            verify(staged, None)
-            delivered.append(deliver(staged, out, name))
-        else:
-            ap.error(f"unsupported target {triple!r}")
+                delivered.append(deliver(staged, out, out_name))
+            else:
+                ap.error(f"unsupported target {triple!r}")
+        except (SystemExit, Exception) as e:
+            record_failure(name, e)
 
-    if want_universal and mac_slices:
+    if want_universal:
         x86 = next((p for t, p in mac_slices if t.startswith("x86_64")), None)
         arm = next((p for t, p in mac_slices if t.startswith("aarch64")), None)
         if x86 is None or arm is None:
-            raise SystemExit("error: macos-universal requires both x86_64 and arm64 slices")
-        if sys.platform == "darwin" and which("lipo"):
-            staged = STAGE / f"{PKG}-universal-apple-darwin"
-            run(["lipo", "-create", "-output", str(staged), str(x86), str(arm)])
+            missing = "x86_64" if x86 is None else "aarch64"
+            record_failure(UNIVERSAL_ALIAS,
+                           f"macos-universal needs both slices; the {missing} slice did not build")
         else:
-            staged = STAGE / f"{PKG}-universal-apple-darwin"
-            staged.write_bytes(fat_macho([x86, arm]))
-            staged.chmod(0o755)
-        verify(staged, None)
-        delivered.append(deliver(staged, out, f"{PKG}-universal-apple-darwin"))
+            try:
+                if sys.platform == "darwin" and which("lipo"):
+                    staged = STAGE / f"{PKG}-universal-apple-darwin"
+                    run(["lipo", "-create", "-output", str(staged), str(x86), str(arm)])
+                else:
+                    staged = STAGE / f"{PKG}-universal-apple-darwin"
+                    staged.write_bytes(fat_macho([x86, arm]))
+                    staged.chmod(0o755)
+                verify(staged, None)
+                delivered.append(deliver(staged, out, f"{PKG}-universal-apple-darwin"))
+            except (SystemExit, Exception) as e:
+                record_failure(UNIVERSAL_ALIAS, e)
 
     print("\nDone. Delivered:")
     for d in delivered:
         print(" ", d)
+    if failures:
+        recipe = "senaenc" if PKG == "senaenc" else "senadec-bin"
+        print("\nFailed targets:", file=sys.stderr)
+        for t, msg in failures:
+            print(f"  {t}: {msg}", file=sys.stderr)
+        retry = " ".join(t for t, _ in failures)
+        print(f"\nretry just the failed targets (the rest is already built):\n"
+              f"  just {recipe} \"{retry}\"", file=sys.stderr)
+    if not delivered:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

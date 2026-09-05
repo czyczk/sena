@@ -12,11 +12,29 @@ Individual Python commands:
 
 ```text
 python3 plugins/foobar2000/scripts/build.py doctor
+python3 plugins/foobar2000/scripts/build.py check [--arch x64]   # preflight only, exit 1 on problems
 python3 plugins/foobar2000/scripts/build.py windows --vs 2022   # or --vs 2026 / auto
 python3 plugins/foobar2000/scripts/build.py mac
-python3 plugins/foobar2000/scripts/build.py package
+python3 plugins/foobar2000/scripts/build.py package [--scope windows-x64]
 python3 plugins/foobar2000/scripts/build.py install             # copy DLL into foobar2000 profile
 ```
+
+Build ergonomics:
+
+- Every build command preflights its scope BEFORE compiling; a piece whose
+  toolchain is incomplete is skipped and the rest still builds. The macOS
+  build compiles the Rust staticlib before any C++, so a Rust-side failure
+  never wastes a C++ compile.
+- Runs end with a summary naming the gaps and the catch-up recipes (build
+  the missing piece, then `package` again - packaging only zips what is in
+  `dist/`, it never rebuilds).
+- `package --scope all|windows|windows-x86|windows-x64|windows-arm64ec|mac`
+  selects what goes into the `.fb2k-component`; scoped packages are named
+  accordingly (e.g. `foo_input_sena-0.1.0-windows-x64.fb2k-component`),
+  while `all` keeps the canonical `foo_input_sena-0.1.0.fb2k-component`.
+- The matching just recipes: `senadec-plugin-fb2k-check [arch]`,
+  `senadec-plugin-fb2k-package [scope]`, and the combined
+  `senadec-plugin-fb2k-{windows-x86,windows-x64,windows-arm64ec,mac}-package`.
 
 Environment overrides: `FOOBAR_SDK`, `FOOBAR_EXE`, `FOOBAR_APPDATA`,
 `MACOSX_SDK`, `LD64_LLD`.
