@@ -223,3 +223,30 @@ entry: symptom -> root cause -> fix. Companion to
 - Diagnosis tip: "grows within one track" = per-frame/chunk accounting
   structure; "grows per track, never released" = missing dtor/close. The
   two are independent and both were present.
+
+### macOS: instant crash at playback start, zero console output
+- Symptom: any .sena plays -> the process dies at the first decode; no
+  console lines at all. Properties/tag reads are fine. Windows (same
+  build) totally fine.
+- Crash report: `EXC_BAD_ACCESS (SIGBUS)`, `KERN_PROTECTION_FAILURE` at a
+  Stack Guard page, on "Fb2k Playback Decoding Thread" - a **stack
+  overflow**. macOS gives fb2k's decoding thread a 544 KiB stack (the
+  report's VM region list shows it), Windows threads get 1 MiB.
+- Root cause was DOWNSTREAM, in rxaac-dec (not sena): `UsacDecoder` had
+  `mps_dec: Option<MpsDec>` with MpsDec = ~76 KiB of inline matrices, so
+  the decoder struct was ~98 KiB and nested by-value construction
+  (`UsacDecoder::new` -> `ChannelState::new` -> `FdChannelState::new` ->
+  big-array `Default`) needed >640 KiB of stack. The MPS state is even
+  `None` for our files - it overflows just from being an inline field.
+- Diagnosis method worth reusing: `std::thread::Builder::new()
+  .stack_size(N)` + binary search on N reproduces host thread budgets
+  locally (an overflow aborts the process, so probe one size per process).
+  Regression guard: `stream::tests::decode_fits_small_host_stack` (448 KiB).
+- Fix (rxaac-dec, 2 lines): `mps_dec: Option<Box<MpsDec>>` + `Box::new` at
+  the lazy init. UsacDecoder shrinks 98 KiB -> ~20 KiB; whole decode
+  init+read fits in ~256 KiB of stack (>2x margin under 544 KiB).
+- Lesson: constructors that return big structs by value are a stack
+  hazard on small host threads (audio plugins, mobile). Box fields >~8 KiB
+  at the struct level; don't rely on the optimizer to elide the copies.
+  The pre-session "working" mac build was only marginally under the limit
+  (old rxaac already needed ~640 KiB) - it worked by toolchain luck.

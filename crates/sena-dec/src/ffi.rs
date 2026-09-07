@@ -1090,6 +1090,50 @@ mod tests {
         assert_eq!((info.sample_rate, info.channels, info.playable_frames, info.profile), (48000, 2, 960000, 300));
     }
 
+    /// `sena_file_art_read` via the range-read path must return the same
+    /// attachments as the buffered parse (playback start queries cover art
+    /// through this path).
+    #[test]
+    fn abi_art_read_range_path() {
+        let base = open_mem("assets/e2e/01__p300__lfa__hf144.sena");
+        let base_bytes = unsafe { &*base.data.get() }.clone();
+        let art = vec![
+            crate::attachments::Attachment::new("cover_front.jpg", "image/jpeg", vec![0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 3, 4, 5]),
+            crate::attachments::Attachment::new("artist.jpg", "image/jpeg", vec![9, 8, 7, 6]),
+        ];
+        let with_art = crate::attachments::rewrite_attachments(&base_bytes, &art).unwrap();
+
+        // Reference through the in-memory parse.
+        let reference = crate::attachments::parse_attachments(&Demuxed::parse(with_art.clone()).unwrap());
+        assert_eq!(reference.len(), 2);
+
+        let mem = MemFile::new(with_art);
+        let io = SenaFileIo {
+            user_data: (&mem as *const MemFile).cast_mut().cast(),
+            read: Some(mem_read),
+            write: Some(mem_write),
+            seek: Some(mem_seek),
+            tell: None,
+            size: Some(mem_size),
+        };
+        let mut handle: *mut SenaArtHandle = std::ptr::null_mut();
+        let mut err = [0u8; 256];
+        assert_eq!(unsafe { sena_file_art_read(&io, &mut handle, err.as_mut_ptr().cast(), err.len()) }, SENA_DEC_OK);
+        assert!(!handle.is_null());
+        assert_eq!(unsafe { sena_art_count(handle) }, 2);
+        for i in 0..2u32 {
+            let name = unsafe { CStr::from_ptr(sena_art_name(handle, i)) }.to_string_lossy().into_owned();
+            let mime = unsafe { CStr::from_ptr(sena_art_mime(handle, i)) }.to_string_lossy().into_owned();
+            let len = unsafe { sena_art_data_len(handle, i) };
+            let data = unsafe { std::slice::from_raw_parts(sena_art_data(handle, i), len) }.to_vec();
+            let expect = &reference[i as usize];
+            assert_eq!(name, expect.name);
+            assert_eq!(mime, expect.mime);
+            assert_eq!(data, expect.data);
+        }
+        unsafe { sena_art_close(handle) };
+    }
+
     /// The lazy io path must be bit-exact with the in-memory store: same
     /// streaming decoder, same bytes, only the payload source differs. (The
     /// separate whole-file `pipeline::Decoder` is NOT bit-identical to the

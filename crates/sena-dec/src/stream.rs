@@ -692,4 +692,37 @@ mod tests {
         }
         assert!(max_prefix <= 100_000, "bits_prefix grew to {max_prefix} entries after seek");
     }
+
+    /// Regression guard for the foobar2000 macOS stack overflow: the fb2k
+    /// playback decoding thread has a 544 KiB stack, and decoder init +
+    /// decode must fit comfortably inside it. (rxaac-dec's MpsDec used to be
+    /// a ~76 KiB inline field of UsacDecoder whose by-value construction
+    /// needed >640 KiB of stack = instant SIGBUS on the Mac thread. Now
+    /// boxed; the whole pipeline fits in ~256 KiB. We test at 448 KiB for
+    /// toolchain headroom.)
+    #[test]
+    fn decode_fits_small_host_stack() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/e2e/01__p300__lfa__hf144.sena");
+        let bytes = std::fs::read(path).unwrap();
+        let handle = std::thread::Builder::new()
+            .stack_size(448 * 1024)
+            .spawn(move || {
+                let mut dec = StreamingDecoder::open(Demuxed::parse(bytes).unwrap()).unwrap();
+                let playable = dec.info().playable_frames;
+                let mut buf = vec![0.0f32; 4096 * 2];
+                let mut total = 0u64;
+                loop {
+                    let n = dec.read_f32(&mut buf, 4096).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    total += n;
+                }
+                assert_eq!(total, playable);
+            })
+            .unwrap();
+        // A stack overflow aborts the whole process (no unwind), so join
+        // succeeding at all is the assertion.
+        handle.join().unwrap();
+    }
 }
