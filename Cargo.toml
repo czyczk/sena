@@ -25,3 +25,11 @@ rustfft = "6"
 opus-decoder = { path = "../ropus/crates/opus-decoder", default-features = false }
 sha2 = "0.10"
 rxaac-dec-lib = { path = "../rxaac-dec/crates/rxaac-dec-lib" }
+
+# Release binaries (senaenc/senadec CLIs and the sena-dec staticlib linked
+# into the fb2k plugin) are pure compute: enable cross-crate fat LTO and
+# one codegen unit. panic stays "unwind" because the staticlib must not
+# abort the host process.
+[profile.release]
+lto = "fat"
+codegen-units = 1
