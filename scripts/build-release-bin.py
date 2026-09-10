@@ -13,8 +13,18 @@ Targets (aliases or full Rust triples):
   linux-x64         x86_64-unknown-linux-gnu
   linux-arm64       aarch64-unknown-linux-gnu
 
-Linux linker selection (builds always use the repo-local copied toolchain
-.toolchains/stable, never rustup's; see notes/build-and-cross.md):
+Rust toolchain selection (SENA_TOOLCHAIN=auto|rustup|repo; see
+notes/build-and-cross.md):
+  auto (default)  the rustup/cargo on PATH when it actually runs (this box's
+                  snap cargo shim once failed with a DBus transient-scope
+                  error - that episode is why the repo copy exists), else the
+                  repo-local copied toolchain .toolchains/stable as fallback.
+  rustup / repo   force one or the other.
+  A missing target std points at `rustup target add <triple>` in rustup mode
+  (effective immediately), or at copying the std into .toolchains/stable in
+  repo mode.
+
+Linux linker selection:
   native arch       plain cargo build (host std ships with the toolchain)
   cross arch        cargo-zigbuild when zig is present (repo .cache/tools/zig;
                     zig carries its own glibc sysroot for the target), else an
@@ -119,15 +129,51 @@ def wslpath_w(p):
     return subprocess.check_output(["wslpath", "-w", str(p)], text=True).strip()
 
 
+REPO_TOOLCHAIN = ROOT / ".toolchains" / "stable"
+_TOOLCHAIN_MODE = None
+
+
+def path_cargo_works():
+    """The cargo on PATH must actually run: this box's snap shim once failed
+    with a rustup/DBus transient-scope error (that episode is why the repo
+    copy in .toolchains exists), so `which` alone is not enough."""
+    cargo = which("cargo")
+    if cargo is None:
+        return False
+    try:
+        r = subprocess.run([str(cargo), "--version"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=60)
+        return r.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def toolchain_mode():
+    """auto: rustup from PATH when usable, else the repo-local copied
+    toolchain .toolchains/stable. SENA_TOOLCHAIN=rustup|repo forces one."""
+    global _TOOLCHAIN_MODE
+    if _TOOLCHAIN_MODE is None:
+        pref = os.environ.get("SENA_TOOLCHAIN", "auto")
+        if pref not in ("auto", "rustup", "repo"):
+            raise SystemExit("error: SENA_TOOLCHAIN must be auto, rustup or repo")
+        mode = pref if pref != "auto" else ("rustup" if path_cargo_works() else "repo")
+        if mode == "repo" and not (REPO_TOOLCHAIN / "bin" / "cargo").exists():
+            raise SystemExit(
+                "error: no usable cargo on PATH and no repo toolchain at "
+                f"{REPO_TOOLCHAIN} (install rustup, or restore the repo toolchain copy)"
+            )
+        _TOOLCHAIN_MODE = mode
+    return _TOOLCHAIN_MODE
+
+
 def cargo_env():
     env = os.environ.copy()
     env.setdefault("CARGO_HOME", str(ROOT / ".cargo-home"))
-    toolchain_bin = ROOT / ".toolchains" / "stable" / "bin"
-    if toolchain_bin.exists():
-        env["PATH"] = str(toolchain_bin) + os.pathsep + env.get("PATH", "")
-    toolchain_lib = ROOT / ".toolchains" / "stable" / "lib"
-    if toolchain_lib.exists():
-        env["LD_LIBRARY_PATH"] = str(toolchain_lib) + os.pathsep + env.get("LD_LIBRARY_PATH", "")
+    if toolchain_mode() == "repo":
+        env["PATH"] = str(REPO_TOOLCHAIN / "bin") + os.pathsep + env.get("PATH", "")
+        env["LD_LIBRARY_PATH"] = (str(REPO_TOOLCHAIN / "lib") + os.pathsep
+                                  + env.get("LD_LIBRARY_PATH", ""))
     env.pop("CARGO_TARGET_DIR", None)
     return env
 
@@ -148,13 +194,17 @@ def ensure_rust_target(triple):
 
 
 def std_missing_hint(triple):
-    rustlib = ROOT / ".toolchains" / "stable" / "lib" / "rustlib"
+    if toolchain_mode() == "rustup":
+        return (f"Rust standard library for {triple} is not installed; run: "
+                f"rustup target add {triple}")
+    rustlib = REPO_TOOLCHAIN / "lib" / "rustlib"
     return (
         f"Rust standard library for {triple} is not installed in the repo toolchain "
-        f"({rustlib}/{triple}); this build uses the copied .toolchains/stable "
-        f"toolchain, not the rustup-managed one. Copy/extract the matching rust-std "
-        f"component for this rustc into that directory (e.g. from a same-version "
-        f"rustup toolchain), then rerun."
+        f"({rustlib}/{triple}); this build fell back to the copied .toolchains/stable "
+        f"toolchain because no usable cargo is on PATH. Either fix PATH/rustup and run "
+        f"`rustup target add {triple}`, or copy/extract the matching rust-std component "
+        f"for this rustc into that directory (e.g. from a same-version rustup "
+        f"toolchain), then rerun."
     )
 
 
@@ -554,6 +604,10 @@ def main():
     STAGE = ROOT / "build" / f"{PKG}-release"
     if args.out is None:
         args.out = str(ROOT / "build" / PKG)
+
+    mode = toolchain_mode()
+    detail = str(which("cargo")) if mode == "rustup" else str(REPO_TOOLCHAIN)
+    print(f"Rust toolchain: {mode} ({detail})")
 
     requested = (args.target or []) + (args.target_args or [])
     if not requested:

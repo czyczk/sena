@@ -1,9 +1,26 @@
 # Build environment and cross-compilation notes
 
-## cargo check workaround on this machine
+## Rust toolchain selection
 
-The `/snap/bin/cargo` shim fails with a rustup/DBus transient-scope error.
-Interactive shells use the real toolchain binaries directly:
+Builds use the rustup/cargo on PATH by default. A missing target rust-std
+is reported as `rustup target add <triple>`, which takes effect immediately
+(`~/` is writable again; the snap cargo shim's DBus failure is gone - both
+were broken when `.toolchains/` was introduced, see the historical note
+below and the 2026-09-05 entry).
+
+If no cargo is on PATH or it fails to run, `build-release-bin.py`
+automatically falls back to the repo-local copied toolchain
+`.toolchains/stable`; `SENA_TOOLCHAIN=rustup|repo` forces a mode.
+`CARGO_HOME` is pinned to the repo's `.cargo-home` either way (the registry
+mirror config lives there). The fb2k plugin build script has always assumed
+rustup (`rustup target add ...` hints) and never used `.toolchains/`.
+
+`.toolchains/`, `.cargo-home/`, `.cache/` are git-ignored local state.
+
+### Historical: cargo check workaround (pre-2026-09)
+
+The `/snap/bin/cargo` shim failed with a rustup/DBus transient-scope error
+and `~/` was a read-only mount, so shells used the repo copies directly:
 
 ```bash
 # writable cargo home inside the repo (the system ~/.cargo is read-only here)
@@ -12,8 +29,6 @@ export CARGO_HOME=/home/zenas/src/Rust_Projects/sena/.cargo-home
 export PATH=/home/zenas/src/Rust_Projects/sena/.toolchains/stable/bin:$PATH
 cargo check --workspace
 ```
-
-`.toolchains/`, `.cargo-home/`, `.cache/` are git-ignored local state.
 
 Target standard libraries were extracted manually from the 2026-07-16
 toolchain manifest into `.toolchains/stable/lib/rustlib/` for:
@@ -196,3 +211,22 @@ this Linux host; the binaries are structurally verified as above.
   `.cache/cargo-zigbuild` via `CARGO_ZIGBUILD_CACHE_DIR`), falling back to an
   installed `<arch>-linux-gnu-gcc`. Native-arch Linux builds still use plain
   `cargo build`.
+
+## 2026-09-10: release builds prefer rustup again; agent shells get cargo
+
+- `build-release-bin.py` no longer hard-requires `.toolchains/stable`: auto
+  mode probes the cargo on PATH by actually running `cargo --version` (the
+  snap shim's old DBus failure made `which` unreliable) and uses rustup when
+  it works, else falls back to the repo copy; `SENA_TOOLCHAIN=rustup|repo`
+  forces a mode. Missing-std errors in rustup mode say
+  `rustup target add <triple>`, which is effective now (`~/` is writable).
+  The one global gap vs the repo copy - the arm64 Windows std - was closed
+  with `rustup target add aarch64-pc-windows-msvc`.
+- `~/.zshenv` now puts `~/.cargo/bin` and `/snap/bin` on PATH for
+  non-interactive shells, so agent sessions find cargo/rustc/rustup and the
+  cargo subcommands (cargo-xwin, cargo-zigbuild, just); previously only
+  interactive zsh (`~/.zshrc`) had them, which is why an earlier agent
+  concluded Rust "wasn't installed" and created `.toolchains/`.
+- Side effect to be aware of: builds now track `rustup update` (the repo
+  copy pinned rustc at 1.97.1). `SENA_TOOLCHAIN=repo` restores the pinned
+  behavior while `.toolchains/stable` still exists.

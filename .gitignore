@@ -1,8 +1,9 @@
 # Baseline: `cargo new` default for a binary project.
 /target
 
-# Local build-tool caches and copied toolchains (this WSL box has read-only
-# ~/.cargo / ~/.rustup; see notes/build-and-cross.md).
+# Local build-tool caches and the copied fallback toolchain (kept in-repo so
+# agents can write them freely; ~/.cargo / ~/.rustup were read-only on this
+# WSL box at the time - see notes/build-and-cross.md).
 /.cargo-home/
 /.toolchains/
 /.cache/

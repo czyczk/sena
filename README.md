@@ -169,9 +169,12 @@ Supported targets: `windows-x86`, `windows-x64`, `windows-arm64`,
 Unsupported targets fail with an explicit error. Linux triples matching the
 host arch build natively; cross ones (e.g. `linux-x64` on an aarch64 host)
 are linked through `cargo zigbuild` when zig is present under
-`.cache/tools/zig`, or an installed `<arch>-linux-gnu-gcc`. All targets
-need their rust-std inside the repo's copied toolchain `.toolchains/stable`
-(not rustup's); see `notes/build-and-cross.md`. Windows linker modes are
+`.cache/tools/zig`, or an installed `<arch>-linux-gnu-gcc`. Builds use the
+rustup toolchain from PATH when it works, and a missing target rust-std is
+reported as `rustup target add <triple>`. When no usable cargo is on PATH
+the build falls back to the repo-local copied toolchain
+`.toolchains/stable` (force a mode with `SENA_TOOLCHAIN=rustup|repo`); see
+`notes/build-and-cross.md`. Windows linker modes are
 `auto` (real MSVC link.exe via VS when available, otherwise cargo-xwin),
 `xwin`, `vs`, and `cargo`; `--vs auto|2022|2026` selects the Visual Studio
 instance when VS linking is used.
