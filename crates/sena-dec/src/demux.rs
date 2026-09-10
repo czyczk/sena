@@ -89,6 +89,9 @@ pub struct Demuxed {
     pub tracks: Vec<Track>,
     pub tags: Vec<TagBlock>,
     pub frames: Vec<Frame>,
+    /// Encoded size of all Cluster elements (codec payloads plus block
+    /// framing); the audio-only size an average-bitrate display should use.
+    pub audio_span_bytes: u64,
     pub warnings: Vec<String>,
 }
 
@@ -374,6 +377,7 @@ impl Demuxed {
         let mut tracks = Vec::new();
         let mut tags = Vec::new();
         let mut frames = Vec::new();
+        let mut audio_span_bytes = 0u64;
         for_each_child(&bytes, segment, |id, child| {
             if id == TRACKS_ID {
                 for_each_child(&bytes, child, |tid, tentry| {
@@ -386,6 +390,7 @@ impl Demuxed {
                 let entries = parse_tags_payload(&bytes, child)?;
                 tags.push(TagBlock { elem: child, entries });
             } else if id == CLUSTER_ID {
+                audio_span_bytes += (child.data_end - child.start) as u64;
                 let mut cluster_t = 0u64;
                 for_each_child(&bytes, child, |cid, cchild| {
                     if cid == CLUSTER_TIMESTAMP_ID {
@@ -414,6 +419,7 @@ impl Demuxed {
             tracks,
             tags,
             frames,
+            audio_span_bytes,
             warnings: Vec::new(),
         };
         out.validate_layout();
@@ -503,6 +509,12 @@ pub struct IndexedFile {
     pub attachment_ranges: Vec<(u64, u64, u64)>,
     pub frames: Vec<FrameRef>,
     pub warnings: Vec<String>,
+    /// Encoded size of all Cluster elements (codec payloads plus block
+    /// framing); the audio-only size an average-bitrate display should use.
+    /// Accumulated from the top-level headers alone, so it is available in
+    /// both the head-only scan and the full frame index - and it excludes
+    /// Tags/Attachments/Void, which tag and cover rewrites shuffle around.
+    pub audio_span_bytes: u64,
     pub segment_payload_start: u64,
     /// Absolute offset one past the Segment payload (= file end in practice).
     pub segment_payload_end: u64,
@@ -531,6 +543,7 @@ pub trait ContainerMeta {
     fn meta_immutable_tag(&self, key: &str) -> Option<&str>;
     fn meta_track(&self, codec_id: &str) -> Option<&Track>;
     fn meta_warnings(&self) -> &[String];
+    fn meta_audio_span_bytes(&self) -> u64;
 }
 
 impl ContainerMeta for Demuxed {
@@ -543,6 +556,9 @@ impl ContainerMeta for Demuxed {
     fn meta_warnings(&self) -> &[String] {
         &self.warnings
     }
+    fn meta_audio_span_bytes(&self) -> u64 {
+        self.audio_span_bytes
+    }
 }
 
 impl ContainerMeta for IndexedFile {
@@ -554,6 +570,9 @@ impl ContainerMeta for IndexedFile {
     }
     fn meta_warnings(&self) -> &[String] {
         &self.warnings
+    }
+    fn meta_audio_span_bytes(&self) -> u64 {
+        self.audio_span_bytes
     }
 }
 
@@ -708,6 +727,7 @@ pub fn index_container<R: FnMut(u64, usize) -> Result<Vec<u8>, String>>(
     let mut tag_ranges = Vec::new();
     let mut attachment_ranges = Vec::new();
     let mut frames = Vec::new();
+    let mut audio_span_bytes = 0u64;
     let mut p = segment.data_start;
     while p < segment.data_end {
         let e = read_elem_w(&mut w, p)?;
@@ -736,8 +756,11 @@ pub fn index_container<R: FnMut(u64, usize) -> Result<Vec<u8>, String>>(
             let entries = parse_tags_payload(&payload, local).map_err(|e| e.to_string())?;
             tags.push(entries);
             tag_ranges.push((e.start, e.data_end));
-        } else if e.id == CLUSTER_ID && want_frames {
-            walk_cluster_w(&mut w, &e, &mut frames)?;
+        } else if e.id == CLUSTER_ID {
+            audio_span_bytes += e.data_end - e.start;
+            if want_frames {
+                walk_cluster_w(&mut w, &e, &mut frames)?;
+            }
         } else if e.id == ATTACHMENTS_ID {
             attachment_ranges.push((e.start, e.data_start, e.data_end));
         }
@@ -758,6 +781,7 @@ pub fn index_container<R: FnMut(u64, usize) -> Result<Vec<u8>, String>>(
         attachment_ranges,
         frames,
         warnings,
+        audio_span_bytes,
         segment_payload_start: segment.data_start,
         segment_payload_end: segment.data_end,
         segment_size_pos: segment.start + segment.id.len() as u64,

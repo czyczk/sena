@@ -48,6 +48,10 @@ typedef struct {
     uint32_t profile;
     uint32_t sena_version;
     char audio_sha256[65]; /* SENA_AUDIO_SHA256, 64 hex + NUL; empty if absent */
+    /* Encoded size of all Cluster elements (codec payloads plus block
+       framing). Tags, Attachments (cover art) and Void filler are excluded:
+       average-bitrate displays must use this, not the raw file size. */
+    uint64_t audio_span_bytes;
 } SenaDecInfo;
 
 typedef struct {

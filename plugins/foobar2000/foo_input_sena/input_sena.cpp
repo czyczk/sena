@@ -77,12 +77,13 @@ void input_sena::get_info(file_info &info, abort_callback &abort) {
         info.info_set("Audio SHA256", di.audio_sha256);
     }
 
-    if (m_file->can_seek()) {
-        t_filesize size = m_file->get_size_ex(abort);
-        if (size != filesize_invalid && di.playable_frames > 0) {
-            double seconds = (double)di.playable_frames / (double)di.sample_rate;
-            info.info_set_bitrate((t_int64)((double)size * 8.0 / seconds / 1000.0 + 0.5));
-        }
+    // Average bitrate from the container's Cluster span (codec payloads +
+    // block framing). The raw file size must not be used: tags and cover
+    // attachments would inflate the rate (a bigger cover -> a "higher"
+    // bitrate), diverging from the payload-based dynamic display.
+    if (di.audio_span_bytes > 0 && di.playable_frames > 0) {
+        double seconds = (double)di.playable_frames / (double)di.sample_rate;
+        info.info_set_bitrate((t_int64)((double)di.audio_span_bytes * 8.0 / seconds / 1000.0 + 0.5));
     }
     read_user_tags(info, abort);
 }

@@ -55,6 +55,10 @@ pub struct SenaDecInfo {
     /// SENA_AUDIO_SHA256, hash of the encoded Opus + xHE-AAC streams
     /// (64 hex chars + NUL); empty for files without it.
     pub audio_sha256: [c_char; 65],
+    /// Encoded size of all Cluster elements (codec payloads plus block
+    /// framing). Tags, Attachments (cover art) and Void filler are excluded,
+    /// so hosts derive the average bitrate from this, not the file size.
+    pub audio_span_bytes: u64,
 }
 
 #[repr(C)]
@@ -634,7 +638,7 @@ pub unsafe extern "C" fn sena_dec_get_info(
         for (k, c) in i.audio_sha256.as_bytes().iter().take(64).enumerate() {
             sha[k] = *c as c_char;
         }
-        unsafe { *info = SenaDecInfo { sample_rate: i.sample_rate, channels: i.channels, playable_frames: i.playable_frames, profile: i.profile, sena_version: i.sena_version, audio_sha256: sha } };
+        unsafe { *info = SenaDecInfo { sample_rate: i.sample_rate, channels: i.channels, playable_frames: i.playable_frames, profile: i.profile, sena_version: i.sena_version, audio_sha256: sha, audio_span_bytes: i.audio_span_bytes } };
         Ok(SENA_DEC_OK)
     })
     .unwrap_or_else(|e| e)
@@ -736,7 +740,7 @@ pub unsafe extern "C" fn sena_dec_probe_info(
         for (k, c) in probe.audio_sha256.as_bytes().iter().take(64).enumerate() {
             sha[k] = *c as c_char;
         }
-        Ok(SenaDecInfo { sample_rate: probe.sample_rate, channels: probe.channels, playable_frames: probe.playable_frames, profile: probe.profile, sena_version: probe.sena_version, audio_sha256: sha })
+        Ok(SenaDecInfo { sample_rate: probe.sample_rate, channels: probe.channels, playable_frames: probe.playable_frames, profile: probe.profile, sena_version: probe.sena_version, audio_sha256: sha, audio_span_bytes: probe.audio_span_bytes })
     }));
     match result {
         Ok(Ok(i)) => {
@@ -989,7 +993,7 @@ mod tests {
         let mut err = [0u8; 256];
         assert_eq!(unsafe { sena_dec_open(&io, &mut handle, err.as_mut_ptr().cast(), err.len()) }, SENA_DEC_OK);
         assert!(!handle.is_null());
-        let mut info = SenaDecInfo { sample_rate: 0, channels: 0, playable_frames: 0, profile: 0, sena_version: 0, audio_sha256: [0; 65] };
+        let mut info = SenaDecInfo { sample_rate: 0, channels: 0, playable_frames: 0, profile: 0, sena_version: 0, audio_sha256: [0; 65], audio_span_bytes: 0 };
         assert_eq!(unsafe { sena_dec_get_info(handle, &mut info) }, SENA_DEC_OK);
         assert_eq!((info.sample_rate, info.channels, info.playable_frames, info.profile), (48000, 2, 960000, 300));
 
@@ -1084,10 +1088,84 @@ mod tests {
             tell: None,
             size: Some(mem_size),
         };
-        let mut info = SenaDecInfo { sample_rate: 0, channels: 0, playable_frames: 0, profile: 0, sena_version: 0, audio_sha256: [0; 65] };
+        let mut info = SenaDecInfo { sample_rate: 0, channels: 0, playable_frames: 0, profile: 0, sena_version: 0, audio_sha256: [0; 65], audio_span_bytes: 0 };
         let mut err = [0u8; 256];
         assert_eq!(unsafe { sena_dec_probe_info(&io, &mut info, err.as_mut_ptr().cast(), err.len()) }, SENA_DEC_OK);
         assert_eq!((info.sample_rate, info.channels, info.playable_frames, info.profile), (48000, 2, 960000, 300));
+    }
+
+    /// Regression: `audio_span_bytes` (the source for the fb2k static
+    /// average bitrate) covers only Cluster elements, so a large cover
+    /// attachment and user-tag rewrites must not change it, and the
+    /// open-decoder path must agree with the head-only probe.
+    #[test]
+    fn abi_audio_span_excludes_cover_and_tags() {
+        let bytes = std::fs::read(format!("{}/../../assets/e2e/01__p300__lfa__hf144.sena", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let art = vec![crate::attachments::Attachment::new(
+            "cover_front.jpg",
+            "image/jpeg",
+            vec![0xAB; 128 * 1024],
+        )];
+        let with_art = crate::attachments::rewrite_attachments(&bytes, &art).unwrap();
+        assert!(with_art.len() > bytes.len() + 128 * 1024);
+
+        let probe_span = |data: &[u8]| {
+            let mem = MemFile::new(data.to_vec());
+            let io = SenaDecIo {
+                user_data: (&mem as *const MemFile).cast_mut().cast(),
+                read: Some(mem_read),
+                seek: Some(mem_seek),
+                tell: None,
+                size: Some(mem_size),
+            };
+            let mut info = SenaDecInfo { sample_rate: 0, channels: 0, playable_frames: 0, profile: 0, sena_version: 0, audio_sha256: [0; 65], audio_span_bytes: 0 };
+            let mut err = [0u8; 256];
+            assert_eq!(unsafe { sena_dec_probe_info(&io, &mut info, err.as_mut_ptr().cast(), err.len()) }, SENA_DEC_OK);
+            info.audio_span_bytes
+        };
+
+        let span = probe_span(&bytes);
+        assert!(span > 0);
+        assert!((span as usize) < bytes.len());
+        let payload: u64 = Demuxed::parse(bytes.clone())
+            .unwrap()
+            .frames
+            .iter()
+            .map(|f| f.data.len() as u64)
+            .sum();
+        assert!(payload <= span);
+        assert_eq!(probe_span(&with_art), span);
+
+        let mem = MemFile::new(with_art.clone());
+        let file_io = SenaFileIo {
+            user_data: (&mem as *const MemFile).cast_mut().cast(),
+            read: Some(mem_read),
+            write: Some(mem_write),
+            seek: Some(mem_seek),
+            tell: None,
+            size: Some(mem_size),
+        };
+        let entries = [SenaMetaEntry { key: c"TITLE".as_ptr(), value: c"cover test".as_ptr() }];
+        let mut err = [0u8; 256];
+        assert_eq!(unsafe { sena_file_write_tags(&file_io, entries.as_ptr(), 1, err.as_mut_ptr().cast(), err.len()) }, SENA_DEC_OK);
+        let after: Vec<u8> = unsafe { &*mem.data.get() }.clone();
+        assert!(after.len() > with_art.len());
+        assert_eq!(probe_span(&after), span);
+
+        let mem2 = MemFile::new(after);
+        let io2 = SenaDecIo {
+            user_data: (&mem2 as *const MemFile).cast_mut().cast(),
+            read: Some(mem_read),
+            seek: Some(mem_seek),
+            tell: None,
+            size: Some(mem_size),
+        };
+        let mut handle: *mut SenaDecHandle = std::ptr::null_mut();
+        assert_eq!(unsafe { sena_dec_open(&io2, &mut handle, err.as_mut_ptr().cast(), err.len()) }, SENA_DEC_OK);
+        let mut info = SenaDecInfo { sample_rate: 0, channels: 0, playable_frames: 0, profile: 0, sena_version: 0, audio_sha256: [0; 65], audio_span_bytes: 0 };
+        assert_eq!(unsafe { sena_dec_get_info(handle, &mut info) }, SENA_DEC_OK);
+        unsafe { sena_dec_close(handle) };
+        assert_eq!(info.audio_span_bytes, span);
     }
 
     /// `sena_file_art_read` via the range-read path must return the same

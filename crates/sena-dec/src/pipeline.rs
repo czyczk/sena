@@ -56,6 +56,11 @@ pub struct DecodedInfo {
     /// SENA_AUDIO_SHA256 tag (hash of the encoded Opus + xHE-AAC elementary
     /// streams carried by the container); empty for files that predate the tag.
     pub audio_sha256: String,
+    /// Encoded size of all Cluster elements: codec payloads plus block
+    /// framing, excluding Tags, Attachments (cover art) and Void filler.
+    /// Average-bitrate displays use this instead of the raw file size so a
+    /// large cover does not inflate the reported rate.
+    pub audio_span_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -380,6 +385,7 @@ pub fn probe<M: ContainerMeta>(demux: &M) -> Result<(DecodedInfo, Vec<String>), 
         profile: profile_num,
         sena_version: version_num,
         audio_sha256,
+        audio_span_bytes: demux.meta_audio_span_bytes(),
     }, warnings))
 }
 
@@ -502,6 +508,7 @@ pub fn decode(demux: &Demuxed) -> Result<Decoded, DecodeError> {
             profile: profile_num,
             sena_version: version_num,
             audio_sha256,
+            audio_span_bytes: demux.audio_span_bytes,
         },
         pcm,
         lf_track_pcm,
