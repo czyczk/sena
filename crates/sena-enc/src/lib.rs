@@ -39,6 +39,9 @@ pub struct EncoderConfig<'a> {
     pub exhale: &'a str,
     pub opusenc: &'a str,
     pub workdir: &'a Path,
+    /// Optional gentle HF tilt on the Opus-bound band, percent of the
+    /// reference curve (None/0 = off).
+    pub hf_tilt_pct: Option<f64>,
 }
 
 pub struct Encoded<'a> {
@@ -280,6 +283,10 @@ pub fn encode_stream<R: std::io::Read>(
     let mut ws = wav::WavStream::new();
     let mut norm: Option<StreamResampler> = None;
     let mut split_s: Option<CrossoverStream> = None;
+    let mut tilt: Option<sena_dsp::FirStream> = cfg
+        .hf_tilt_pct
+        .filter(|&s| s > 0.0)
+        .map(|s| sena_dsp::FirStream::new(sena_dsp::tilt_taps(s)));
     let mut lf_rs: Option<StreamResampler> = None;
     let mut lf_wr: Option<wav::WavWriter> = None;
     let mut hf_wr: Option<wav::WavWriter> = None;
@@ -326,6 +333,7 @@ pub fn encode_stream<R: std::io::Read>(
                     lf_rs.as_mut().unwrap(),
                     lf_wr.as_mut().unwrap(),
                     hf_wr.as_mut().unwrap(),
+                    &mut tilt,
                     &mut st,
                 )?;
             }
@@ -368,7 +376,15 @@ pub fn encode_stream<R: std::io::Read>(
         let lf16b = lf_rs.finish(ch);
         end_tick(&mut st.t, &mut st.lf);
         lf_wr.push(&lf16b)?;
-        let high_p: Vec<f64> = high_a.iter().chain(high_b.iter()).map(|v| v * PRE_GAIN).collect();
+        let high_in: Vec<f64> = high_a.iter().chain(high_b.iter()).cloned().collect();
+        let high_f = if let Some(t) = tilt.as_mut() {
+            let mut v = t.push(&high_in, ch);
+            v.extend(t.finish(ch));
+            v
+        } else {
+            high_in
+        };
+        let high_p: Vec<f64> = high_f.iter().map(|v| v * PRE_GAIN).collect();
         hf_wr.push(&high_p)?;
     }
     lf_wr.finish()?;
@@ -448,6 +464,7 @@ fn push_chunk(
     lf_rs: &mut sena_dsp::StreamResampler,
     lf_wr: &mut wav::WavWriter,
     hf_wr: &mut wav::WavWriter,
+    tilt: &mut Option<sena_dsp::FirStream>,
     st: &mut StageTimes,
 ) -> Result<(), Error> {
     st.begin();
@@ -471,6 +488,7 @@ fn push_chunk(
             return Err(e);
         }
     }
+    let high = if let Some(t) = tilt.as_mut() { t.push(&high, ch) } else { high };
     if !high.is_empty() {
         let high_p: Vec<f64> = high.iter().map(|v| v * PRE_GAIN).collect();
         let mut err: Option<Error> = None;
@@ -1020,6 +1038,7 @@ mod tests {
             exhale: "/nonexistent/exhale",
             opusenc: "/nonexistent/opusenc",
             workdir: &wd,
+            hf_tilt_pct: None,
         };
         let mut bytes = &src[..];
         let out = wd.join("out.sena");
@@ -1049,6 +1068,58 @@ mod tests {
         let ml = lf.iter().zip(rlf.iter()).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
         let mh = hf.iter().zip(rhf.iter()).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
         assert!(ml <= 1.0 / 32768.0 + 1e-9, "LF max diff {ml}");
+        assert!(mh < 1e-6, "HF max diff {mh}");
+        let _ = std::fs::remove_dir_all(&wd);
+    }
+
+    #[test]
+    fn stream_hf_tilt_matches_batch() {
+        // hf_tilt on: the written HF band WAV must equal the batch reference
+        // (split -> batch tilt convolution -> PRE_GAIN).
+        let src = synth_wav(3, 44100, true);
+        let wd = std::env::temp_dir().join(format!("sena-enc-tilt-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&wd);
+        let cfg = EncoderConfig {
+            profile: Profile::At300,
+            total_kbps: 160,
+            use_senav: false,
+            exhale: "/nonexistent/exhale",
+            opusenc: "/nonexistent/opusenc",
+            workdir: &wd,
+            hf_tilt_pct: Some(100.0),
+        };
+        let mut bytes = &src[..];
+        let out = wd.join("out.sena");
+        let err = encode_stream(&cfg, &mut bytes, &out);
+        assert!(err.is_err(), "expected codec-step failure, got {err:?}");
+
+        let (x, ch, in_rate) = wav::read_f64_bytes(&src).unwrap();
+        let x48 = sena_dsp::Resampler::new(in_rate, SAMPLE_RATE).process(&x, ch);
+        let (_low, high) = sena_dsp::split(&x48, 2, 300.0);
+        // batch tilt: zero-phase conv (aligned like FirStream)
+        let h = sena_dsp::tilt_taps(100.0);
+        let d = (h.len() - 1) / 2;
+        let n = high.len() / ch;
+        let mut tilted = vec![0.0; high.len()];
+        for i in 0..n {
+            for c in 0..ch {
+                let mut acc = 0.0;
+                for (k, &t) in h.iter().enumerate() {
+                    let ii = i as isize + k as isize - d as isize;
+                    if ii >= 0 && (ii as usize) < n {
+                        acc += t * high[(ii as usize) * ch + c];
+                    }
+                }
+                tilted[i * ch + c] = acc;
+            }
+        }
+        let ref_hf = wd.join("ref_hf_tilt.wav");
+        let high_p: Vec<f64> = tilted.iter().map(|v| v * PRE_GAIN).collect();
+        wav::write_f32(&ref_hf, &high_p, SAMPLE_RATE).unwrap();
+        let hf = wav::read_f64(&wd.join("hf.wav")).unwrap().0;
+        let (rhf, _, _) = wav::read_f64(&ref_hf).unwrap();
+        assert_eq!(hf.len(), rhf.len(), "HF lengths differ");
+        let mh = hf.iter().zip(rhf.iter()).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
         assert!(mh < 1e-6, "HF max diff {mh}");
         let _ = std::fs::remove_dir_all(&wd);
     }

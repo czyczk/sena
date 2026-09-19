@@ -6,8 +6,10 @@ use std::path::{Path, PathBuf};
 
 fn usage() -> ! {
     eprintln!(
-        "usage: senaenc [--profile 300|600] [--opus-original|--opus-senav] [--bypass-recommendations] \
+        "usage: senaenc [--profile 300|600] [--opus-original|--opus-senav] [--hf-tilt <0-100>] [--bypass-recommendations] \
          <bitrate_kbps> <in.wav|-> <out.sena>\n\
+         --hf-tilt <pct>: optional gentle high-frequency tilt on the Opus band (percent of the \
+         reference curve; 0 = off; default off)\n\
          senaenc doctor                              check required encoder tools\n\
          minimum bitrate: {}k (@600) / {}k (@300); below {RECOMMENDED_MIN_TOTAL_KBPS}k plain Opus\n\
          is recommended and senaenc refuses unless --bypass-recommendations is given\n\
@@ -178,6 +180,7 @@ fn main() {
     let keep_workdir = args.iter().any(|a| a == "--keep-workdir");
     let force = args.iter().any(|a| a == "--force");
     let bypass = args.iter().any(|a| a == "--bypass-recommendations");
+    let mut hf_tilt_pct: Option<f64> = None;
     let mut rest = vec![];
     let mut i = 0;
     while i < args.len() {
@@ -192,6 +195,14 @@ fn main() {
             }
             "--opus-original" => opus_mode = Some(false),
             "--opus-senav" => opus_mode = Some(true),
+            "--hf-tilt" => {
+                i += 1;
+                let v: f64 = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(-1.0);
+                if !(0.0..=100.0).contains(&v) {
+                    usage();
+                }
+                hf_tilt_pct = if v > 0.0 { Some(v) } else { None };
+            }
             "--keep-workdir" => {}
             "--force" => {}
             "--bypass-recommendations" => {}
@@ -280,6 +291,7 @@ fn main() {
         exhale: &exhale,
         opusenc: &opusenc,
         workdir: &wd,
+        hf_tilt_pct,
     };
     // Streaming encode: the input is consumed as the DSP makes progress, so
     // feeding hosts (foobar2000 converter) see the real pipeline tempo.
