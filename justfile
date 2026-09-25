@@ -3,6 +3,7 @@
 # Recipe groups:
 #   general          doctor / check / test
 #   plugin (fb2k)    senadec-plugin-fb2k-*     (foo_input_sena; the Sena decoder)
+#   plugin (ffmpeg)  senadec-plugin-ffmpeg-*   (ffmpeg/LAV demuxer over dlopen'd core)
 #   senaenc          senaenc-*                 (encoder CLI release builds)
 #   senadec          senadec-bin-*             (decoder CLI release builds)
 #
@@ -23,6 +24,7 @@ senaenc_linker := env_var_or_default("SENAENC_LINKER", "auto")
 release_targets := "windows-x64 windows-arm64 linux-x64 linux-arm64 macos-universal"
 FOOBAR_SDK := env_var_or_default("FOOBAR_SDK", "~/src/public/foobar2000-research/SDK-2025-03-07")
 FOOBAR_EXE := env_var_or_default("FOOBAR_EXE", "C:\\Program Files\\foobar2000\\foobar2000.exe")
+FFMPEG_SRC := env_var_or_default("FFMPEG_SRC", env_var("HOME") + "/src/public/ffmpeg")
 
 # ---------------------------------------------------------------------------
 # General
@@ -108,6 +110,43 @@ senadec-plugin-fb2k-all vs="auto":
 
 senadec-plugin-fb2k-install:
     @python3 "{{script}}" install
+
+# ---------------------------------------------------------------------------
+# ffmpeg / LAV Filters demuxer (plugins/ffmpeg): a thin libavformat adapter
+# that dlopens the sena-dec core. See plugins/ffmpeg/README.md.
+#
+#   just senadec-plugin-ffmpeg-apply             # patch the ffmpeg tree (idempotent)
+#   just senadec-plugin-ffmpeg-build             # apply + reconfigure + make
+#   just senadec-plugin-ffmpeg-test              # deterministic end-to-end gates
+#   just senadec-plugin-lav-dll                  # sena_dec.dll for LAV (windows x64+x86)
+#   just senadec-plugin-lav-dll "windows-x64"
+# ---------------------------------------------------------------------------
+
+senadec-plugin-ffmpeg-apply ffmpeg_dir=FFMPEG_SRC:
+    @python3 "{{repo}}/plugins/ffmpeg/tools/apply.py" "{{ffmpeg_dir}}"
+
+senadec-plugin-ffmpeg-build ffmpeg_dir=FFMPEG_SRC:
+    @bash "{{repo}}/plugins/ffmpeg/tools/rebuild.sh" "{{ffmpeg_dir}}"
+
+senadec-plugin-ffmpeg-test ffmpeg_dir=FFMPEG_SRC:
+    @bash "{{repo}}/tests/ffmpeg/run.sh" "{{ffmpeg_dir}}"
+
+senadec-plugin-lav-dll targets="windows-x64 windows-x86":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "{{repo}}"
+    for t in {{targets}}; do
+        case "$t" in
+            windows-x64) triple=x86_64-pc-windows-msvc ;;
+            windows-x86) triple=i686-pc-windows-msvc ;;
+            *) echo "unsupported target $t (want windows-x64|windows-x86)" >&2; exit 2 ;;
+        esac
+        XWIN_CACHE_DIR="{{repo}}/.cache/cargo-xwin" cargo xwin build -p sena-dec-capi --target "$triple" --release --lib
+        out="{{repo}}/build/plugins/ffmpeg/$t"
+        mkdir -p "$out"
+        cp "target/$triple/release/sena_dec.dll" "$out/sena_dec.dll"
+        echo "$out/sena_dec.dll"
+    done
 
 # ---------------------------------------------------------------------------
 # senaenc release binaries (encoder CLI; no opusenc/exhale needed at build

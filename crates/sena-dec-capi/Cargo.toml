@@ -1,0 +1,17 @@
+[package]
+name = "sena-dec-capi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "Apache-2.0"
+description = "sena-dec packaged as a C shared library (ffmpeg/LAV demuxer backend)."
+publish = false
+
+[dependencies]
+sena-dec.workspace = true
+
+[lib]
+# Shared library loaded at runtime by plugin hosts (dlopen/LoadLibrary). The
+# output keeps the canonical name libsena_dec.so / sena_dec.dll.
+name = "sena_dec"
+crate-type = ["cdylib"]

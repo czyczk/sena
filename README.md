@@ -12,6 +12,7 @@ Workspace crates:
 - `crates/sena-dec` — decoder core, C ABI, tag editor.
 - `bins/senaenc`, `bins/senadec` — CLI tools.
 - `plugins/foobar2000/foo_input_sena` — foobar2000 input component.
+- `plugins/ffmpeg` — ffmpeg/LAV Filters demuxer (MPC-HC, PotPlayer, ffplay).
 
 ## senaenc command line
 
@@ -116,6 +117,9 @@ Notes:
 just doctor                          # build-environment check
 just test                            # workspace tests
 just senadec-plugin-fb2k-all         # windows x86/x64/arm64ec + macOS + zipped .fb2k-component
+just senadec-plugin-ffmpeg-build     # patch + rebuild an ffmpeg tree (FFMPEG_SRC=...)
+just senadec-plugin-ffmpeg-test      # deterministic demuxer gates (tests/ffmpeg)
+just senadec-plugin-lav-dll          # sena_dec.dll for LAV Filters (windows x64+x86)
 just senaenc                         # encoder CLI release binaries (windows x64/arm64 + Linux x64/arm64 + macOS Universal)
 just senadec-bin                     # decoder CLI release binaries (same targets)
 ```

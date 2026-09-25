@@ -6,6 +6,7 @@ members = [
     "crates/sena-mux",
     "crates/sena-enc",
     "crates/sena-dec",
+    "crates/sena-dec-capi",
     "bins/senaenc",
     "bins/senadec",
 ]

@@ -12,6 +12,10 @@
       x64 + arm64ec and macOS x86_64 + arm64 P0, rest per priority);
       follow notes/foobar2000-plugin.md; include input_info_writer tag
       editing and get_dynamic_info real-time bitrate
+- [x] 4b. ffmpeg/LAV Filters shim over the (runtime-loaded) C ABI:
+      plugins/ffmpeg demuxer emitting decoded PCM (libopenmpt pattern),
+      matroskadec deferral patch, deterministic gates in tests/ffmpeg;
+      see notes/ffmpeg-lav-plugin.md
 - [x] 5. Playable-length truncation + gapless sequence golden
 - [x] 6. Output-format conformance: WAV headers, s24 packing, s16 TPDF
       reproducibility, raw pipe consumer checks

@@ -197,6 +197,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "sena-dec-capi"
+version = "0.1.0"
+dependencies = [
+ "sena-dec",
+]
+
+[[package]]
 name = "sena-dsp"
 version = "0.1.0"
 dependencies = [

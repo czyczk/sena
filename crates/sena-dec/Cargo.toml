@@ -18,4 +18,7 @@ opus-decoder.workspace = true
 rxaac-dec-lib.workspace = true
 
 [lib]
+# rlib: in-workspace users; staticlib: statically-linked plugin hosts
+# (foobar2000 component). Runtime-loaded hosts (ffmpeg/LAV demuxer) use
+# crates/sena-dec-capi, which packages this crate as a cdylib.
 crate-type = ["rlib", "staticlib"]
