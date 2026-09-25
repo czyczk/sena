@@ -21,8 +21,8 @@ use sena_dsp::Resampler;
 
 use crate::demux::{Demuxed, FrameRef, IndexedFile, Track};
 use crate::pipeline::{
-    DecodeError, DecodedInfo, LfAuInfo, OpusPacketInfo, ReadInfo, SAMPLE_RATE,
-    add_bits_interval, parse_opus_head,
+    DecodeError, DecodedInfo, LfAuInfo, OpusPacketInfo, ReadInfo, SAMPLE_RATE, add_bits_interval,
+    parse_opus_head,
 };
 
 const MIN_CHUNK_FRAMES: u64 = 4800; // 100 ms @48k
@@ -32,7 +32,10 @@ const MIN_CHUNK_FRAMES: u64 = 4800; // 100 ms @48k
 pub enum FrameStore {
     /// Whole file in memory (non-seekable inputs, examples): payloads are
     /// copied out of the buffer on demand. Peak memory is ~1x file size.
-    Memory { bytes: Vec<u8>, frames: Vec<FrameRef> },
+    Memory {
+        bytes: Vec<u8>,
+        frames: Vec<FrameRef>,
+    },
     /// Lazy positioned reads through the host's io callbacks: the index is
     /// the only per-file state, decode fetches one packet at a time. A small
     /// read-ahead window keeps linear decode from doing a seek+read syscall
@@ -69,7 +72,9 @@ impl FrameStore {
                     .map(|s| s.to_vec())
                     .ok_or_else(|| DecodeError::Format("frame range outside file".into()))
             }
-            FrameStore::Lazy { read_at, window, .. } => {
+            FrameStore::Lazy {
+                read_at, window, ..
+            } => {
                 let len = fr.len as usize;
                 let end = fr.offset + len as u64;
                 let wend = window.0 + window.1.len() as u64;
@@ -112,6 +117,10 @@ struct State {
     /// Per-track AU/packet counters still to skip (seek jump without decode).
     lf_skip_aus: usize,
     hf_skip_pkts: usize,
+    /// A_OPUSHF (three-track layout): own pre-skip trim and seek-skip
+    /// counter; `tf` decoders stay None for a two-track file.
+    tf_trim: usize,
+    tf_skip_pkts: usize,
     /// Seek (true): keep the raw LF context before the trim point so the
     /// zero-phase resampler has real audio instead of zeros (start: false).
     lf_trim_after: bool,
@@ -131,15 +140,22 @@ struct State {
     lf_zero_prefix: usize,
     xdec: UsacDecoder,
     opus: OpusDecoder,
+    /// Decoder for the A_OPUSHF track (three-track layout only).
+    opus2: Option<OpusDecoder>,
     frame_index: usize,
     lf_raw: VecDeque<f32>,
     hf_raw: VecDeque<f32>,
+    /// Decoded samples of the A_OPUSHF track (empty for two-track files).
+    tf_raw: VecDeque<f32>,
     lf_total_before: i128,
     opus_total_before: i128,
+    tf_total_before: i128,
     lf_infos: Vec<LfAuInfo>,
     opus_infos: Vec<OpusPacketInfo>,
+    tf_infos: Vec<OpusPacketInfo>,
     lf_errors: usize,
     opus_errors: usize,
+    tf_errors: usize,
     output: VecDeque<f64>,
     first: bool,
     produced: u64,
@@ -192,12 +208,17 @@ impl StreamingDecoder {
     fn init_state(&mut self) -> Result<(), DecodeError> {
         let lf_track = self.track("A_SENALF");
         let hf_track = self.track("A_OPUS");
+        let tf_track = self.tracks.iter().find(|t| t.codec_id == "A_OPUSHF");
         let lf_rate = lf_track.sample_rate.round() as u32;
         let asc = AudioSpecificConfig::parse(&lf_track.codec_private)
             .map_err(|e| DecodeError::Format(format!("ASC parse: {e}")))?;
         let opus_head = parse_opus_head(&hf_track.codec_private)?;
-        let xdec = UsacDecoder::new(&asc)
-            .map_err(|e| DecodeError::Codec(format!("rxaac init: {e}")))?;
+        let tf_head = match tf_track {
+            Some(t) => Some(parse_opus_head(&t.codec_private)?),
+            None => None,
+        };
+        let xdec =
+            UsacDecoder::new(&asc).map_err(|e| DecodeError::Codec(format!("rxaac init: {e}")))?;
         if xdec.num_channels() != 2 {
             return Err(DecodeError::Unsupported("rxaac channels != 2".into()));
         }
@@ -207,27 +228,46 @@ impl StreamingDecoder {
             opus.set_gain(i32::from(opus_head.output_gain))
                 .map_err(|e| DecodeError::Codec(format!("opus output gain: {e}")))?;
         }
+        let mut opus2 = None;
+        if let Some(head) = tf_head.as_ref() {
+            let mut d = OpusDecoder::new(SAMPLE_RATE, Channels::Stereo)
+                .map_err(|e| DecodeError::Codec(format!("opus init (A_OPUSHF): {e}")))?;
+            if head.output_gain != 0 {
+                d.set_gain(i32::from(head.output_gain))
+                    .map_err(|e| DecodeError::Codec(format!("opus output gain: {e}")))?;
+            }
+            opus2 = Some(d);
+        }
+        let tf_trim = tf_head.as_ref().map_or(0, |h| h.pre_skip as usize);
         self.state = Some(State {
             lf_rate,
             lf_trim: crate::pipeline::XHE_TRIM_CORE_SAMPLES,
             hf_trim: opus_head.pre_skip as usize,
             lf_skip_aus: 0,
             hf_skip_pkts: 0,
+
+            tf_trim,
+            tf_skip_pkts: 0,
             lf_trim_after: false,
             lf_resampler: Resampler::new(lf_rate, SAMPLE_RATE),
             lf_ctx: 0,
             lf_zero_prefix: 0,
             xdec,
             opus,
+            opus2,
             frame_index: 0,
             lf_raw: VecDeque::new(),
             hf_raw: VecDeque::new(),
+            tf_raw: VecDeque::new(),
             lf_total_before: 0,
             opus_total_before: 0,
+            tf_total_before: 0,
             lf_infos: Vec::new(),
             opus_infos: Vec::new(),
+            tf_infos: Vec::new(),
             lf_errors: 0,
             opus_errors: 0,
+            tf_errors: 0,
             output: VecDeque::new(),
             first: true,
             produced: 0,
@@ -247,6 +287,12 @@ impl StreamingDecoder {
         let frame = self.store.frames()[frame_index];
         let data = self.store.read(frame_index)?;
         let lf_num = self.track("A_SENALF").number;
+        let mid_num = self.track("A_OPUS").number;
+        let tf_num = self
+            .tracks
+            .iter()
+            .find(|t| t.codec_id == "A_OPUSHF")
+            .map(|t| t.number);
         let st = self.state.as_mut().unwrap();
         st.frame_index += 1;
         if frame.track == lf_num {
@@ -257,16 +303,17 @@ impl StreamingDecoder {
             // Decode into a scratch buffer so a panicking decoder can never
             // leave partial samples in the stream queue.
             let mut out: Vec<f32> = Vec::new();
-            let result = catch_unwind(AssertUnwindSafe(|| {
-                st.xdec.decode_au(&data, &mut out)
-            }));
+            let result = catch_unwind(AssertUnwindSafe(|| st.xdec.decode_au(&data, &mut out)));
             let failed = match result {
                 Ok(Err(e)) => {
                     eprintln!("warning: LF AU decode error ({}): {e}", frame.t_ns);
                     true
                 }
                 Err(_) => {
-                    eprintln!("warning: LF AU decoder panic ({}); replacing with silence", frame.t_ns);
+                    eprintln!(
+                        "warning: LF AU decoder panic ({}); replacing with silence",
+                        frame.t_ns
+                    );
                     true
                 }
                 Ok(Ok(())) => false,
@@ -279,7 +326,9 @@ impl StreamingDecoder {
             }
             let samples = out.len() / st.xdec.num_channels();
             if samples == 0 || samples * st.xdec.num_channels() != out.len() {
-                return Err(DecodeError::Codec("rxaac returned a non-integral frame".into()));
+                return Err(DecodeError::Codec(
+                    "rxaac returned a non-integral frame".into(),
+                ));
             }
             if st.lf_zero_prefix > 0 {
                 let n = st.lf_zero_prefix.min(samples);
@@ -293,18 +342,58 @@ impl StreamingDecoder {
                 bits: (data.len() * 8) as u64,
             });
             st.lf_total_before += samples as i128;
-        } else {
+        } else if tf_num == Some(frame.track) {
+            // A_OPUSHF (three-track layout): an independent opus stream over
+            // b19/b20; skipped packets at a seek jump straight by index.
+            if st.tf_skip_pkts > 0 {
+                st.tf_skip_pkts -= 1;
+                return Ok(true);
+            }
+            let opus2 = st
+                .opus2
+                .as_mut()
+                .ok_or_else(|| DecodeError::Format("A_OPUSHF frame without a decoder".into()))?;
+            let mut buf = vec![0.0f32; 5760 * 2];
+            let mut n = match opus2.decode_float(Some(&data), &mut buf, DecodeMode::Normal) {
+                Ok(n) => n,
+                Err(e) => {
+                    eprintln!(
+                        "warning: A_OPUSHF packet decode error ({}): {e}; using PLC",
+                        frame.t_ns
+                    );
+                    st.tf_errors += 1;
+                    opus2
+                        .decode_float(None, &mut buf, DecodeMode::Normal)
+                        .map_err(|e| DecodeError::Codec(format!("opus PLC (A_OPUSHF): {e}")))?
+                }
+            };
+            n = n.min(5760);
+            st.tf_raw.extend(buf[..n * 2].iter().copied());
+            st.tf_infos.push(OpusPacketInfo {
+                start_48k: st.tf_total_before,
+                samples_48k: n as i128,
+                bits: (data.len() * 8) as u64,
+            });
+            st.tf_total_before += n as i128;
+        } else if frame.track == mid_num {
             if st.hf_skip_pkts > 0 {
                 st.hf_skip_pkts -= 1;
                 return Ok(true);
             }
             let mut buf = vec![0.0f32; 5760 * 2];
-            let mut n = match st.opus.decode_float(Some(&data), &mut buf, DecodeMode::Normal) {
+            let mut n = match st
+                .opus
+                .decode_float(Some(&data), &mut buf, DecodeMode::Normal)
+            {
                 Ok(n) => n,
                 Err(e) => {
-                    eprintln!("warning: Opus packet decode error ({}): {e}; using PLC", frame.t_ns);
+                    eprintln!(
+                        "warning: Opus packet decode error ({}): {e}; using PLC",
+                        frame.t_ns
+                    );
                     st.opus_errors += 1;
-                    st.opus.decode_float(None, &mut buf, DecodeMode::Normal)
+                    st.opus
+                        .decode_float(None, &mut buf, DecodeMode::Normal)
                         .map_err(|e| DecodeError::Codec(format!("opus PLC: {e}")))?
                 }
             };
@@ -316,17 +405,25 @@ impl StreamingDecoder {
                 bits: (data.len() * 8) as u64,
             });
             st.opus_total_before += n as i128;
+        } else {
+            return Err(DecodeError::Format(format!(
+                "block for unknown track {} in a Sena file",
+                frame.track
+            )));
         }
         Ok(true)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn chunk_bits(
         &self,
         lf_rate: u32,
         lf_trim: usize,
         hf_trim: usize,
+        tf_trim: usize,
         lf_infos: &[LfAuInfo],
         opus_infos: &[OpusPacketInfo],
+        tf_infos: &[OpusPacketInfo],
         start: u64,
         end: u64,
     ) -> Vec<f64> {
@@ -339,12 +436,20 @@ impl StreamingDecoder {
             let s_core = info.start_core - lf_trim as i128;
             let s48 = s_core * 48_000 / lf_rate as i128;
             let e48 = (s_core + info.samples_core) * 48_000 / lf_rate as i128;
-            add_bits_interval(&mut delta, n as i128, s48 - base, e48 - base, info.bits as f64);
+            add_bits_interval(
+                &mut delta,
+                n as i128,
+                s48 - base,
+                e48 - base,
+                info.bits as f64,
+            );
         }
-        for info in opus_infos {
-            let s = info.start_48k - hf_trim as i128;
-            let e = s + info.samples_48k;
-            add_bits_interval(&mut delta, n as i128, s - base, e - base, info.bits as f64);
+        for (infos, trim) in [(opus_infos, hf_trim), (tf_infos, tf_trim)] {
+            for info in infos {
+                let s = info.start_48k - trim as i128;
+                let e = s + info.samples_48k;
+                add_bits_interval(&mut delta, n as i128, s - base, e - base, info.bits as f64);
+            }
         }
         let mut rate = vec![0.0f64; n + 1];
         let mut acc = 0.0;
@@ -396,12 +501,13 @@ impl StreamingDecoder {
     }
 
     fn produce_chunk(&mut self) -> Result<(), DecodeError> {
-        let (lf_skip, hf_skip, trim_after) = {
+        let (lf_skip, hf_skip, tf_skip, trim_after) = {
             let st = self.state.as_ref().unwrap();
             let first = st.first;
             (
                 if first { st.lf_trim } else { 0 },
                 if first { st.hf_trim } else { 0 },
+                if first { st.tf_trim } else { 0 },
                 first && st.lf_trim_after,
             )
         };
@@ -410,9 +516,15 @@ impl StreamingDecoder {
             // Fresh = buffered beyond the retained left context and the
             // one-time leading trim (at a seek the trim region is itself
             // kept as context).
-            let fresh_lf = (st.lf_raw.len() / 2).saturating_sub(st.lf_ctx + if trim_after { 0 } else { lf_skip });
+            let fresh_lf = (st.lf_raw.len() / 2)
+                .saturating_sub(st.lf_ctx + if trim_after { 0 } else { lf_skip });
             let fresh_hf = (st.hf_raw.len() / 2).saturating_sub(hf_skip);
-            (st.lf_ctx, st.lf_resampler.guard_frames(), fresh_lf == 0 || fresh_hf == 0)
+            let fresh_tf = (st.tf_raw.len() / 2).saturating_sub(tf_skip);
+            (
+                st.lf_ctx,
+                st.lf_resampler.guard_frames(),
+                fresh_lf == 0 || fresh_hf == 0 || (st.opus2.is_some() && fresh_tf == 0),
+            )
         };
         if raw_empty {
             let st = self.state.as_mut().unwrap();
@@ -420,14 +532,17 @@ impl StreamingDecoder {
                 // Trailing unmatched stream data after the shorter track ended.
                 st.lf_raw.clear();
                 st.hf_raw.clear();
+                st.tf_raw.clear();
                 st.lf_infos.clear();
                 st.opus_infos.clear();
+                st.tf_infos.clear();
                 st.first = false;
             }
             return Ok(());
         }
 
-        let (lf48, lf_off, hf_after, take, start, rate, lf_pass_core, lf_consume_core) = {
+        let has_tf = self.state.as_ref().unwrap().opus2.is_some();
+        let (lf48, lf_off, hf_after, tf_after, take, start, rate, lf_pass_core, lf_consume_core) = {
             let st = self.state.as_ref().unwrap();
             let resampler = &st.lf_resampler;
             // The resample window is the whole pending LF raw: retained left
@@ -440,7 +555,8 @@ impl StreamingDecoder {
             // Context inside the resample window (its outputs are dropped
             // after resampling): the retained left context, plus the
             // pre-target region after a seek.
-            let window_front_core = ctx.max(raw_drop) - raw_drop + if trim_after { lf_skip } else { 0 };
+            let window_front_core =
+                ctx.max(raw_drop) - raw_drop + if trim_after { lf_skip } else { 0 };
             let front_core = raw_drop + window_front_core;
             let lf_after: Vec<f64> = st
                 .lf_raw
@@ -454,6 +570,12 @@ impl StreamingDecoder {
                 .skip(hf_skip * 2)
                 .map(|&s| f64::from(s))
                 .collect();
+            let tf_after: Vec<f64> = st
+                .tf_raw
+                .iter()
+                .skip(tf_skip * 2)
+                .map(|&s| f64::from(s))
+                .collect();
             let lf48 = resampler.process(&lf_after, 2);
             let lf_off = resampler.output_frames(window_front_core);
             // Without a right guard the window tail would ring; emit only
@@ -465,7 +587,14 @@ impl StreamingDecoder {
             } else {
                 resampler.output_frames(window_core.saturating_sub(guard))
             };
-            let n = right_cap.saturating_sub(lf_off).min(hf_after.len() / 2);
+            let n = right_cap
+                .saturating_sub(lf_off)
+                .min(hf_after.len() / 2)
+                .min(if st.opus2.is_some() {
+                    tf_after.len() / 2
+                } else {
+                    usize::MAX
+                });
             let remaining = self.info.playable_frames.saturating_sub(st.produced);
             let mut take = (n as u64).min(remaining) as usize;
             // The rational ratio only represents some output counts exactly;
@@ -488,8 +617,28 @@ impl StreamingDecoder {
             let lf_pass_core = front_core + lf_consume_core;
             let start = st.produced;
             let end = start + take as u64;
-            let rate = self.chunk_bits(st.lf_rate, st.lf_trim, st.hf_trim, &st.lf_infos, &st.opus_infos, start, end);
-            (lf48, lf_off, hf_after, take, start, rate, lf_pass_core, lf_consume_core)
+            let rate = self.chunk_bits(
+                st.lf_rate,
+                st.lf_trim,
+                st.hf_trim,
+                st.tf_trim,
+                &st.lf_infos,
+                &st.opus_infos,
+                &st.tf_infos,
+                start,
+                end,
+            );
+            (
+                lf48,
+                lf_off,
+                hf_after,
+                tf_after,
+                take,
+                start,
+                rate,
+                lf_pass_core,
+                lf_consume_core,
+            )
         };
 
         let gain = 1.0 / PRE_GAIN;
@@ -499,8 +648,16 @@ impl StreamingDecoder {
             let r = lf48[(i + lf_off) * 2 + 1] * gain;
             let hl = hf_after[i * 2] * gain;
             let hr = hf_after[i * 2 + 1] * gain;
-            chunk_out.push(lf + hl);
-            chunk_out.push(r + hr);
+            // A_OPUSHF mixes on top when the layout carries it (tf_after is
+            // empty for two-track files, so tf sample access stays in-bounds
+            // by the min() above).
+            let (tl, tr) = if has_tf {
+                (tf_after[i * 2] * gain, tf_after[i * 2 + 1] * gain)
+            } else {
+                (0.0, 0.0)
+            };
+            chunk_out.push(lf + hl + tl);
+            chunk_out.push(r + hr + tr);
         }
 
         {
@@ -513,11 +670,15 @@ impl StreamingDecoder {
             st.lf_raw.drain(..(lf_pass_core - retain) * 2);
             st.lf_ctx = retain;
             st.hf_raw.drain(..(hf_skip + take) * 2);
+            if st.opus2.is_some() {
+                st.tf_raw.drain(..(tf_skip + take) * 2);
+            }
             // `lf_consume_core` bookkeeping for the bit accounting: the infos
             // track the fresh timeline, which advances by the consumed count
             // (the retained context was consumed by earlier chunks).
             Self::trim_lf_infos(&mut st.lf_infos, lf_consume_core as i128);
             Self::trim_opus_infos(&mut st.opus_infos, take as i128);
+            Self::trim_opus_infos(&mut st.tf_infos, take as i128);
             st.first = false;
         }
 
@@ -549,7 +710,12 @@ impl StreamingDecoder {
                         let trim = if st.first { st.lf_trim as i128 } else { 0 };
                         // The retained context and (until EOF) the right guard
                         // are resampler context, not emittable output.
-                        let reserve = st.lf_ctx as i128 + if st.finished { 0 } else { st.lf_resampler.guard_frames() as i128 };
+                        let reserve = st.lf_ctx as i128
+                            + if st.finished {
+                                0
+                            } else {
+                                st.lf_resampler.guard_frames() as i128
+                            };
                         let core = (st.lf_raw.len() / 2) as i128 - trim - reserve;
                         (core * 48_000 / st.lf_rate as i128).max(0) as u64
                     };
@@ -557,7 +723,19 @@ impl StreamingDecoder {
                         let trim = if st.first { st.hf_trim as i128 } else { 0 };
                         ((st.hf_raw.len() / 2) as i128 - trim).max(0) as u64
                     };
-                    (lf_ready.min(hf_ready), st.finished)
+                    let tf_ready = {
+                        let trim = if st.first { st.tf_trim as i128 } else { 0 };
+                        ((st.tf_raw.len() / 2) as i128 - trim).max(0) as u64
+                    };
+                    let ready = lf_ready.min(hf_ready);
+                    (
+                        if st.opus2.is_some() {
+                            ready.min(tf_ready)
+                        } else {
+                            ready
+                        },
+                        st.finished,
+                    )
                 };
                 if ready >= MIN_CHUNK_FRAMES || eof {
                     break;
@@ -585,7 +763,11 @@ impl StreamingDecoder {
             return Err(DecodeError::Format("output buffer too small".into()));
         }
         if want == 0 {
-            self.last_read = ReadInfo { start_frame: self.info.playable_frames, frames: 0, payload_bits: 0 };
+            self.last_read = ReadInfo {
+                start_frame: self.info.playable_frames,
+                frames: 0,
+                payload_bits: 0,
+            };
             return Ok(0);
         }
         self.fill(want)?;
@@ -668,6 +850,16 @@ impl StreamingDecoder {
         let j0 = (f + pre_skip) / 960;
         let hf_trim = f + pre_skip - j0 * 960;
 
+        // A_OPUSHF jumps by its own packet index / pre-skip.
+        let (tf_j0, tf_trim) = match self.tracks.iter().find(|t| t.codec_id == "A_OPUSHF") {
+            Some(t) => {
+                let ps = parse_opus_head(&t.codec_private)?.pre_skip as usize;
+                let j0 = (f + ps) / 960;
+                (j0, f + ps - j0 * 960)
+            }
+            None => (0, 0),
+        };
+
         self.cursor = frame;
         self.bits_base = frame;
         self.bits_prefix = vec![0.0];
@@ -680,6 +872,10 @@ impl StreamingDecoder {
             st.hf_trim = hf_trim;
             st.lf_skip_aus = start_au;
             st.hf_skip_pkts = j0;
+            st.tf_skip_pkts = tf_j0;
+            if st.opus2.is_some() {
+                st.tf_trim = tf_trim;
+            }
             st.lf_trim_after = true;
             st.lf_zero_prefix = if start_au == 0 {
                 crate::pipeline::XHE_TRIM_CORE_SAMPLES
@@ -712,7 +908,6 @@ impl StreamingDecoder {
             idx -= 1;
         }
     }
-
 }
 
 #[cfg(test)]
@@ -725,7 +920,10 @@ mod tests {
     /// (steady memory growth visible in the host during playback).
     #[test]
     fn bits_prefix_stays_bounded_over_full_decode() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/e2e/01__p300__lfa__hf144.sena");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../assets/e2e/01__p300__lfa__hf144.sena"
+        );
         let bytes = std::fs::read(path).unwrap();
         let mut dec = StreamingDecoder::open(Demuxed::parse(bytes).unwrap()).unwrap();
         let playable = dec.info().playable_frames;
@@ -744,7 +942,10 @@ mod tests {
         // A read produces at most a couple of ~100 ms decode chunks ahead of
         // the cursor; before the fix this reached playable_frames + 1
         // (960001 entries for this asset).
-        assert!(max_prefix <= 100_000, "bits_prefix grew to {max_prefix} entries");
+        assert!(
+            max_prefix <= 100_000,
+            "bits_prefix grew to {max_prefix} entries"
+        );
 
         // Seeking mid-stream and reading on must stay bounded too.
         dec.seek(playable / 2).unwrap();
@@ -755,7 +956,10 @@ mod tests {
             }
             max_prefix = max_prefix.max(dec.bits_prefix.len());
         }
-        assert!(max_prefix <= 100_000, "bits_prefix grew to {max_prefix} entries after seek");
+        assert!(
+            max_prefix <= 100_000,
+            "bits_prefix grew to {max_prefix} entries after seek"
+        );
     }
 
     /// The streaming decoder must equal the whole-file pipeline: with the
@@ -765,8 +969,17 @@ mod tests {
     /// the outputs are bit-identical for the e2e assets.
     #[test]
     fn streaming_matches_whole_file_pipeline() {
-        for asset in ["01__p300__lfa__hf144", "01__p600__lfd__hf136", "05__p300__lfa__hf144", "09__p600__lfd__hf136"] {
-            let path = format!("{}/../../assets/e2e/{asset}.sena", env!("CARGO_MANIFEST_DIR"));
+        for asset in [
+            "01__p300__lfa__hf144",
+            "01__p600__lfd__hf136",
+            "01__p600__3t__hf160+64",
+            "05__p300__lfa__hf144",
+            "09__p600__lfd__hf136",
+        ] {
+            let path = format!(
+                "{}/../../assets/e2e/{asset}.sena",
+                env!("CARGO_MANIFEST_DIR")
+            );
             let bytes = std::fs::read(&path).unwrap();
             let whole = crate::pipeline::decode(&Demuxed::parse(bytes.clone()).unwrap()).unwrap();
             let whole_pcm = whole.pcm_f64();
@@ -786,7 +999,10 @@ mod tests {
                 .zip(whole_pcm.iter())
                 .map(|(s, w)| (*s as f64 - *w as f32 as f64).abs())
                 .fold(0.0f64, f64::max);
-            assert!(max <= 1e-6, "{asset}: max streaming-vs-whole-file diff {max}");
+            assert!(
+                max <= 1e-6,
+                "{asset}: max streaming-vs-whole-file diff {max}"
+            );
         }
     }
 
@@ -799,27 +1015,32 @@ mod tests {
     /// toolchain headroom.)
     #[test]
     fn decode_fits_small_host_stack() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/e2e/01__p300__lfa__hf144.sena");
-        let bytes = std::fs::read(path).unwrap();
-        let handle = std::thread::Builder::new()
-            .stack_size(448 * 1024)
-            .spawn(move || {
-                let mut dec = StreamingDecoder::open(Demuxed::parse(bytes).unwrap()).unwrap();
-                let playable = dec.info().playable_frames;
-                let mut buf = vec![0.0f32; 4096 * 2];
-                let mut total = 0u64;
-                loop {
-                    let n = dec.read_f32(&mut buf, 4096).unwrap();
-                    if n == 0 {
-                        break;
+        for asset in ["01__p300__lfa__hf144", "01__p600__3t__hf160+64"] {
+            let path = format!(
+                "{}/../../assets/e2e/{asset}.sena",
+                env!("CARGO_MANIFEST_DIR")
+            );
+            let bytes = std::fs::read(&path).unwrap();
+            let handle = std::thread::Builder::new()
+                .stack_size(448 * 1024)
+                .spawn(move || {
+                    let mut dec = StreamingDecoder::open(Demuxed::parse(bytes).unwrap()).unwrap();
+                    let playable = dec.info().playable_frames;
+                    let mut buf = vec![0.0f32; 4096 * 2];
+                    let mut total = 0u64;
+                    loop {
+                        let n = dec.read_f32(&mut buf, 4096).unwrap();
+                        if n == 0 {
+                            break;
+                        }
+                        total += n;
                     }
-                    total += n;
-                }
-                assert_eq!(total, playable);
-            })
-            .unwrap();
-        // A stack overflow aborts the whole process (no unwind), so join
-        // succeeding at all is the assertion.
-        handle.join().unwrap();
+                    assert_eq!(total, playable);
+                })
+                .unwrap();
+            // A stack overflow aborts the whole process (no unwind), so join
+            // succeeding at all is the assertion.
+            handle.join().unwrap();
+        }
     }
 }

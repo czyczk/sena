@@ -235,6 +235,12 @@ def main():
     assert tracks[2]["codec"] == "A_SENALF", tracks
     assert tags["SENA_PROFILE"] == profile_s, tags
     assert clusters > 10, clusters
+    # Three-track layout (>=256k): A_OPUSHF rides along as track 3 and the
+    # mid encode's elementary stream is mid.opus, not hf.opus.
+    three_track = len(tracks) > 3
+    if three_track:
+        assert tracks[3]["codec"] == "A_OPUSHF", tracks
+        assert tags["SENA_PROFILE"] == f"{profile}@15600", tags
     # 延迟 = 1024 个核心样本 × 实际流率（mdhd）；容器 CodecDelay 应等于 1024×1e9/率
     lf_rate_hz = int(round(tracks[2].get("rate_hz", 0)))
     assert lf_rate_hz in (16000, 32000), f"unexpected LF rate {lf_rate_hz}"
@@ -246,15 +252,32 @@ def main():
     assert len(lf_pkts) == len(lf_aus) and all(
         a == b for a, b in zip(lf_aus, lf_pkts)
     ), "LF packets differ"
+    mid_ogg = f"{wd}/mid.opus" if three_track else f"{wd}/hf.opus"
     hf_pkts = frames[1]
-    hf_audio = ogg_audio(f"{wd}/hf.opus")
+    hf_audio = ogg_audio(mid_ogg)
     assert len(hf_pkts) == len(hf_audio) and all(
         a == b for a, b in zip(hf_audio, hf_pkts)
     ), "HF packets differ or tags not stripped"
-    print(f"container OK: {len(lf_pkts)} LF AUs, {len(hf_pkts)} HF packets, {clusters} clusters")
+    if three_track:
+        hf2_pkts = frames[3]
+        hf2_audio = ogg_audio(f"{wd}/hf.opus")
+        assert len(hf2_pkts) == len(hf2_audio) and all(
+            a == b for a, b in zip(hf2_audio, hf2_pkts)
+        ), "A_OPUSHF packets differ or tags not stripped"
+        print(
+            f"container OK: {len(lf_pkts)} LF AUs, {len(hf_pkts)} mid + "
+            f"{len(hf2_pkts)} top packets, {clusters} clusters"
+        )
+    else:
+        print(f"container OK: {len(lf_pkts)} LF AUs, {len(hf_pkts)} HF packets, {clusters} clusters")
 
     subprocess.run(["xhedec", f"{wd}/lf.m4a", f"{wd}/lf_dec.wav"], check=True)
-    subprocess.run(["opusdec", "--quiet", "--force-wav", f"{wd}/hf.opus", f"{wd}/hf_dec.wav"], check=True)
+    subprocess.run(["opusdec", "--quiet", "--force-wav", mid_ogg, f"{wd}/hf_dec.wav"], check=True)
+    if three_track:
+        subprocess.run(
+            ["opusdec", "--quiet", "--force-wav", f"{wd}/hf.opus", f"{wd}/hf2_dec.wav"],
+            check=True,
+        )
     ref, _ = sf.read(inp, dtype="float64", always_2d=True)
     lf, fs = sf.read(f"{wd}/lf_dec.wav", dtype="float64", always_2d=True)
     if fs != SR:
@@ -262,6 +285,14 @@ def main():
     hp, _ = sf.read(f"{wd}/hf_dec.wav", dtype="float64", always_2d=True)
     lf /= PAD
     hp /= PAD
+    if three_track:
+        hp2, _ = sf.read(f"{wd}/hf2_dec.wav", dtype="float64", always_2d=True)
+        hp2 /= PAD
+        # opusdec pads the two band tracks to the same length; sum mid+top
+        # (the encoder split is complementary, so this equals the 600 Hz-high
+        # band) before the lag/correlation checks.
+        m = min(len(hp), len(hp2))
+        hp = hp[:m] + hp2[:m]
     lag_l = xcorr_lag(ref.mean(axis=1), lf.mean(axis=1), SR)
     lag_h = xcorr_lag(ref.mean(axis=1), hp.mean(axis=1), SR)
     exp_lag = -(1024 * SR // lf_rate_hz)

@@ -70,7 +70,9 @@ fn parse_args() -> Result<Args, String> {
                 };
             }
             "--dump-tracks" => {
-                dump_prefix = Some(PathBuf::from(args.next().ok_or("--dump-tracks requires a prefix")?));
+                dump_prefix = Some(PathBuf::from(
+                    args.next().ok_or("--dump-tracks requires a prefix")?,
+                ));
             }
             "--info" => info = true,
             "--force" => force = true,
@@ -103,7 +105,11 @@ fn parse_args() -> Result<Args, String> {
     })
 }
 
-fn write_all(out: &mut dyn Write, data: &[u8], path: Option<&std::path::Path>) -> std::io::Result<()> {
+fn write_all(
+    out: &mut dyn Write,
+    data: &[u8],
+    path: Option<&std::path::Path>,
+) -> std::io::Result<()> {
     if let Some(path) = path {
         std::fs::write(path, data)
     } else {
@@ -167,13 +173,26 @@ fn run() -> Result<(), String> {
     if let Some(prefix) = &args.dump_prefix {
         let lf_name = prefix.with_extension("lf.wav");
         let hf_name = prefix.with_extension("hf.wav");
+        let hf2_name = prefix.with_extension("hf2.wav");
         let lf = output::encode_wav(decoded.lf_track_pcm(), SampleFormat::F32, Dither::None)
             .map_err(|e| e.to_string())?;
         let hf = output::encode_wav(decoded.hf_track_pcm(), SampleFormat::F32, Dither::None)
             .map_err(|e| e.to_string())?;
         std::fs::write(&lf_name, lf).map_err(|e| format!("{}: {e}", lf_name.display()))?;
         std::fs::write(&hf_name, hf).map_err(|e| format!("{}: {e}", hf_name.display()))?;
-        eprintln!("wrote {} and {}", lf_name.display(), hf_name.display());
+        if info.three_track {
+            let hf2 = output::encode_wav(decoded.hf2_track_pcm(), SampleFormat::F32, Dither::None)
+                .map_err(|e| e.to_string())?;
+            std::fs::write(&hf2_name, hf2).map_err(|e| format!("{}: {e}", hf2_name.display()))?;
+            eprintln!(
+                "wrote {}, {} and {}",
+                lf_name.display(),
+                hf_name.display(),
+                hf2_name.display()
+            );
+        } else {
+            eprintln!("wrote {} and {}", lf_name.display(), hf_name.display());
+        }
         if !args.output_explicit {
             return Ok(());
         }
@@ -198,7 +217,13 @@ fn run() -> Result<(), String> {
             };
             let data = output::encode_wav(pcm, fmt, args.dither).map_err(|e| e.to_string())?;
             write_all(&mut std::io::stdout(), &data, out_path).map_err(|e| e.to_string())?;
-            eprintln!("wrote {} {bits}-bit WAV ({} bytes)", out_path.map(|p| p.display().to_string()).unwrap_or_else(|| "stdout".into()), data.len());
+            eprintln!(
+                "wrote {} {bits}-bit WAV ({} bytes)",
+                out_path
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "stdout".into()),
+                data.len()
+            );
         }
         Format::RawF32 | Format::RawS24 | Format::RawS16 => {
             let (fmt, bits) = match args.format {
@@ -208,7 +233,13 @@ fn run() -> Result<(), String> {
             };
             let data = output::encode_raw(pcm, fmt, args.dither).map_err(|e| e.to_string())?;
             write_all(&mut std::io::stdout(), &data, out_path).map_err(|e| e.to_string())?;
-            eprintln!("wrote {} raw {bits}-bit PCM ({} bytes)", out_path.map(|p| p.display().to_string()).unwrap_or_else(|| "stdout".into()), data.len());
+            eprintln!(
+                "wrote {} raw {bits}-bit PCM ({} bytes)",
+                out_path
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "stdout".into()),
+                data.len()
+            );
         }
     }
     Ok(())

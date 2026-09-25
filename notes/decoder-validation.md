@@ -89,3 +89,23 @@ not reliably converge. Sena e2e streams carry AudioPreroll only in AU 0
 access. See `examples/lf_preroll_probe.rs` and
 `notes/ffmpeg-lav-plugin.md` section 4.2.
 
+## Three-track layout asset (2026-09-25)
+
+`assets/e2e/01__p600__3t__hf160+64.sena` is the first three-track e2e asset
+(`--opus-senav 256`, profile @600: exhale 32k + mid senav 160k over
+600 Hz..15.6 kHz + top senav 64k over 15.6 kHz+). Produced with the local
+`bin/` toolchain (`opusenc-senav` from `opus-custom`), ffmpeg wav extract of
+`01__src.flac` at 48 kHz f32.
+
+- `senaenc` accounting print: `600@15600`, mid 160 + top 64 confirmed.
+- `senadec --info`: profile=600, playable 960000 (exact), audio-sha256
+  recorded (v2 domain, 3 streams).
+- decode vs source (ffmpeg f32): lag 0, correlation 0.999778, RMS 0.0038 -
+  same class as the two-track rows above. No archived `-ref16`/`-ref32`
+  reference exists for this layout (no external reference pipeline covers
+  the 15600 Hz split); the acceptance gates are the
+  `stream::tests::streaming_matches_whole_file_pipeline` equality (the
+  asset is in its list) and `pipeline::tests::three_track_layout`.
+- Layout mismatch regression (A_OPUSHF without / with wrong
+  `SENA_PROFILE`) covered by `pipeline::tests::three_track_layout`.
+

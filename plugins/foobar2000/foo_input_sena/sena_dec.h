@@ -18,7 +18,7 @@
 extern "C" {
 #endif
 
-#define SENA_DEC_ABI_VERSION 1
+#define SENA_DEC_ABI_VERSION 2
 
 typedef struct SenaDec SenaDec;
 typedef struct SenaTags SenaTags;
@@ -52,6 +52,7 @@ typedef struct {
        framing). Tags, Attachments (cover art) and Void filler are excluded:
        average-bitrate displays must use this, not the raw file size. */
     uint64_t audio_span_bytes;
+    uint32_t three_track; /* ABI 2: nonzero = A_OPUSHF (15.6 kHz+) track present */
 } SenaDecInfo;
 
 typedef struct {

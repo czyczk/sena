@@ -3,17 +3,27 @@
 
 pub mod fir_tables;
 
-use rustfft::num_complex::Complex64;
 use rustfft::FftPlanner;
+use rustfft::num_complex::Complex64;
+
+/// Reference FIR for a split point. 300/600 are the profile crossovers;
+/// 15600 is the three-track b19 split (cutoff 15480, stopband at 15600).
+pub(crate) fn fir_for(fc: f64) -> &'static [f64] {
+    if (fc - 300.0).abs() < 1.0 {
+        &fir_tables::FIR_300
+    } else if (fc - 600.0).abs() < 1.0 {
+        &fir_tables::FIR_600
+    } else if (fc - 15600.0).abs() < 1.0 {
+        &fir_tables::FIR_15600
+    } else {
+        panic!("no reference FIR for split at {fc} Hz");
+    }
+}
 
 /// Split stereo f64 samples into low/high bands with the reference FIR.
 /// Returns (low, high); both delayed by (N-1)/2 relative to input.
 pub fn split(x: &[f64], ch: usize, fc: f64) -> (Vec<f64>, Vec<f64>) {
-    let h: &[f64] = if (fc - 300.0).abs() < 1.0 {
-        &fir_tables::FIR_300
-    } else {
-        &fir_tables::FIR_600
-    };
+    let h: &[f64] = fir_for(fc);
     let n = x.len() / ch;
     let low = fftconvolve_stereo(x, h, ch, n);
     // high = delayed x - low
@@ -166,7 +176,11 @@ impl Resampler {
         // Upsampling (n > 1): the sinc zeros must sit at multiples of the
         // input sample spacing (cutoff = input Nyquist) so that the
         // interpolation property holds at the original sample points.
-        let pass = if n > 1 { 0.98 * min_nyq } else { 0.90 * min_nyq };
+        let pass = if n > 1 {
+            0.98 * min_nyq
+        } else {
+            0.90 * min_nyq
+        };
         let trans = min_nyq - pass;
         let fc_sinc = if n > 1 { min_nyq } else { pass + 0.5 * trans };
         let taps = ((fs_lcm as f64) * 12.0 / trans).ceil() as usize | 1;
@@ -213,7 +227,15 @@ impl Resampler {
             phase_shift.push(lo_abs);
             phase_taps.push(taps);
         }
-        Resampler { n, m, kernel, delay, guard_in, phase_shift, phase_taps }
+        Resampler {
+            n,
+            m,
+            kernel,
+            delay,
+            guard_in,
+            phase_shift,
+            phase_taps,
+        }
     }
 
     /// Number of output frames produced for a whole-buffer input of
@@ -586,11 +608,7 @@ pub struct CrossoverStream {
 
 impl CrossoverStream {
     pub fn new(fc: f64) -> Self {
-        let h: &'static [f64] = if (fc - 300.0).abs() < 1.0 {
-            &fir_tables::FIR_300
-        } else {
-            &fir_tables::FIR_600
-        };
+        let h: &'static [f64] = fir_for(fc);
         Self {
             h,
             d: (h.len() - 1) / 2,
@@ -653,12 +671,18 @@ impl CrossoverStream {
         if threads > 1 && cnt >= 16 * 1024 {
             let chunk = cnt.div_ceil(threads);
             std::thread::scope(|s| {
-                for (idx, (low_p, high_p)) in low.chunks_mut(chunk * ch).zip(high.chunks_mut(chunk * ch)).enumerate() {
+                for (idx, (low_p, high_p)) in low
+                    .chunks_mut(chunk * ch)
+                    .zip(high.chunks_mut(chunk * ch))
+                    .enumerate()
+                {
                     let j0 = idx * chunk;
                     let self_ref = &*self;
                     let conv_ref = &conv;
                     s.spawn(move || {
-                        for (j, (lo, hi)) in low_p.chunks_mut(ch).zip(high_p.chunks_mut(ch)).enumerate() {
+                        for (j, (lo, hi)) in
+                            low_p.chunks_mut(ch).zip(high_p.chunks_mut(ch)).enumerate()
+                        {
                             let gi = self_ref.emitted + j0 + j;
                             let wi = gi - self_ref.win_start;
                             for c in 0..ch {
@@ -698,7 +722,11 @@ impl CrossoverStream {
     fn win_convolve(&mut self, ch: usize, n: usize) -> Vec<f64> {
         let out_len = n + self.h.len() - 1;
         let fft_len = out_len.next_power_of_two();
-        let cache_ok = self.conv_cache.as_ref().map(|c| c.fft_len == fft_len).unwrap_or(false);
+        let cache_ok = self
+            .conv_cache
+            .as_ref()
+            .map(|c| c.fft_len == fft_len)
+            .unwrap_or(false);
         if !cache_ok {
             let mut planner = FftPlanner::<f64>::new();
             let fwd = planner.plan_fft_forward(fft_len);
@@ -708,7 +736,12 @@ impl CrossoverStream {
                 hspec[i] = Complex64::new(v, 0.0);
             }
             fwd.process(&mut hspec);
-            self.conv_cache = Some(ConvCache { fft_len, fwd, inv, hspec });
+            self.conv_cache = Some(ConvCache {
+                fft_len,
+                fwd,
+                inv,
+                hspec,
+            });
         }
         let c = self.conv_cache.as_ref().unwrap();
         let mut out = vec![0.0; out_len * ch];
@@ -744,9 +777,18 @@ struct ConvCache {
 /// Reference tilt shape: (frequency Hz, gain dB) knots, linearly
 /// interpolated. Flat below ~1.9 kHz, then a slow fall of a couple of dB.
 const TILT_KNOTS: &[(f64, f64)] = &[
-    (0.0, 0.0), (1900.0, 0.0), (2400.0, -0.05), (3024.0, -0.09),
-    (3810.0, -0.17), (4800.0, -0.31), (6048.0, -0.57), (7620.0, -0.98),
-    (9600.0, -1.61), (12095.0, -2.30), (15239.0, -1.90), (19000.0, -2.00),
+    (0.0, 0.0),
+    (1900.0, 0.0),
+    (2400.0, -0.05),
+    (3024.0, -0.09),
+    (3810.0, -0.17),
+    (4800.0, -0.31),
+    (6048.0, -0.57),
+    (7620.0, -0.98),
+    (9600.0, -1.61),
+    (12095.0, -2.30),
+    (15239.0, -1.90),
+    (19000.0, -2.00),
     (24000.0, -2.10),
 ];
 
@@ -943,7 +985,11 @@ mod tests {
         assert_eq!(y.len(), 16000);
         let p = 24000 / 3;
         let expected = 2.0 * 7600.0 / 48000.0; // fc_sinc = 0.95*8000
-        assert!((y[p] - expected).abs() < 1e-4, "peak {} vs {expected}", y[p]);
+        assert!(
+            (y[p] - expected).abs() < 1e-4,
+            "peak {} vs {expected}",
+            y[p]
+        );
         for k in 1..4000 {
             let d = (y[p + k] - y[p - k]).abs();
             assert!(d < 1e-6 * expected, "asymmetry at {k}: {d}");
@@ -995,7 +1041,9 @@ mod tests {
     #[test]
     fn sine_fidelity_96_to_48() {
         let n = 96000;
-        let x: Vec<f64> = (0..n).map(|i| (2.0*std::f64::consts::PI*100.0*i as f64/96000.0).sin()).collect();
+        let x: Vec<f64> = (0..n)
+            .map(|i| (2.0 * std::f64::consts::PI * 100.0 * i as f64 / 96000.0).sin())
+            .collect();
         let r = Resampler::new(96000, 48000);
         let y = r.process_mono(&x, n / 2);
         let mut maxe = 0.0f64;
@@ -1105,7 +1153,12 @@ mod tests {
         streamed.extend(s.finish(2));
         assert_eq!(streamed.len(), batch.len());
         for (a, b) in streamed.iter().zip(batch.iter()) {
-            assert_eq!(a, b, "stream != batch at {}", streamed.iter().position(|v| v == a).unwrap());
+            assert_eq!(
+                a,
+                b,
+                "stream != batch at {}",
+                streamed.iter().position(|v| v == a).unwrap()
+            );
         }
     }
 
@@ -1142,7 +1195,7 @@ mod tests {
             .iter()
             .flat_map(|&v| [v, v * 0.5])
             .collect();
-        for fc in [300.0, 600.0] {
+        for fc in [300.0, 600.0, 15600.0] {
             let (blow, bhigh) = split(&x, 2, fc);
             let mut s = CrossoverStream::new(fc);
             let mut low = Vec::new();
@@ -1157,11 +1210,84 @@ mod tests {
             high.extend(h);
             assert_eq!(low.len(), blow.len());
             assert_eq!(high.len(), bhigh.len());
-            let ml = low.iter().zip(blow.iter()).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
-            let mh = high.iter().zip(bhigh.iter()).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+            let ml = low
+                .iter()
+                .zip(blow.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f64::max);
+            let mh = high
+                .iter()
+                .zip(bhigh.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f64::max);
             assert!(ml < 1e-8, "fc={fc} low error {ml}");
             assert!(mh < 1e-8, "fc={fc} high error {mh}");
         }
+    }
+
+    /// The three-track b19 split: the low (mid-band) output must have no
+    /// measurable energy at or above 15600 Hz (-6 dB cutoff 15480, 240 Hz
+    /// transition), and low+high must reconstruct the input exactly.
+    #[test]
+    fn crossover_15600_stopband_and_complement() {
+        // Two tones straddling the split + broadband noise, 2 s stereo.
+        let n = 48_000 * 2;
+        let mut x = Vec::with_capacity(n * 2);
+        let mut rng: u64 = 0x9E3779B97F4A7C15;
+        let mut noise = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            (rng as f64 / u64::MAX as f64) * 2.0 - 1.0
+        };
+        for i in 0..n {
+            let t = i as f64 / 48000.0;
+            let v = (2.0 * std::f64::consts::PI * 10000.0 * t).sin() * 0.5
+                + (2.0 * std::f64::consts::PI * 18000.0 * t).sin() * 0.4
+                + noise() * 0.1;
+            x.push(v);
+            x.push(v * 0.7);
+        }
+        let (low, high) = split(&x, 2, 15600.0);
+        // Complementarity (minus the edge regions of the convolution).
+        let skip = 2100;
+        for i in skip..n - skip {
+            for c in 0..2 {
+                let sum = low[i * 2 + c] + high[i * 2 + c];
+                assert!((sum - x[i * 2 + c]).abs() < 1e-9, "frame {i} ch {c}");
+            }
+        }
+        // Low energy above 15600: FFT the settled region of one channel.
+        let m = 1 << 16;
+        let mut re = vec![0.0f64; m];
+        let mut im = vec![0.0f64; m];
+        for (k, i) in (skip..skip + m).enumerate() {
+            // Hann window (gain-compensated): only relative band energy matters.
+            let w = 0.5 - 0.5 * (2.0 * std::f64::consts::PI * k as f64 / m as f64).cos();
+            re[k] = low[i * 2] * w;
+        }
+        let mut planner = rustfft::FftPlanner::<f64>::new();
+        let fft = planner.plan_fft_forward(m);
+        use rustfft::num_complex::Complex64 as C;
+        let mut buf: Vec<C> = re
+            .iter()
+            .zip(im.iter())
+            .map(|(&r, &i)| C::new(r, i))
+            .collect();
+        fft.process(&mut buf);
+        let band_energy = |f0: f64, f1: f64| -> f64 {
+            let k0 = (f0 / 48000.0 * m as f64) as usize;
+            let k1 = (f1 / 48000.0 * m as f64) as usize;
+            buf[k0..k1].iter().map(|c| c.norm_sqr()).sum::<f64>()
+        };
+        let pass = band_energy(2000.0, 14000.0);
+        let stop = band_energy(15700.0, 24000.0);
+        assert!(
+            stop / pass < 1e-12,
+            "stopband leak {} vs pass {}",
+            stop,
+            pass
+        );
     }
 
     #[test]
@@ -1178,7 +1304,10 @@ mod tests {
                 im -= t * (w * k as f64).sin();
             }
             let got = 20.0 * (re * re + im * im).sqrt().log10();
-            assert!((got - g_db).abs() < 0.08, "at {f} Hz: got {got:.3} dB, want {g_db}");
+            assert!(
+                (got - g_db).abs() < 0.08,
+                "at {f} Hz: got {got:.3} dB, want {g_db}"
+            );
         }
     }
 
@@ -1187,8 +1316,15 @@ mod tests {
         let h = tilt_taps(0.0);
         let mut delta = vec![0.0; h.len()];
         delta[h.len() / 2] = 1.0;
-        let e = h.iter().zip(delta.iter()).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
-        assert!(e < 1e-9, "strength 0 should be a pure delay line, max err {e}");
+        let e = h
+            .iter()
+            .zip(delta.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f64::max);
+        assert!(
+            e < 1e-9,
+            "strength 0 should be a pure delay line, max err {e}"
+        );
     }
 
     #[test]
@@ -1219,9 +1355,11 @@ mod tests {
         }
         got.extend(s.finish(1));
         assert_eq!(got.len(), want.len());
-        let e = got.iter().zip(want.iter()).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+        let e = got
+            .iter()
+            .zip(want.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f64::max);
         assert!(e < 1e-12, "stream vs batch error {e}");
     }
 }
-
-

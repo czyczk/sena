@@ -13,18 +13,38 @@ stdin/file WAV --WavStream--> [normalize any rate -> 48 kHz]
                                     |
                                     v
                              CrossoverStream  (split low/high, per-chunk FFT, cached plan)
-                                    | low (+PRE_GAIN)
-                                    v
-                             LF downsample 48k -> 16k/32k (StreamResampler)
-                                    |                          \ high (+PRE_GAIN)
-                                    v                           v
-                                lf.wav (s16, streaming)    hf.wav (f32, streaming)
-                                    |                           |
-                        (EOF)  ------+---------------------------+------>
-                        run exhale (lf.wav)  ||  opusenc (hf.wav)   <- run in parallel
-                                    |
-                        extract AUs/packets -> mux -> .sena
+                                     | low (+PRE_GAIN)
+                                     |                \ high
+                                     v                  v
+                              LF downsample       (two-track: 600 Hz..24 kHz -> hf.wav)
+                              48k -> 16k/32k       (three-track, total >= 256k:
+                                     |              CrossoverStream @15600 -> mid.wav + hf.wav)
+                                     v                           |
+                                 lf.wav (s16, streaming)         v
+                                     |                    mid.wav / hf.wav (f32, streaming)
+                                     |
+                     (EOF)  ------+---------------------------+------>
+                     run exhale (lf.wav) || opusenc (mid) || opusenc (hf, 3-track only)
+                                     |
+                         extract AUs/packets -> mux -> .sena
 ```
+
+- Two-track layout (`SENA_PROFILE` `300`/`600`): exhale LF + one opus track
+  over 600 Hz..Nyquist at `total - deduct`.
+- Three-track layout (nominal total >= 256 kbit/s, `SENA_PROFILE`
+  `<lf>@15600`): the 600 Hz-high band splits again at the Opus b19 edge
+  (15600 Hz; FIR_15600, 2001 taps, cutoff 15480, 240 Hz transition ->
+  >= ~95 dB at 15600). The mid track (`A_OPUS`) codes 600 Hz..15.6 kHz at
+  `total - deduct - 64`; the top track (`A_OPUSHF`) codes 15.6 kHz..24 kHz
+  at a fixed 64k nominal. Both opus tracks use whichever opusenc build the
+  mode selected (`--opus-senav` / `--opus-original`); the three codec
+  processes run concurrently. `--hf-tilt`, when enabled, shapes the mid
+  band only.
+- opus-senav topband-stereo: `AUDIFF_TOPBAND_STEREO` is armed for the mid
+  encode only - by default at the Opus budget when the total is in
+  [192, 256) kbit/s with senav, or verbatim via
+  `--opus-topband-stereo <1-500>` (straight passthrough, no Sena-side
+  arithmetic; warned+ignored under `--opus-original`; never on `A_OPUSHF`).
 
 - Streaming end to end: the input is consumed chunk by chunk and the temp
   WAVs are written as the DSP runs, so a feeding host (foobar2000
@@ -65,6 +85,38 @@ parallel:
 | **total** | **~12.7 s** | **~11.9 s** |
 
 (Old codec stage ~8 s / ~4.5 s sequential; total ~5.7x / ~4.4x faster.)
+
+## Parallelism map (2026-09-25)
+
+What runs concurrently, end to end:
+
+- DSP kernels are internally threaded across outputs/channels for large
+  chunks (polyphase resampler emit, both crossover FFT fills; threshold
+  16K frames/channels).
+- Three-track chunks run the LF branch (downsample + LF write) and the HF
+  branch (15600 Hz split + tilt + mid/top writes) on two scoped threads -
+  the p600 LF downsample no longer serializes behind the second crossover.
+  Two-track keeps the sequential order (its HF branch is a fraction of the
+  LF branch, and SENAENC_TIME stage sums stay comparable with the tables
+  above). With overlapped branches the three-track SENAENC_TIME sum can
+  exceed the wall time.
+- The codec subprocesses (exhale, opusenc mid, opusenc top) spawn together
+  and each is drained on its own thread (a chatty child can no longer stall
+  on a full pipe while an earlier one is waited on). Verified: the 3-track
+  e2e asset is bit-identical whether the band branches run sequentially or
+  concurrently.
+- Whole-file decode (senadec CLI / validation) decodes the tracks
+  concurrently (LF / mid / top on scoped threads).
+
+Deliberately not parallelized:
+
+- Codec-vs-DSP overlap (pipe-feeding opusenc while the bands stream): the
+  encoders read complete WAVs; exhale needs a file anyway, so the win is
+  bounded (~the opusenc wall time). Same call as the 2026-09-01 pass.
+- The streaming product decoder stays single-threaded: tracks are consumed
+  interleaved (no track waits for another, min-ready chunking), decode runs
+  far ahead of realtime, and plugin hosts give the decode thread a 544 KiB
+  stack where worker threads are not welcome.
 
 ## Remaining optimization space (measured, not speculative)
 

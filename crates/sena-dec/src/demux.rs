@@ -139,9 +139,9 @@ pub fn read_vint(data: &[u8], pos: usize) -> Result<(u64, usize), DemuxError> {
         return Err(DemuxError::Malformed(format!("invalid vint at byte {pos}")));
     }
     len += 1;
-    let bytes = data
-        .get(pos..pos + len)
-        .ok_or(DemuxError::Truncated { context: "vint bytes" })?;
+    let bytes = data.get(pos..pos + len).ok_or(DemuxError::Truncated {
+        context: "vint bytes",
+    })?;
     let mut v = 0u64;
     for &b in bytes {
         v = (v << 8) | u64::from(b);
@@ -151,9 +151,9 @@ pub fn read_vint(data: &[u8], pos: usize) -> Result<(u64, usize), DemuxError> {
 }
 
 fn read_id(data: &[u8], pos: usize) -> Result<(&[u8], usize), DemuxError> {
-    let first = *data
-        .get(pos)
-        .ok_or(DemuxError::Truncated { context: "element id" })?;
+    let first = *data.get(pos).ok_or(DemuxError::Truncated {
+        context: "element id",
+    })?;
     if first & 0x80 != 0 {
         return Ok((&data[pos..pos + 1], 1));
     }
@@ -170,7 +170,11 @@ fn read_id(data: &[u8], pos: usize) -> Result<(&[u8], usize), DemuxError> {
     let end = pos
         .checked_add(len)
         .ok_or(DemuxError::Malformed("id overflow".into()))?;
-    Ok((data.get(pos..end).ok_or(DemuxError::Truncated { context: "id" })?, len))
+    Ok((
+        data.get(pos..end)
+            .ok_or(DemuxError::Truncated { context: "id" })?,
+        len,
+    ))
 }
 
 /// Public wrapper over the internal EBML element reader (used by the
@@ -182,18 +186,32 @@ pub fn read_elem_public(data: &[u8], pos: usize) -> Result<Elem, DemuxError> {
 fn read_elem(data: &[u8], pos: usize) -> Result<Elem, DemuxError> {
     let (_, id_len) = read_id(data, pos)?;
     let (size, size_len) = read_vint(data, pos + id_len)?;
-    let size = usize::try_from(size).map_err(|_| DemuxError::Unsupported("element too large".into()))?;
+    let size =
+        usize::try_from(size).map_err(|_| DemuxError::Unsupported("element too large".into()))?;
     let data_start = pos + id_len + size_len;
     let data_end = data_start
         .checked_add(size)
         .ok_or(DemuxError::Malformed("element size overflow".into()))?;
     if data_end > data.len() {
-        return Err(DemuxError::Malformed(format!("element at byte {pos} overruns file: payload ends {data_end}, file {}", data.len())));
+        return Err(DemuxError::Malformed(format!(
+            "element at byte {pos} overruns file: payload ends {data_end}, file {}",
+            data.len()
+        )));
     }
-    Ok(Elem { start: pos, id_len, size_len, data_start, data_end })
+    Ok(Elem {
+        start: pos,
+        id_len,
+        size_len,
+        data_start,
+        data_end,
+    })
 }
 
-fn for_each_child(data: &[u8], elem: Elem, mut f: impl FnMut(&[u8], Elem) -> Result<(), DemuxError>) -> Result<(), DemuxError> {
+fn for_each_child(
+    data: &[u8],
+    elem: Elem,
+    mut f: impl FnMut(&[u8], Elem) -> Result<(), DemuxError>,
+) -> Result<(), DemuxError> {
     let mut p = elem.data_start;
     while p < elem.data_end {
         let child = read_elem(data, p)?;
@@ -206,7 +224,9 @@ fn for_each_child(data: &[u8], elem: Elem, mut f: impl FnMut(&[u8], Elem) -> Res
 
 fn parse_float_payload(data: &[u8], elem: Elem) -> Result<f64, DemuxError> {
     let p = elem.payload();
-    let bytes = data.get(p.clone()).ok_or(DemuxError::Truncated { context: "float payload" })?;
+    let bytes = data.get(p.clone()).ok_or(DemuxError::Truncated {
+        context: "float payload",
+    })?;
     match bytes.len() {
         4 => {
             let b: [u8; 4] = bytes.try_into().unwrap();
@@ -220,7 +240,10 @@ fn parse_float_payload(data: &[u8], elem: Elem) -> Result<f64, DemuxError> {
     }
 }
 
-pub(crate) fn parse_tags_payload(data: &[u8], elem: Elem) -> Result<Vec<(String, String)>, DemuxError> {
+pub(crate) fn parse_tags_payload(
+    data: &[u8],
+    elem: Elem,
+) -> Result<Vec<(String, String)>, DemuxError> {
     let mut entries = Vec::new();
     for_each_child(data, elem, |id, child| {
         if id != TAG_ID {
@@ -235,11 +258,13 @@ pub(crate) fn parse_tags_payload(data: &[u8], elem: Elem) -> Result<Vec<(String,
             for_each_child(data, simple, |id3, field| {
                 if id3 == TAG_NAME_ID {
                     name = Some(
-                        String::from_utf8_lossy(data.get(field.payload()).unwrap_or(&[])).into_owned(),
+                        String::from_utf8_lossy(data.get(field.payload()).unwrap_or(&[]))
+                            .into_owned(),
                     );
                 } else if id3 == TAG_STRING_ID {
                     value = Some(
-                        String::from_utf8_lossy(data.get(field.payload()).unwrap_or(&[])).into_owned(),
+                        String::from_utf8_lossy(data.get(field.payload()).unwrap_or(&[]))
+                            .into_owned(),
                     );
                 }
                 Ok(())
@@ -262,28 +287,37 @@ fn parse_track(data: &[u8], elem: Elem) -> Result<Track, DemuxError> {
     let mut codec_delay_ns = None;
     for_each_child(data, elem, |id, child| {
         match id {
-            TRACK_NUMBER_ID => number = read_uint(data.get(child.payload()).unwrap_or(&[]), "track number")?,
+            TRACK_NUMBER_ID => {
+                number = read_uint(data.get(child.payload()).unwrap_or(&[]), "track number")?
+            }
             TRACK_TYPE_ID => {
                 let t = read_uint(data.get(child.payload()).unwrap_or(&[]), "track type")?;
                 if t != 2 {
-                    return Err(DemuxError::Unsupported(format!("track type {t}, expected audio")));
+                    return Err(DemuxError::Unsupported(format!(
+                        "track type {t}, expected audio"
+                    )));
                 }
             }
             CODEC_ID_ID => {
-                codec_id = String::from_utf8_lossy(data.get(child.payload()).unwrap_or(&[])).into_owned();
+                codec_id =
+                    String::from_utf8_lossy(data.get(child.payload()).unwrap_or(&[])).into_owned();
             }
             CODEC_PRIVATE_ID => {
                 codec_private = data.get(child.payload()).unwrap_or(&[]).to_vec();
             }
             CODEC_DELAY_ID => {
-                codec_delay_ns = Some(read_uint(data.get(child.payload()).unwrap_or(&[]), "CodecDelay")?);
+                codec_delay_ns = Some(read_uint(
+                    data.get(child.payload()).unwrap_or(&[]),
+                    "CodecDelay",
+                )?);
             }
             AUDIO_ID => {
                 for_each_child(data, child, |aid, achild| {
                     if aid == SAMPLING_FREQ_ID {
                         sample_rate = parse_float_payload(data, achild)?;
                     } else if aid == CHANNELS_ID {
-                        channels = read_uint(data.get(achild.payload()).unwrap_or(&[]), "channels")?;
+                        channels =
+                            read_uint(data.get(achild.payload()).unwrap_or(&[]), "channels")?;
                     }
                     Ok(())
                 })?;
@@ -295,33 +329,50 @@ fn parse_track(data: &[u8], elem: Elem) -> Result<Track, DemuxError> {
     if number == 0 || codec_id.is_empty() || sample_rate <= 0.0 || channels == 0 {
         return Err(DemuxError::Malformed("incomplete track entry".into()));
     }
-    Ok(Track { number, codec_id, codec_private, sample_rate, channels, codec_delay_ns })
+    Ok(Track {
+        number,
+        codec_id,
+        codec_private,
+        sample_rate,
+        channels,
+        codec_delay_ns,
+    })
 }
 
-fn parse_simple_block_header(data: &[u8], payload: std::ops::Range<usize>) -> Result<(u64, i16, usize), DemuxError> {
+fn parse_simple_block_header(
+    data: &[u8],
+    payload: std::ops::Range<usize>,
+) -> Result<(u64, i16, usize), DemuxError> {
     let p = payload.start;
     let (track, tn_len) = read_vint(data, p)?;
     let rel_pos = p + tn_len;
     let rel = i16::from_be_bytes(
         data.get(rel_pos..rel_pos + 2)
-            .ok_or(DemuxError::Truncated { context: "simpleblock relative timestamp" })?
+            .ok_or(DemuxError::Truncated {
+                context: "simpleblock relative timestamp",
+            })?
             .try_into()
             .unwrap(),
     );
-    let flags = *data
-        .get(rel_pos + 2)
-        .ok_or(DemuxError::Truncated { context: "simpleblock flags" })?;
+    let flags = *data.get(rel_pos + 2).ok_or(DemuxError::Truncated {
+        context: "simpleblock flags",
+    })?;
     if flags & 0x06 != 0 {
         return Err(DemuxError::Unsupported("laced frames".into()));
     }
     Ok((track, rel, tn_len + 3))
 }
 
-fn parse_simple_block(data: &[u8], payload: std::ops::Range<usize>) -> Result<(u64, u64, Vec<u8>), DemuxError> {
+fn parse_simple_block(
+    data: &[u8],
+    payload: std::ops::Range<usize>,
+) -> Result<(u64, u64, Vec<u8>), DemuxError> {
     let (track, rel, header_len) = parse_simple_block_header(data, payload.clone())?;
     let body = data
         .get(payload.start + header_len..payload.end)
-        .ok_or(DemuxError::Truncated { context: "simpleblock body" })?;
+        .ok_or(DemuxError::Truncated {
+            context: "simpleblock body",
+        })?;
     Ok((track, rel as u64 as i128 as u64, body.to_vec()))
 }
 
@@ -388,7 +439,10 @@ impl Demuxed {
                 })?;
             } else if id == TAGS_ID {
                 let entries = parse_tags_payload(&bytes, child)?;
-                tags.push(TagBlock { elem: child, entries });
+                tags.push(TagBlock {
+                    elem: child,
+                    entries,
+                });
             } else if id == CLUSTER_ID {
                 audio_span_bytes += (child.data_end - child.start) as u64;
                 let mut cluster_t = 0u64;
@@ -415,7 +469,11 @@ impl Demuxed {
         // `t_ns` remains available for diagnostics and bitrate mapping.
         let mut out = Self {
             bytes,
-            segment: SegmentInfo { elem: segment, payload_start, payload_end },
+            segment: SegmentInfo {
+                elem: segment,
+                payload_start,
+                payload_end,
+            },
             tracks,
             tags,
             frames,
@@ -427,11 +485,34 @@ impl Demuxed {
     }
 
     fn validate_layout(&mut self) {
-        if self.tracks.iter().filter(|t| t.codec_id == "A_OPUS").count() != 1 {
-            self.warnings.push("expected exactly one A_OPUS track".into());
+        if self
+            .tracks
+            .iter()
+            .filter(|t| t.codec_id == "A_OPUS")
+            .count()
+            != 1
+        {
+            self.warnings
+                .push("expected exactly one A_OPUS track".into());
         }
-        if self.tracks.iter().filter(|t| t.codec_id == "A_SENALF").count() != 1 {
-            self.warnings.push("expected exactly one A_SENALF track".into());
+        if self
+            .tracks
+            .iter()
+            .filter(|t| t.codec_id == "A_SENALF")
+            .count()
+            != 1
+        {
+            self.warnings
+                .push("expected exactly one A_SENALF track".into());
+        }
+        if self
+            .tracks
+            .iter()
+            .filter(|t| t.codec_id == "A_OPUSHF")
+            .count()
+            > 1
+        {
+            self.warnings.push("more than one A_OPUSHF track".into());
         }
     }
 
@@ -590,7 +671,9 @@ impl<R: FnMut(u64, usize) -> Result<Vec<u8>, String>> Window<'_, R> {
         if len > INDEX_WINDOW {
             return (self.read_at)(pos, len);
         }
-        let end = pos.checked_add(len as u64).ok_or("element range overflow")?;
+        let end = pos
+            .checked_add(len as u64)
+            .ok_or("element range overflow")?;
         if pos < self.base || end > self.base + self.buf.len() as u64 {
             self.buf = (self.read_at)(pos, INDEX_WINDOW)?;
             self.base = pos;
@@ -613,7 +696,11 @@ struct RawElem {
 }
 
 fn vint_width(first: u8) -> Option<usize> {
-    if first == 0 { None } else { Some(1 + first.leading_zeros() as usize) }
+    if first == 0 {
+        None
+    } else {
+        Some(1 + first.leading_zeros() as usize)
+    }
 }
 
 fn read_elem_w<R: FnMut(u64, usize) -> Result<Vec<u8>, String>>(
@@ -623,15 +710,27 @@ fn read_elem_w<R: FnMut(u64, usize) -> Result<Vec<u8>, String>>(
     let first = *w.get(pos, 1)?.first().ok_or("truncated EBML: element id")?;
     let id_len = vint_width(first).ok_or("malformed container: invalid element id")?;
     let id = w.get(pos, id_len)?;
-    let size_first = *w.get(pos + id_len as u64, 1)?.first().ok_or("truncated EBML: element size")?;
+    let size_first = *w
+        .get(pos + id_len as u64, 1)?
+        .first()
+        .ok_or("truncated EBML: element size")?;
     let size_len = vint_width(size_first).ok_or("malformed container: invalid vint")?;
     let size_bytes = w.get(pos + id_len as u64, size_len)?;
     let (size, _) = read_vint(&size_bytes, 0).map_err(|e| e.to_string())?;
     let data_start = pos
         .checked_add((id_len + size_len) as u64)
         .ok_or("element size overflow")?;
-    let data_end = data_start.checked_add(size).ok_or("element size overflow")?;
-    Ok(RawElem { id, size, size_len, start: pos, data_start, data_end })
+    let data_end = data_start
+        .checked_add(size)
+        .ok_or("element size overflow")?;
+    Ok(RawElem {
+        id,
+        size,
+        size_len,
+        start: pos,
+        data_start,
+        data_end,
+    })
 }
 
 fn walk_cluster_w<R: FnMut(u64, usize) -> Result<Vec<u8>, String>>(
@@ -656,8 +755,8 @@ fn walk_cluster_w<R: FnMut(u64, usize) -> Result<Vec<u8>, String>>(
             let plen = e.data_end - e.data_start;
             let head_len = plen.min(8) as usize;
             let head = w.get(e.data_start, head_len)?;
-            let (track, rel, header_len) = parse_simple_block_header(&head, 0..head_len)
-                .map_err(|e| e.to_string())?;
+            let (track, rel, header_len) =
+                parse_simple_block_header(&head, 0..head_len).map_err(|e| e.to_string())?;
             if (header_len as u64) > plen {
                 return Err("malformed container: SimpleBlock header overruns payload".into());
             }
@@ -705,7 +804,11 @@ pub fn index_container<R: FnMut(u64, usize) -> Result<Vec<u8>, String>>(
     read_at: &mut R,
     want_frames: bool,
 ) -> Result<IndexedFile, String> {
-    let mut w = Window { read_at, base: 0, buf: Vec::new() };
+    let mut w = Window {
+        read_at,
+        base: 0,
+        buf: Vec::new(),
+    };
     let magic = w.get(0, 4)?;
     if magic != b"\x1A\x45\xDF\xA3" {
         return Err(DemuxError::Malformed("missing EBML header".into()).to_string());
@@ -739,7 +842,13 @@ pub fn index_container<R: FnMut(u64, usize) -> Result<Vec<u8>, String>>(
                 return Err("malformed container: Tracks element exceeds the sanity cap".into());
             }
             let payload = w.get(e.data_start, e.size as usize)?;
-            let local = Elem { start: 0, id_len: e.id.len(), size_len: e.size_len, data_start: 0, data_end: payload.len() };
+            let local = Elem {
+                start: 0,
+                id_len: e.id.len(),
+                size_len: e.size_len,
+                data_start: 0,
+                data_end: payload.len(),
+            };
             for_each_child(&payload, local, |tid, tentry| {
                 if tid == TRACK_ENTRY_ID {
                     tracks.push(parse_track(&payload, tentry)?);
@@ -752,7 +861,13 @@ pub fn index_container<R: FnMut(u64, usize) -> Result<Vec<u8>, String>>(
                 return Err("malformed container: Tags element exceeds the sanity cap".into());
             }
             let payload = w.get(e.data_start, e.size as usize)?;
-            let local = Elem { start: 0, id_len: e.id.len(), size_len: e.size_len, data_start: 0, data_end: payload.len() };
+            let local = Elem {
+                start: 0,
+                id_len: e.id.len(),
+                size_len: e.size_len,
+                data_start: 0,
+                data_end: payload.len(),
+            };
             let entries = parse_tags_payload(&payload, local).map_err(|e| e.to_string())?;
             tags.push(entries);
             tag_ranges.push((e.start, e.data_end));
@@ -774,6 +889,9 @@ pub fn index_container<R: FnMut(u64, usize) -> Result<Vec<u8>, String>>(
     if tracks.iter().filter(|t| t.codec_id == "A_SENALF").count() != 1 {
         warnings.push("expected exactly one A_SENALF track".into());
     }
+    if tracks.iter().filter(|t| t.codec_id == "A_OPUSHF").count() > 1 {
+        warnings.push("more than one A_OPUSHF track".into());
+    }
     Ok(IndexedFile {
         tracks,
         tags,
@@ -793,8 +911,14 @@ pub fn index_container<R: FnMut(u64, usize) -> Result<Vec<u8>, String>>(
 /// backend for whole-file callers); short only at the buffer end.
 pub fn mem_read_at(bytes: &[u8], pos: u64, len: usize) -> Result<Vec<u8>, String> {
     let start = usize::try_from(pos).map_err(|_| "file too large for this platform".to_string())?;
-    let end = start.checked_add(len).unwrap_or(bytes.len()).min(bytes.len());
-    bytes.get(start..end).map(|s| s.to_vec()).ok_or_else(|| "range outside buffer".to_string())
+    let end = start
+        .checked_add(len)
+        .unwrap_or(bytes.len())
+        .min(bytes.len());
+    bytes
+        .get(start..end)
+        .map(|s| s.to_vec())
+        .ok_or_else(|| "range outside buffer".to_string())
 }
 
 /* --------------------------------------------------------- rewrite planning
@@ -856,9 +980,15 @@ pub(crate) fn encode_vint_exact(value: u64, len: usize) -> Result<Vec<u8>, Strin
 pub(crate) fn push_void_ops(ops: &mut Vec<WriteOp>, start: u64, end: u64) -> Result<(), String> {
     let header = void_header(end - start)?;
     let header_len = header.len() as u64;
-    ops.push(WriteOp::Bytes { offset: start, data: header });
+    ops.push(WriteOp::Bytes {
+        offset: start,
+        data: header,
+    });
     if end - start > header_len {
-        ops.push(WriteOp::Zero { offset: start + header_len, len: end - start - header_len });
+        ops.push(WriteOp::Zero {
+            offset: start + header_len,
+            len: end - start - header_len,
+        });
     }
     Ok(())
 }
@@ -874,10 +1004,17 @@ pub(crate) fn push_append_ops(
     if appended.is_empty() {
         return Ok(());
     }
-    let new_payload_len = (scan.segment_payload_end - scan.segment_payload_start) + appended.len() as u64;
+    let new_payload_len =
+        (scan.segment_payload_end - scan.segment_payload_start) + appended.len() as u64;
     let patch = encode_vint_exact(new_payload_len, scan.segment_size_len)?;
-    ops.push(WriteOp::Insert { offset: scan.segment_payload_end, data: appended });
-    ops.push(WriteOp::Bytes { offset: scan.segment_size_pos, data: patch });
+    ops.push(WriteOp::Insert {
+        offset: scan.segment_payload_end,
+        data: appended,
+    });
+    ops.push(WriteOp::Bytes {
+        offset: scan.segment_size_pos,
+        data: patch,
+    });
     Ok(())
 }
 
@@ -894,7 +1031,10 @@ pub fn apply_write_ops_to_vec(out: &mut Vec<u8>, ops: &[WriteOp]) {
             }
             WriteOp::Zero { offset, len } => {
                 let start = *offset as usize;
-                out.splice(start..start + *len as usize, std::iter::repeat_n(0, *len as usize));
+                out.splice(
+                    start..start + *len as usize,
+                    std::iter::repeat_n(0, *len as usize),
+                );
             }
         }
     }
@@ -902,10 +1042,17 @@ pub fn apply_write_ops_to_vec(out: &mut Vec<u8>, ops: &[WriteOp]) {
 
 /// Immutable Sena tags that must survive a rewrite (checked by the FFI and
 /// the in-buffer rewrite helpers after applying the plan).
-pub(crate) const IMMUTABLE_KEYS: [&str; 4] =
-    ["SENA_PROFILE", "SENA_VERSION", "SENA_PLAYABLE_SAMPLES", "SENA_AUDIO_SHA256"];
+pub(crate) const IMMUTABLE_KEYS: [&str; 4] = [
+    "SENA_PROFILE",
+    "SENA_VERSION",
+    "SENA_PLAYABLE_SAMPLES",
+    "SENA_AUDIO_SHA256",
+];
 
-pub(crate) fn check_immutable_survived(before: &IndexedFile, after: &IndexedFile) -> Result<(), String> {
+pub(crate) fn check_immutable_survived(
+    before: &IndexedFile,
+    after: &IndexedFile,
+) -> Result<(), String> {
     for key in IMMUTABLE_KEYS {
         if let Some(v) = before.immutable_tag(key)
             && after.immutable_tag(key) != Some(v)
@@ -935,18 +1082,39 @@ mod tests {
 
     #[test]
     fn index_matches_full_parse() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/e2e/01__p300__lfa__hf144.sena");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../assets/e2e/01__p300__lfa__hf144.sena"
+        );
         let bytes = std::fs::read(path).unwrap();
         let demux = Demuxed::parse(bytes.clone()).unwrap();
         let indexed = index_container(&mut |pos, len| mem_read_at(&bytes, pos, len), true).unwrap();
 
         // Same metadata view the probe consumes.
-        assert_eq!(indexed.immutable_tag("SENA_PROFILE"), demux.immutable_tag("SENA_PROFILE"));
-        assert_eq!(indexed.immutable_tag("SENA_PLAYABLE_SAMPLES"), demux.immutable_tag("SENA_PLAYABLE_SAMPLES"));
-        assert_eq!(indexed.immutable_tag("SENA_AUDIO_SHA256"), demux.immutable_tag("SENA_AUDIO_SHA256"));
-        assert_eq!(indexed.track("A_OPUS").unwrap().number, demux.track("A_OPUS").unwrap().number);
-        assert_eq!(indexed.track("A_SENALF").unwrap().number, demux.track("A_SENALF").unwrap().number);
-        assert_eq!(indexed.segment_payload_end, demux.segment.elem.data_end as u64);
+        assert_eq!(
+            indexed.immutable_tag("SENA_PROFILE"),
+            demux.immutable_tag("SENA_PROFILE")
+        );
+        assert_eq!(
+            indexed.immutable_tag("SENA_PLAYABLE_SAMPLES"),
+            demux.immutable_tag("SENA_PLAYABLE_SAMPLES")
+        );
+        assert_eq!(
+            indexed.immutable_tag("SENA_AUDIO_SHA256"),
+            demux.immutable_tag("SENA_AUDIO_SHA256")
+        );
+        assert_eq!(
+            indexed.track("A_OPUS").unwrap().number,
+            demux.track("A_OPUS").unwrap().number
+        );
+        assert_eq!(
+            indexed.track("A_SENALF").unwrap().number,
+            demux.track("A_SENALF").unwrap().number
+        );
+        assert_eq!(
+            indexed.segment_payload_end,
+            demux.segment.elem.data_end as u64
+        );
         assert_eq!(indexed.warnings, demux.warnings);
 
         // Every indexed frame points at the same payload bytes the full
@@ -963,11 +1131,18 @@ mod tests {
 
     #[test]
     fn head_scan_skips_cluster_contents() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/e2e/01__p300__lfa__hf144.sena");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../assets/e2e/01__p300__lfa__hf144.sena"
+        );
         let bytes = std::fs::read(path).unwrap();
-        let indexed = index_container(&mut |pos, len| mem_read_at(&bytes, pos, len), false).unwrap();
+        let indexed =
+            index_container(&mut |pos, len| mem_read_at(&bytes, pos, len), false).unwrap();
         assert!(indexed.frames.is_empty());
         assert_eq!(indexed.immutable_tag("SENA_PROFILE"), Some("300"));
-        assert_eq!(indexed.immutable_tag("SENA_PLAYABLE_SAMPLES"), Some("960000"));
+        assert_eq!(
+            indexed.immutable_tag("SENA_PLAYABLE_SAMPLES"),
+            Some("960000")
+        );
     }
 }

@@ -17,7 +17,11 @@ WORK="$(mktemp -d /tmp/sena-ffmpeg-test.XXXXXX)"
 trap 'rm -rf "$WORK"' EXIT
 
 cd "$ROOT"
-cargo build --release -p sena-dec-capi -p sena-dec -p senadec --example decode_dump --example make_fixture 2>&1 | tail -1
+# Build the runtime-loaded core separately: a combined invocation with
+# `--example` filters every package's targets down to examples, silently
+# skipping the cdylib and leaving a stale libsena_dec.so in place.
+cargo build --release -p sena-dec-capi -p sena-dec -p senadec 2>&1 | tail -1
+cargo build --release -p sena-dec --example decode_dump --example make_fixture 2>&1 | tail -1
 export SENA_DEC_LIBRARY="$ROOT/target/release/libsena_dec.so"
 
 [ -x "$FFMPEG" ] || { echo "no ffmpeg binary at $FFMPEG" >&2; exit 2; }

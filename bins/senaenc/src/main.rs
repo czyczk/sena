@@ -1,15 +1,25 @@
 //! senaenc CLI.
 
-use sena_core::{account, Profile, RECOMMENDED_MIN_TOTAL_KBPS, SENAV_THRESHOLD_KBPS};
-use sena_enc::{check_version, exhale_version, opusenc_version, version_ge, EncoderConfig};
+use sena_core::{
+    Profile, RECOMMENDED_MIN_TOTAL_KBPS, SENAV_THRESHOLD_KBPS, THREE_TRACK_MIN_KBPS,
+    TOPBAND_DEFAULT_RANGE, account, account3, three_track_tag,
+};
+use sena_enc::{EncoderConfig, check_version, exhale_version, opusenc_version, version_ge};
 use std::path::{Path, PathBuf};
 
 fn usage() -> ! {
     eprintln!(
-        "usage: senaenc [--profile 300|600] [--opus-original|--opus-senav] [--hf-tilt <0-100>] [--bypass-recommendations] \
+        "usage: senaenc [--profile 300|600] [--opus-original|--opus-senav] \
+         [--opus-topband-stereo <1-500>] [--hf-tilt <0-100>] [--bypass-recommendations] \
          <bitrate_kbps> <in.wav|-> <out.sena>\n\
+         --opus-topband-stereo <k>: passed straight to the opusenc-senav mid encode \
+         (AUDIFF_TOPBAND_STEREO); default = the Opus budget when using opus-senav at a \
+         total in [192, 256) kbit/s; ignored (with a warning) with --opus-original; \
+         never applied to the 15600 Hz+ top track\n\
          --hf-tilt <pct>: optional gentle high-frequency tilt on the Opus band (percent of the \
          reference curve; 0 = off; default off)\n\
+         totals >= {THREE_TRACK_MIN_KBPS}k use the three-track layout: exhale LF + \
+         Opus mid (600 Hz..15.6 kHz) + Opus top (15.6 kHz+, fixed 64k)\n\
          senaenc doctor                              check required encoder tools\n\
          minimum bitrate: {}k (@600) / {}k (@300); below {RECOMMENDED_MIN_TOTAL_KBPS}k plain Opus\n\
          is recommended and senaenc refuses unless --bypass-recommendations is given\n\
@@ -102,7 +112,10 @@ fn doctor() -> i32 {
             }
             Ok(v) => {
                 fatal += 1;
-                eprintln!("  [fatal] exhale {v} at {} ({src}): older than required 1.2.2", p.display());
+                eprintln!(
+                    "  [fatal] exhale {v} at {} ({src}): older than required 1.2.2",
+                    p.display()
+                );
             }
             Err(e) => {
                 fatal += 1;
@@ -113,7 +126,10 @@ fn doctor() -> i32 {
             fatal += 1;
             eprintln!("  [fatal] exhale (>= 1.2.2) not found next to senaenc or on PATH");
             eprintln!("         impact: the xHE-AAC low band cannot be encoded at all.");
-            eprintln!("         fix: put exhale.exe next to senaenc.exe ({}) or add its folder to PATH", finder.exe_dir.display());
+            eprintln!(
+                "         fix: put exhale.exe next to senaenc.exe ({}) or add its folder to PATH",
+                finder.exe_dir.display()
+            );
         }
     }
 
@@ -132,28 +148,45 @@ fn doctor() -> i32 {
             fatal += 1;
             eprintln!("  [fatal] opusenc not found next to senaenc or on PATH");
             eprintln!("         impact: the high band cannot be encoded at all.");
-            eprintln!("         fix: put opusenc.exe next to senaenc.exe ({}) or add its folder to PATH", finder.exe_dir.display());
+            eprintln!(
+                "         fix: put opusenc.exe next to senaenc.exe ({}) or add its folder to PATH",
+                finder.exe_dir.display()
+            );
         }
     }
 
     // opusenc-senav: optional
     match finder.find("opusenc-senav") {
-        Some((p, src)) => match check_version(&p.to_string_lossy(), Some("Opus SenaV"), "opusenc-senav") {
-            Ok(()) => {
-                eprintln!("  [ok] opusenc-senav (SenaV build) ({}, {src})", p.display());
+        Some((p, src)) => {
+            match check_version(&p.to_string_lossy(), Some("Opus SenaV"), "opusenc-senav") {
+                Ok(()) => {
+                    eprintln!(
+                        "  [ok] opusenc-senav (SenaV build) ({}, {src})",
+                        p.display()
+                    );
+                }
+                Err(e) => {
+                    warnings += 1;
+                    eprintln!("  [warn] opusenc-senav at {} ({src}): {e}", p.display());
+                    eprintln!(
+                        "         impact: treated as absent - automatic senav selection (bitrate > {SENAV_THRESHOLD_KBPS} kbit/s) and --opus-senav will fail."
+                    );
+                }
             }
-            Err(e) => {
-                warnings += 1;
-                eprintln!("  [warn] opusenc-senav at {} ({src}): {e}", p.display());
-                eprintln!("         impact: treated as absent - automatic senav selection (bitrate > {SENAV_THRESHOLD_KBPS} kbit/s) and --opus-senav will fail.");
-            }
-        },
+        }
         None => {
             warnings += 1;
             eprintln!("  [warn] opusenc-senav not found (optional)");
-            eprintln!("         impact: --opus-senav and automatic senav selection (bitrate > {SENAV_THRESHOLD_KBPS} kbit/s) are unavailable;");
-            eprintln!("         encoding still works up to {SENAV_THRESHOLD_KBPS} kbit/s (auto) or at any rate with --opus-original.");
-            eprintln!("         fix: optional - put opusenc-senav.exe next to senaenc.exe ({}) or add its folder to PATH", finder.exe_dir.display());
+            eprintln!(
+                "         impact: --opus-senav and automatic senav selection (bitrate > {SENAV_THRESHOLD_KBPS} kbit/s) are unavailable;"
+            );
+            eprintln!(
+                "         encoding still works up to {SENAV_THRESHOLD_KBPS} kbit/s (auto) or at any rate with --opus-original."
+            );
+            eprintln!(
+                "         fix: optional - put opusenc-senav.exe next to senaenc.exe ({}) or add its folder to PATH",
+                finder.exe_dir.display()
+            );
         }
     }
 
@@ -181,6 +214,7 @@ fn main() {
     let force = args.iter().any(|a| a == "--force");
     let bypass = args.iter().any(|a| a == "--bypass-recommendations");
     let mut hf_tilt_pct: Option<f64> = None;
+    let mut topband_flag: Option<u32> = None;
     let mut rest = vec![];
     let mut i = 0;
     while i < args.len() {
@@ -195,6 +229,14 @@ fn main() {
             }
             "--opus-original" => opus_mode = Some(false),
             "--opus-senav" => opus_mode = Some(true),
+            "--opus-topband-stereo" => {
+                i += 1;
+                let v: u32 = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(0);
+                if !(1..=500).contains(&v) {
+                    usage();
+                }
+                topband_flag = Some(v);
+            }
             "--hf-tilt" => {
                 i += 1;
                 let v: f64 = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(-1.0);
@@ -237,8 +279,41 @@ fn main() {
         eprintln!("       re-run with --bypass-recommendations to encode Sena anyway.");
         std::process::exit(5);
     }
+    let three_track = kbps >= THREE_TRACK_MIN_KBPS;
+    if three_track && account3(kbps, profile).is_none() {
+        // Unreachable for >= 256k with the defined profiles; kept as a guard.
+        eprintln!("error: total bitrate {kbps}k cannot fund the three-track layout");
+        std::process::exit(3);
+    }
     let (xhe_k, opus_k) = account(kbps, profile).unwrap();
+    let mid_k = if three_track {
+        account3(kbps, profile).unwrap().1
+    } else {
+        opus_k
+    };
     let use_senav = opus_mode.unwrap_or(kbps > SENAV_THRESHOLD_KBPS);
+
+    // Topband-stereo resolution (mid encode only; the 15600 Hz+ top track
+    // never gets the knob):
+    // - explicit flag wins, passed through verbatim (no Sena arithmetic);
+    // - under --opus-original it is meaningless: warn and ignore;
+    // - opus-senav two-track in [192, 256) defaults to the Opus budget;
+    // - the three-track layout has no top bands in the mid encode -> off.
+    let topband_kbps = if !use_senav {
+        if let Some(v) = topband_flag {
+            eprintln!(
+                "senaenc: warning: --opus-topband-stereo {v} ignored (--opus-original selected)"
+            );
+        }
+        None
+    } else if let Some(v) = topband_flag {
+        Some(v)
+    } else if !three_track && TOPBAND_DEFAULT_RANGE.contains(&kbps) {
+        Some(mid_k)
+    } else {
+        None
+    };
+
     let stdin_input = input.as_os_str() == "-";
     if output.exists() && !force {
         if stdin_input || !std::io::stdin().is_terminal() {
@@ -259,14 +334,45 @@ fn main() {
             std::process::exit(1);
         }
     }
-    eprintln!(
-        "senaenc: profile @{}  total {}k -> xHE-AAC {}k (deducted) + Opus {}k ({})",
-        profile.crossover_hz(),
-        kbps,
-        xhe_k,
-        opus_k,
-        if use_senav { "opusenc-senav" } else { "opusenc (original)" }
-    );
+    if three_track {
+        eprintln!(
+            "senaenc: profile @{}  total {}k -> xHE-AAC {}k (deducted) + Opus mid {}k (600 Hz..15.6 kHz) + Opus top {}k (15.6 kHz+, {}) [{}]{}",
+            profile.crossover_hz(),
+            kbps,
+            xhe_k,
+            mid_k,
+            sena_core::HF_TRACK_KBPS,
+            if use_senav {
+                "opusenc-senav"
+            } else {
+                "opusenc (original)"
+            },
+            three_track_tag(profile),
+            if let Some(t) = topband_kbps {
+                format!("  topband-stereo={t}")
+            } else {
+                String::new()
+            }
+        );
+    } else {
+        eprintln!(
+            "senaenc: profile @{}  total {}k -> xHE-AAC {}k (deducted) + Opus {}k ({}){}",
+            profile.crossover_hz(),
+            kbps,
+            xhe_k,
+            mid_k,
+            if use_senav {
+                "opusenc-senav"
+            } else {
+                "opusenc (original)"
+            },
+            if let Some(t) = topband_kbps {
+                format!("  topband-stereo={t}")
+            } else {
+                String::new()
+            }
+        );
+    }
 
     // locate binaries: same dir as the executable first (with Windows
     // .exe/PATHEXT variants), then PATH
@@ -276,7 +382,11 @@ fn main() {
         std::process::exit(4);
     });
     let exhale = exhale.to_string_lossy().into_owned();
-    let opus_name = if use_senav { "opusenc-senav" } else { "opusenc" };
+    let opus_name = if use_senav {
+        "opusenc-senav"
+    } else {
+        "opusenc"
+    };
     let (opusenc, _) = finder.find(opus_name).unwrap_or_else(|| {
         eprintln!("error: {opus_name} not found next to senaenc or on PATH");
         std::process::exit(4);
@@ -288,6 +398,8 @@ fn main() {
         profile,
         total_kbps: kbps,
         use_senav,
+        three_track,
+        topband_kbps,
         exhale: &exhale,
         opusenc: &opusenc,
         workdir: &wd,
