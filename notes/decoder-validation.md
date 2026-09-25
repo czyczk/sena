@@ -52,3 +52,40 @@ Encoder note: `find_aus` now uses the MP4 `stco` first chunk offset instead
 of a hard-coded 2-byte mdat preamble. Some exhale outputs have a 3-byte
 preamble, which previously shifted every AU by one byte and made rxaac-dec
 panic/error. Fixed and re-verified above.
+
+## Streaming path guard-context fix (2026-09-21)
+
+While validating the ffmpeg demuxer (which drives the streaming C ABI),
+chunk-boundary seams were found in the streaming output: a fresh zero-phase
+resampler per ~100 ms chunk left every chunk head/tail without FIR guard
+context (measured: periodic seams up to 0.12 peak, -65.6 dB RMS vs ref32,
+12.5 dB worse than the whole-file path).
+
+Fix in `crates/sena-dec/src/stream.rs`: retain `Resampler::guard_frames()`
+core samples of consumed LF raw as the next chunk's left context and emit
+only outputs with complete right context (EOF tail excepted, matching the
+whole-file zero-padding), plus zero the warmup AU region when a seek anchors
+at AU 0. Measured after the fix (same assets as the table above):
+
+- streaming vs whole-file `pipeline::decode`: **bit-exact** for
+  `01__p300__lfa__hf144`; <= 3.6e-12 max diff (f32 ulp, FFT block-size
+  rounding) for the other five assets;
+- streaming vs archived ref32 (`01__p300`): RMS -78.03 dB, identical to the
+  whole-file path's documented value;
+- locked by `stream::tests::streaming_matches_whole_file_pipeline`.
+
+The same fix covers every C ABI host (foobar2000, ffmpeg/LAV demuxer).
+
+Seek caveat documented while testing: decoding from an independency-flag AU
+after `sena_dec_seek` is *not* sample-exact with continuous decoding
+(LPD prev-frame state + free-running eSBR noise/sine counters are not in the
+bitstream; ~100-200 ms LPD warmup transient on loud content, persistent
+envelope-identical noise difference ~1e-4..1.7e-3). Cross-checked with
+rxaac-dec (2026-09-21): the AOSP C reference shows the identical residual
+(-25..-41 dB) and rxaac is faithful to it (-73..-80 dB), so this is
+format-inherent, not a decoder defect; extra non-independent preroll AUs do
+not reliably converge. Sena e2e streams carry AudioPreroll only in AU 0
+(`examples/lf_au_scan.rs`), so indep-AU seek is the best available random
+access. See `examples/lf_preroll_probe.rs` and
+`notes/ffmpeg-lav-plugin.md` section 4.2.
+

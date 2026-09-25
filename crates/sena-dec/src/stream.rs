@@ -115,6 +115,20 @@ struct State {
     /// Seek (true): keep the raw LF context before the trim point so the
     /// zero-phase resampler has real audio instead of zeros (start: false).
     lf_trim_after: bool,
+    /// The LF resampler (16k/32k -> 48k zero-phase). Kernel data only, built
+    /// once per (re)start; `guard_frames()` of it is the core-sample context
+    /// retained at the `lf_raw` head and required beyond the emitted range,
+    /// so every emitted output has complete kernel support and equals the
+    /// whole-file decode.
+    lf_resampler: Resampler,
+    /// Core samples at the `lf_raw` head kept purely as resampler context
+    /// (already accounted in the playable timeline).
+    lf_ctx: usize,
+    /// Core samples at the decode start to replace with zeros: at a seek
+    /// anchored at AU 0 the warmup AU would otherwise leak into the resampler
+    /// context, while the whole-file decode treats everything before the
+    /// 1024-sample trim as nonexistent (zero).
+    lf_zero_prefix: usize,
     xdec: UsacDecoder,
     opus: OpusDecoder,
     frame_index: usize,
@@ -200,6 +214,9 @@ impl StreamingDecoder {
             lf_skip_aus: 0,
             hf_skip_pkts: 0,
             lf_trim_after: false,
+            lf_resampler: Resampler::new(lf_rate, SAMPLE_RATE),
+            lf_ctx: 0,
+            lf_zero_prefix: 0,
             xdec,
             opus,
             frame_index: 0,
@@ -263,6 +280,11 @@ impl StreamingDecoder {
             let samples = out.len() / st.xdec.num_channels();
             if samples == 0 || samples * st.xdec.num_channels() != out.len() {
                 return Err(DecodeError::Codec("rxaac returned a non-integral frame".into()));
+            }
+            if st.lf_zero_prefix > 0 {
+                let n = st.lf_zero_prefix.min(samples);
+                out[..n * 2].fill(0.0);
+                st.lf_zero_prefix -= n;
             }
             st.lf_raw.extend(out);
             st.lf_infos.push(LfAuInfo {
@@ -374,17 +396,23 @@ impl StreamingDecoder {
     }
 
     fn produce_chunk(&mut self) -> Result<(), DecodeError> {
-        let lf_skip = {
+        let (lf_skip, hf_skip, trim_after) = {
             let st = self.state.as_ref().unwrap();
-            if st.first { st.lf_trim } else { 0 }
+            let first = st.first;
+            (
+                if first { st.lf_trim } else { 0 },
+                if first { st.hf_trim } else { 0 },
+                first && st.lf_trim_after,
+            )
         };
-        let hf_skip = {
+        let (ctx, guard, raw_empty) = {
             let st = self.state.as_ref().unwrap();
-            if st.first { st.hf_trim } else { 0 }
-        };
-        let raw_empty = {
-            let st = self.state.as_ref().unwrap();
-            st.lf_raw.len() <= lf_skip * 2 || st.hf_raw.len() <= hf_skip * 2
+            // Fresh = buffered beyond the retained left context and the
+            // one-time leading trim (at a seek the trim region is itself
+            // kept as context).
+            let fresh_lf = (st.lf_raw.len() / 2).saturating_sub(st.lf_ctx + if trim_after { 0 } else { lf_skip });
+            let fresh_hf = (st.hf_raw.len() / 2).saturating_sub(hf_skip);
+            (st.lf_ctx, st.lf_resampler.guard_frames(), fresh_lf == 0 || fresh_hf == 0)
         };
         if raw_empty {
             let st = self.state.as_mut().unwrap();
@@ -399,13 +427,25 @@ impl StreamingDecoder {
             return Ok(());
         }
 
-        let (lf48, lf_off, hf_after, take, start, rate, lf_consume_core) = {
+        let (lf48, lf_off, hf_after, take, start, rate, lf_pass_core, lf_consume_core) = {
             let st = self.state.as_ref().unwrap();
-            let trim_after = st.lf_trim_after;
+            let resampler = &st.lf_resampler;
+            // The resample window is the whole pending LF raw: retained left
+            // context plus fresh samples. Dropping the context's outputs
+            // afterwards keeps every emitted output on the whole-file phase
+            // grid with complete kernel support (chunked decode then equals
+            // the whole-file pipeline, instead of ringing at every chunk
+            // boundary as a fresh zero-context window would).
+            let raw_drop = if trim_after { 0 } else { lf_skip };
+            // Context inside the resample window (its outputs are dropped
+            // after resampling): the retained left context, plus the
+            // pre-target region after a seek.
+            let window_front_core = ctx.max(raw_drop) - raw_drop + if trim_after { lf_skip } else { 0 };
+            let front_core = raw_drop + window_front_core;
             let lf_after: Vec<f64> = st
                 .lf_raw
                 .iter()
-                .skip(if trim_after { 0 } else { lf_skip * 2 })
+                .skip(raw_drop * 2)
                 .map(|&s| f64::from(s))
                 .collect();
             let hf_after: Vec<f64> = st
@@ -414,17 +454,24 @@ impl StreamingDecoder {
                 .skip(hf_skip * 2)
                 .map(|&s| f64::from(s))
                 .collect();
-            let resampler = Resampler::new(st.lf_rate, SAMPLE_RATE);
             let lf48 = resampler.process(&lf_after, 2);
-            // Seek: the pre-target raw stays as the resampler context; the
-            // corresponding output prefix is skipped after resampling.
-            let lf_off = if trim_after { resampler.output_frames(lf_skip) } else { 0 };
-            let n = (lf48.len() / 2).saturating_sub(lf_off).min(hf_after.len() / 2);
+            let lf_off = resampler.output_frames(window_front_core);
+            // Without a right guard the window tail would ring; emit only
+            // fully-supported outputs until the LF stream is finished (the
+            // zero-padded tail at EOF matches the whole-file decode).
+            let window_core = lf_after.len() / 2;
+            let right_cap = if st.finished {
+                lf48.len() / 2
+            } else {
+                resampler.output_frames(window_core.saturating_sub(guard))
+            };
+            let n = right_cap.saturating_sub(lf_off).min(hf_after.len() / 2);
             let remaining = self.info.playable_frames.saturating_sub(st.produced);
             let mut take = (n as u64).min(remaining) as usize;
             // The rational ratio only represents some output counts exactly;
             // trim up to 2 frames from the chunk so the resampler can map the
-            // raw count one-to-one (the frames are emitted by the next chunk).
+            // consumed core count one-to-one (the frames are emitted by the
+            // next chunk).
             let consume_core = loop {
                 if take == 0 {
                     return Ok(());
@@ -434,13 +481,15 @@ impl StreamingDecoder {
                 }
                 take -= 1;
             };
-            // Raw consumed for `take` outputs counted from the trimmed
-            // (seek) point; the pre-target raw stays as context.
-            let lf_consume_core = consume_core.min(lf_after.len() / 2);
+            // Core samples passed over from the `lf_raw` head up to the new
+            // fresh base: context/trim region plus the consumed fresh part.
+            let fresh_cap = window_core.saturating_sub(window_front_core);
+            let lf_consume_core = consume_core.min(fresh_cap);
+            let lf_pass_core = front_core + lf_consume_core;
             let start = st.produced;
             let end = start + take as u64;
             let rate = self.chunk_bits(st.lf_rate, st.lf_trim, st.hf_trim, &st.lf_infos, &st.opus_infos, start, end);
-            (lf48, lf_off, hf_after, take, start, rate, lf_consume_core)
+            (lf48, lf_off, hf_after, take, start, rate, lf_pass_core, lf_consume_core)
         };
 
         let gain = 1.0 / PRE_GAIN;
@@ -458,14 +507,15 @@ impl StreamingDecoder {
             let st = self.state.as_mut().unwrap();
             st.output.extend(chunk_out);
             st.produced = start + take as u64;
-            // The pre-target raw stays as resampler context on seeks; the
-            // consumed raw covers the trimmed part plus the take part.
-            for _ in 0..(lf_skip + lf_consume_core) * 2 {
-                st.lf_raw.pop_front();
-            }
-            for _ in 0..(hf_skip + take) * 2 {
-                st.hf_raw.pop_front();
-            }
+            // Retain the last `lf_guard` core samples of the passed region as
+            // the next chunk's left context; drop everything older.
+            let retain = lf_pass_core.min(st.lf_resampler.guard_frames());
+            st.lf_raw.drain(..(lf_pass_core - retain) * 2);
+            st.lf_ctx = retain;
+            st.hf_raw.drain(..(hf_skip + take) * 2);
+            // `lf_consume_core` bookkeeping for the bit accounting: the infos
+            // track the fresh timeline, which advances by the consumed count
+            // (the retained context was consumed by earlier chunks).
             Self::trim_lf_infos(&mut st.lf_infos, lf_consume_core as i128);
             Self::trim_opus_infos(&mut st.opus_infos, take as i128);
             st.first = false;
@@ -497,7 +547,10 @@ impl StreamingDecoder {
                     let st = self.state.as_ref().unwrap();
                     let lf_ready = {
                         let trim = if st.first { st.lf_trim as i128 } else { 0 };
-                        let core = (st.lf_raw.len() / 2) as i128 - trim;
+                        // The retained context and (until EOF) the right guard
+                        // are resampler context, not emittable output.
+                        let reserve = st.lf_ctx as i128 + if st.finished { 0 } else { st.lf_resampler.guard_frames() as i128 };
+                        let core = (st.lf_raw.len() / 2) as i128 - trim - reserve;
                         (core * 48_000 / st.lf_rate as i128).max(0) as u64
                     };
                     let hf_ready = {
@@ -578,11 +631,18 @@ impl StreamingDecoder {
         self.cursor
     }
 
-    /// Jump seek: xHE-AAC streams mark independent random-access AUs with
-    /// the USAC independency flag (the first payload bit); a fresh decoder
-    /// started at such an AU is bit-exact with sequential decoding, so the
-    /// seek decodes only a handful of AUs instead of the whole prefix.
-    /// Opus packets are independent and jump directly by index.
+    /// Jump seek: xHE-AAC streams mark random-access AUs with the USAC
+    /// independency flag (the first payload bit); a fresh decoder started at
+    /// such an AU is structurally valid (no references before it), so the
+    /// seek decodes only a handful of AUs instead of the whole prefix. Note
+    /// this is not sample-exact with the continuous decode — LPD prev-frame
+    /// state and the free-running eSBR noise/sine counters are simply not
+    /// carried in the bitstream; cross-checked with rxaac and the AOSP C
+    /// reference: format-inherent, identical residual in the C testbench
+    /// (see examples/lf_preroll_probe.rs and notes/ffmpeg-lav-plugin.md
+    /// 4.2). exhale emits no mid-stream AudioPreroll AUs in Sena files
+    /// (AU 0 only), so the indep-AU jump is the best available random
+    /// access. Opus packets are independent and jump directly by index.
     pub fn seek(&mut self, frame: u64) -> Result<(), DecodeError> {
         if frame > self.info.playable_frames {
             return Err(DecodeError::Format("seek past playable length".into()));
@@ -621,6 +681,11 @@ impl StreamingDecoder {
             st.lf_skip_aus = start_au;
             st.hf_skip_pkts = j0;
             st.lf_trim_after = true;
+            st.lf_zero_prefix = if start_au == 0 {
+                crate::pipeline::XHE_TRIM_CORE_SAMPLES
+            } else {
+                0
+            };
         }
         Ok(())
     }
@@ -691,6 +756,38 @@ mod tests {
             max_prefix = max_prefix.max(dec.bits_prefix.len());
         }
         assert!(max_prefix <= 100_000, "bits_prefix grew to {max_prefix} entries after seek");
+    }
+
+    /// The streaming decoder must equal the whole-file pipeline: with the
+    /// zero-phase resampler guard context retained across chunks there are no
+    /// chunk-boundary seams (pre-fix: periodic 100 ms seams up to 0.12 peak).
+    /// Tolerance covers FFT-block-size rounding across platforms; on x86_64
+    /// the outputs are bit-identical for the e2e assets.
+    #[test]
+    fn streaming_matches_whole_file_pipeline() {
+        for asset in ["01__p300__lfa__hf144", "01__p600__lfd__hf136", "05__p300__lfa__hf144", "09__p600__lfd__hf136"] {
+            let path = format!("{}/../../assets/e2e/{asset}.sena", env!("CARGO_MANIFEST_DIR"));
+            let bytes = std::fs::read(&path).unwrap();
+            let whole = crate::pipeline::decode(&Demuxed::parse(bytes.clone()).unwrap()).unwrap();
+            let whole_pcm = whole.pcm_f64();
+            let mut dec = StreamingDecoder::open(Demuxed::parse(bytes).unwrap()).unwrap();
+            let mut streamed = Vec::new();
+            let mut buf = vec![0.0f32; 4096 * 2];
+            loop {
+                let n = dec.read_f32(&mut buf, 4096).unwrap();
+                if n == 0 {
+                    break;
+                }
+                streamed.extend_from_slice(&buf[..n as usize * 2]);
+            }
+            assert_eq!(streamed.len(), whole_pcm.len(), "{asset}: length");
+            let max = streamed
+                .iter()
+                .zip(whole_pcm.iter())
+                .map(|(s, w)| (*s as f64 - *w as f32 as f64).abs())
+                .fold(0.0f64, f64::max);
+            assert!(max <= 1e-6, "{asset}: max streaming-vs-whole-file diff {max}");
+        }
     }
 
     /// Regression guard for the foobar2000 macOS stack overflow: the fb2k

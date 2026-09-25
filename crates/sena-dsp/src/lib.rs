@@ -222,6 +222,15 @@ impl Resampler {
         (input_frames * self.n + self.m / 2) / self.m
     }
 
+    /// Context, in input frames, that a windowed consumer must keep on each
+    /// side of the emitted range so that every emitted output has complete
+    /// kernel support (windowed output then equals the corresponding range of
+    /// a whole-buffer `process`). Rounded up to a whole decimation cycle so
+    /// the output phase grid is preserved across window boundaries.
+    pub fn guard_frames(&self) -> usize {
+        self.guard_in.div_ceil(self.m.max(1)) * self.m.max(1)
+    }
+
     /// Smallest number of input frames whose whole-buffer resample yields at
     /// least `output_frames`, clamped to at most `output_frames` (the exact
     /// prefix length used by streaming consumers). Returns `None` when the
