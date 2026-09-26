@@ -530,20 +530,74 @@ pub fn decode(demux: &Demuxed) -> Result<Decoded, DecodeError> {
         return Err(DecodeError::Format("container has no audio blocks".into()));
     }
 
-    // The track decodes are independent: run them concurrently (the
-    // whole-file path is the senadec CLI / validation route; the product
-    // streaming decoder consumes the tracks interleaved instead).
+    // The track decodes are independent, and so is each track's
+    // post-decode DSP (LF warmup trim + upsample, mid pre-skip trim, top
+    // band upsample + shift-back + pre-skip trim): run all of it
+    // concurrently so the whole-file path overlaps the DSP with the codec
+    // decodes instead of serializing it after them (the product streaming
+    // decoder consumes the tracks interleaved instead).
     let (lf_res, mid_res, hf2_res) = std::thread::scope(|s| {
-        let hlf = s.spawn(|| decode_lf(lf_track, &lf_frames, &asc));
-        let hmid = s.spawn(|| decode_opus(&hf_frames, &opus_head, SAMPLE_RATE));
+        let hlf = s.spawn(|| -> Result<(Vec<f64>, Vec<LfAuInfo>, usize, usize), DecodeError> {
+            let (lf_raw, lf_infos, core_rate, lf_errors) = decode_lf(lf_track, &lf_frames, &asc)?;
+            let lf_trim = XHE_TRIM_CORE_SAMPLES;
+            if lf_raw.len() < lf_trim * 2 {
+                return Err(DecodeError::ShortOutput {
+                    have: (lf_raw.len() / 2) as u64,
+                    need: lf_trim as u64,
+                });
+            }
+            let lf_after: Vec<f64> = lf_raw[lf_trim * 2..]
+                .iter()
+                .map(|&s| f64::from(s))
+                .collect();
+            let lf48 = Resampler::new(core_rate as u32, SAMPLE_RATE).process(&lf_after, 2);
+            Ok((lf48, lf_infos, core_rate, lf_errors))
+        });
+        let hmid =
+            s.spawn(|| -> Result<(Vec<f64>, Vec<OpusPacketInfo>), DecodeError> {
+                let (hf_raw, opus_infos) = decode_opus(&hf_frames, &opus_head, SAMPLE_RATE)?;
+                let hf_skip = opus_head.pre_skip as usize;
+                if hf_raw.len() < hf_skip * 2 {
+                    return Err(DecodeError::ShortOutput {
+                        have: (hf_raw.len() / 2) as u64,
+                        need: hf_skip as u64,
+                    });
+                }
+                let hf_after: Vec<f64> = hf_raw[hf_skip * 2..]
+                    .iter()
+                    .map(|&s| f64::from(s))
+                    .collect();
+                Ok((hf_after, opus_infos))
+            });
         let htop = s.spawn(
-            || -> Result<(Vec<f32>, Vec<OpusPacketInfo>, OpusHead), DecodeError> {
+            || -> Result<(Vec<f64>, Vec<OpusPacketInfo>, OpusHead), DecodeError> {
                 match &hf2_track {
                     Some(t) => {
                         let head = parse_opus_head(&t.codec_private)?;
-                        let (raw, infos) =
+                        let (raw16, infos) =
                             decode_opus(&hf2_frames, &head, sena_core::HF_TRACK_RATE)?;
-                        Ok((raw, infos, head))
+                        // The A_OPUSHF stream decodes at 16 kHz: upsample
+                        // back to 48 kHz (zero-phase, grid-exact x3), shift
+                        // the baseband content back up to the 15.6 kHz+
+                        // band, then drop the pre-skip (48 kHz units).
+                        let hf2_skip = head.pre_skip as usize;
+                        let raw: Vec<f64> = raw16.iter().map(|&s| f64::from(s)).collect();
+                        let up =
+                            Resampler::new(sena_core::HF_TRACK_RATE, SAMPLE_RATE).process(&raw, 2);
+                        if up.len() < hf2_skip * 2 {
+                            return Err(DecodeError::ShortOutput {
+                                have: (up.len() / 2) as u64,
+                                need: hf2_skip as u64,
+                            });
+                        }
+                        let shifted = sena_dsp::shift_up_offset(
+                            &up,
+                            2,
+                            sena_core::HF_SPLIT_HZ,
+                            SAMPLE_RATE,
+                            -(hf2_skip as i64),
+                        );
+                        Ok((shifted[hf2_skip * 2..].to_vec(), infos, head))
                     }
                     None => Ok((
                         Vec::new(),
@@ -566,65 +620,14 @@ pub fn decode(demux: &Demuxed) -> Result<Decoded, DecodeError> {
             j3.unwrap_or_else(|e| std::panic::resume_unwind(e)),
         )
     });
-    let (lf_raw, lf_infos, core_rate, lf_errors) = lf_res?;
-    let (hf_raw, opus_infos) = mid_res?;
-    let (hf2_raw, hf2_infos, hf2_head) = hf2_res?;
+    let (lf48, lf_infos, core_rate, lf_errors) = lf_res?;
+    let (hf48, opus_infos) = mid_res?;
+    let (hf2_after, hf2_infos, hf2_head) = hf2_res?;
     if lf_errors != 0 {
         warnings.push(format!(
             "{lf_errors} LF AU decode errors replaced by silence"
         ));
     }
-
-    // Leading trims.
-    let lf_trim = XHE_TRIM_CORE_SAMPLES;
-    if lf_raw.len() < lf_trim * 2 {
-        return Err(DecodeError::ShortOutput {
-            have: (lf_raw.len() / 2) as u64,
-            need: lf_trim as u64,
-        });
-    }
-    let lf_after: Vec<f64> = lf_raw[lf_trim * 2..]
-        .iter()
-        .map(|&s| f64::from(s))
-        .collect();
-    let hf_skip = opus_head.pre_skip as usize;
-    if hf_raw.len() < hf_skip * 2 {
-        return Err(DecodeError::ShortOutput {
-            have: (hf_raw.len() / 2) as u64,
-            need: hf_skip as u64,
-        });
-    }
-    let hf_after: Vec<f64> = hf_raw[hf_skip * 2..]
-        .iter()
-        .map(|&s| f64::from(s))
-        .collect();
-    let hf2_skip = hf2_head.pre_skip as usize;
-    let hf2_after: Vec<f64> = if three_track {
-        // The A_OPUSHF stream decodes at 16 kHz: upsample back to 48 kHz
-        // (zero-phase, grid-exact x3), shift the baseband content back up
-        // to the 15.6 kHz+ band, then drop the pre-skip (48 kHz units).
-        let raw16: Vec<f64> = hf2_raw.iter().map(|&s| f64::from(s)).collect();
-        let up = Resampler::new(sena_core::HF_TRACK_RATE, SAMPLE_RATE).process(&raw16, 2);
-        if up.len() < hf2_skip * 2 {
-            return Err(DecodeError::ShortOutput {
-                have: (up.len() / 2) as u64,
-                need: hf2_skip as u64,
-            });
-        }
-        let shifted = sena_dsp::shift_up_offset(
-            &up,
-            2,
-            sena_core::HF_SPLIT_HZ,
-            SAMPLE_RATE,
-            -(hf2_skip as i64),
-        );
-        shifted[hf2_skip * 2..].to_vec()
-    } else {
-        Vec::new()
-    };
-
-    let lf48 = Resampler::new(core_rate as u32, SAMPLE_RATE).process(&lf_after, 2);
-    let hf48 = hf_after;
 
     let n = (lf48.len() / 2).min(hf48.len() / 2).min(if three_track {
         hf2_after.len() / 2
@@ -656,9 +659,9 @@ pub fn decode(demux: &Demuxed) -> Result<Decoded, DecodeError> {
         &lf_infos,
         core_rate,
         &opus_infos,
-        hf_skip,
+        opus_head.pre_skip as usize,
         &hf2_infos,
-        hf2_skip,
+        hf2_head.pre_skip as usize,
     );
 
     let audio_sha256 = demux

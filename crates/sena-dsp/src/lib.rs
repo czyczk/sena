@@ -819,25 +819,52 @@ pub fn hilbert_taps() -> Vec<f64> {
 /// SSB shift core: out[i] = x[i]*cos(w*(origin+i)) -/+ H{x}[i]*sin(w*(...))
 /// with w = 2*pi*fc/fs; `up` selects the sign (down: +sin, up: -sin).
 /// `origin` is the absolute frame index carried by output frame 0 (the
-/// carrier phase reference; negative values are fine).
+/// carrier phase reference; negative values are fine). Channels run on
+/// separate threads for large inputs (same threshold class as the
+/// crossover fills); values are identical to the serial evaluation.
 fn ssb_shift(x: &[f64], ch: usize, fc: f64, fs: u32, origin: i64, up: bool) -> Vec<f64> {
     let h = hilbert_taps();
     let d = HILBERT_DELAY;
     let n = x.len() / ch;
     let w0 = 2.0 * std::f64::consts::PI * fc / fs as f64;
-    let mut out = vec![0.0; x.len()];
-    for c in 0..ch {
+    let shift_channel = |c: usize, dst: &mut Vec<f64>| {
+        dst.clear();
+        dst.reserve(n);
         let mono: Vec<f64> = x.iter().skip(c).step_by(ch).copied().collect();
         let conv = fftconvolve_mono(&mono, &h);
         for i in 0..n {
             let ph = w0 * (origin + i as i64) as f64;
             let (s, co) = ph.sin_cos();
             let q = conv[i + d];
-            out[i * ch + c] = if up {
+            dst.push(if up {
                 mono[i] * co - q * s
             } else {
                 mono[i] * co + q * s
-            };
+            });
+        }
+    };
+    let mut chans: Vec<Vec<f64>> = vec![Vec::new(); ch];
+    let threads = std::thread::available_parallelism()
+        .map(|t| t.get())
+        .unwrap_or(1)
+        .min(ch)
+        .min(16);
+    if threads > 1 && n >= 16 * 1024 {
+        let f = &shift_channel;
+        std::thread::scope(|s| {
+            for (c, dst) in chans.iter_mut().enumerate() {
+                s.spawn(move || f(c, dst));
+            }
+        });
+    } else {
+        for (c, dst) in chans.iter_mut().enumerate() {
+            shift_channel(c, dst);
+        }
+    }
+    let mut out = Vec::with_capacity(x.len());
+    for i in 0..n {
+        for c in 0..ch {
+            out.push(chans[c][i]);
         }
     }
     out
@@ -932,14 +959,45 @@ impl ShiftStream {
         let conv = self.win_convolve(ch, n);
         let w0 = 2.0 * std::f64::consts::PI * self.fc / self.fs as f64;
         let mut out = vec![0.0; cnt * ch];
-        for j in 0..cnt {
-            let gi = self.emitted + j;
-            let wi = gi - self.win_start;
-            let ph = w0 * gi as f64;
-            let (s, co) = ph.sin_cos();
-            for c in 0..ch {
-                // down-shift: Re{(x + j*H{x}) * e^{-jwt}} = x*cos + H{x}*sin
-                out[j * ch + c] = self.win[wi * ch + c] * co + conv[(wi + d) * ch + c] * s;
+        // Every output frame is independent: fill in parallel for large
+        // chunks (same pattern as the crossover emit).
+        let threads = std::thread::available_parallelism()
+            .map(|t| t.get())
+            .unwrap_or(1)
+            .min(16);
+        if threads > 1 && cnt >= 16 * 1024 {
+            let chunk = cnt.div_ceil(threads) * ch;
+            std::thread::scope(|s| {
+                for (idx, part) in out.chunks_mut(chunk).enumerate() {
+                    let j0 = idx * (chunk / ch);
+                    let self_ref = &*self;
+                    let conv_ref = &conv;
+                    s.spawn(move || {
+                        for (jj, o) in part.chunks_mut(ch).enumerate() {
+                            let j = j0 + jj;
+                            let gi = self_ref.emitted + j;
+                            let wi = gi - self_ref.win_start;
+                            let ph = w0 * gi as f64;
+                            let (sn, co) = ph.sin_cos();
+                            for c in 0..ch {
+                                // down-shift: Re{(x + j*H{x}) e^{-jwt}}
+                                o[c] = self_ref.win[wi * ch + c] * co
+                                    + conv_ref[(wi + d) * ch + c] * sn;
+                            }
+                        }
+                    });
+                }
+            });
+        } else {
+            for j in 0..cnt {
+                let gi = self.emitted + j;
+                let wi = gi - self.win_start;
+                let ph = w0 * gi as f64;
+                let (s, co) = ph.sin_cos();
+                for c in 0..ch {
+                    // down-shift: Re{(x + j*H{x}) * e^{-jwt}} = x*cos + H{x}*sin
+                    out[j * ch + c] = self.win[wi * ch + c] * co + conv[(wi + d) * ch + c] * s;
+                }
             }
         }
         self.emitted += cnt;

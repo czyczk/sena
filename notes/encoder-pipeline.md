@@ -95,27 +95,37 @@ parallel:
 
 (Old codec stage ~8 s / ~4.5 s sequential; total ~5.7x / ~4.4x faster.)
 
-## Parallelism map (2026-09-25)
+## Parallelism map (2026-09-25; audited 2026-09-26 for the shift chain)
 
 What runs concurrently, end to end:
 
 - DSP kernels are internally threaded across outputs/channels for large
-  chunks (polyphase resampler emit, both crossover FFT fills; threshold
+  chunks (polyphase resampler emit, both crossover FFT fills, the SSB
+  shift batch channels and the ShiftStream emit fill; threshold
   16K frames/channels).
 - Three-track chunks run the LF branch (downsample + LF write) and the HF
-  branch (15600 Hz split + tilt + mid/top writes) on two scoped threads -
-  the p600 LF downsample no longer serializes behind the second crossover.
-  Two-track keeps the sequential order (its HF branch is a fraction of the
-  LF branch, and SENAENC_TIME stage sums stay comparable with the tables
-  above). With overlapped branches the three-track SENAENC_TIME sum can
-  exceed the wall time.
+  branch (15600 Hz split + tilt + mid write + top-band shift/downsample/
+  write) on two scoped threads - the p600 LF downsample no longer
+  serializes behind the second crossover. Inside the HF branch the mid
+  lane stays serial with the top lane (audit 2026-09-26: the mid lane is
+  tilt + one write, a per-chunk spawn costs more than it overlaps -
+  measured +15-25 ms on an equivalent two-track split; the shift chain is
+  the long pole and is already on the parallel branch). Two-track keeps
+  the sequential order (same measurement: its HF branch is a fraction of
+  the LF branch, and per-chunk spawns regress the wall time). With
+  overlapped branches the three-track SENAENC_TIME sum can exceed the
+  wall time.
 - The codec subprocesses (exhale, opusenc mid, opusenc top) spawn together
   and each is drained on its own thread (a chatty child can no longer stall
   on a full pipe while an earlier one is waited on). Verified: the 3-track
   e2e asset is bit-identical whether the band branches run sequentially or
   concurrently.
 - Whole-file decode (senadec CLI / validation) decodes the tracks
-  concurrently (LF / mid / top on scoped threads).
+  concurrently (LF / mid / top on scoped threads); since the shift rework
+  each track's post-decode DSP (LF warmup trim + upsample, mid pre-skip
+  trim, top-band 16k->48k upsample + shift-back + pre-skip trim) also runs
+  inside its track thread instead of serializing after the joins (3-track
+  whole-file decode -44%, two-track -10% wall, outputs bit-identical).
 
 Deliberately not parallelized:
 
