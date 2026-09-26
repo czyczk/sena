@@ -20,3 +20,11 @@
       verified bit-identical), whole-file decode decodes the three tracks
       concurrently; documented what stays sequential (streaming decoder,
       codec-vs-DSP overlap)
+- [x] 9. top track rework: direct 48 kHz coding replaced by SSB shift to
+      baseband + 16 kHz stream (sena-dsp Hilbert/ShiftStream + tests,
+      encoder chain, decoder 16k->48k upsample + shift-up in whole-file and
+      streaming paths incl. seek context back-off, container rate 16000,
+      e2e asset regenerated). Also fixed a latent streaming-decoder bug the
+      new chunk pattern exposed: the LF resampler window drain must stay on
+      the decimation grid (a 3/2-ratio drain by an odd core count shifted
+      all later LF output by half a frame).

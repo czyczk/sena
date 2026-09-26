@@ -9,7 +9,14 @@ and produce three tracks:
 
 - `A_SENALF`: unchanged exhale LF encode at the profile's deduction.
 - `A_OPUS` (mid): 600 Hz - 15600 Hz at `total - deduct - 64` kbit/s.
-- `A_OPUSHF` (top): 15600 Hz - Nyquist at a fixed 64 kbit/s nominal.
+- `A_OPUSHF` (top): the 15600 Hz+ band, SSB-shifted down to baseband and
+  carried as a 16 kHz stream at a fixed 64 kbit/s nominal.
+
+Rationale for the shift: a track whose content sits only above 15.6 kHz
+starves under the codec's content-blind band allocation (the empty low
+bands keep their share and the coded band set collapses); shifted to
+baseband, the same content is coded normally and the 64 kbit/s nominal is
+actually spent on it.
 
 This applies to both profiles (@300/@600) and both opus modes
 (`--opus-senav` and `--opus-original`); the opus mode selects the binary
@@ -19,8 +26,8 @@ concurrently.
 #### Scenario: 256 kbit/s senav encode
 - GIVEN a stereo source, `--profile 600 --opus-senav 256`
 - THEN exhale codes the LF band (32 kbit/s deducted), the mid band is
-  encoded by opusenc-senav at 160 kbit/s, the top band by opusenc-senav at
-  64 kbit/s, and `SENA_PROFILE` is `600@15600`.
+  encoded by opusenc-senav at 160 kbit/s, the shifted top band by
+  opusenc-senav at 64 kbit/s, and `SENA_PROFILE` is `600@15600`.
 
 #### Scenario: totals above 256
 - GIVEN a total of 320 kbit/s with the three-track layout
@@ -31,12 +38,28 @@ concurrently.
 The 15600 Hz split SHALL use a linear-phase FIR low-pass with subtractive
 complement, Kaiser beta 9.0, 2001 taps, -6 dB cutoff at 15480 Hz and a
 240 Hz transition (stopband at 15600 Hz), so the mid track carries
-essentially nothing at or above b19 and the top track carries b19+b20.
+essentially nothing at or above b19 and the top band carries b19+b20.
 Mid + top SHALL reconstruct the 600 Hz-high band exactly.
 
 #### Scenario: Complementary reconstruction at 15600 Hz
 - GIVEN the mid and top band signals
 - THEN mid + top equals the 600 Hz-high band within floating-point noise.
+
+### Requirement: Top-band shift chain
+The top band SHALL be shifted down by the split frequency before encoding:
+the analytic signal (windowed Hilbert FIR, 8001 taps, Kaiser beta 9,
+zero-phase aligned) is multiplied by exp(-j*2*pi*15600*t) and the real part
+is resampled 48 kHz -> 16 kHz with the zero-phase rational resampler. The
+carrier phase SHALL be locked to the source timeline (phase 0 at the first
+input frame) so the decoder can restore the band coherently. The shifted
+stream is what `A_OPUSHF` carries; the shift/resample roundtrip (without
+the codec) SHALL restore the band with only transition-band ripple at the
+carrier edges.
+
+#### Scenario: shift roundtrip
+- GIVEN band-limited content above 15600 Hz, shifted down and back up
+- THEN the reconstruction matches the original top band within the Hilbert
+  ripple, and the band reappears at its original frequencies.
 
 ### Requirement: SENA_PROFILE tag for the three-track layout
 Three-track files SHALL carry `SENA_PROFILE` = `<lf>@<hf>` where `<lf>` is

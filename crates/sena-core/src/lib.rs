@@ -87,11 +87,17 @@ pub fn account(total_kbps: u32, profile: Profile) -> Option<(u32, u32)> {
 }
 
 /// Second split point of the three-track layout: the Opus b19 edge at
-/// 48 kHz / 20 ms frames (bands 19+20 = 15.6 kHz..Nyquist).
+/// 48 kHz / 20 ms frames (bands 19+20 = 15.6 kHz..Nyquist). The top band is
+/// shifted down by this same frequency (analytic-signal SSB shift) so the
+/// top track codes it as baseband content.
 pub const HF_SPLIT_HZ: f64 = 15600.0;
 
-/// Fixed nominal rate of the A_OPUSHF (b19/b20) opus track.
+/// Fixed nominal rate of the A_OPUSHF (top band) opus track.
 pub const HF_TRACK_KBPS: u32 = 64;
+
+/// Stream rate of the A_OPUSHF track: the top band (15600 Hz..Nyquist) is
+/// shifted down to baseband (0..8.4 kHz) and carried at 16 kHz.
+pub const HF_TRACK_RATE: u32 = 16000;
 
 /// Nominal totals at (and above) which the encoder uses the three-track
 /// layout; below it the top bands stay in the single A_OPUS track.

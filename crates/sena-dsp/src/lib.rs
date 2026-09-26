@@ -244,6 +244,14 @@ impl Resampler {
         (input_frames * self.n + self.m / 2) / self.m
     }
 
+    /// The decimation factor m of the n/m ratio: a windowed consumer that
+    /// drains consumed input frames must keep the window start on this grid
+    /// (drain multiples of m), or later outputs shift by a fraction of a
+    /// frame against the whole-file phase grid.
+    pub fn decimation(&self) -> usize {
+        self.m
+    }
+
     /// Context, in input frames, that a windowed consumer must keep on each
     /// side of the emitted range so that every emitted output has complete
     /// kernel support (windowed output then equals the corresponding range of
@@ -769,6 +777,228 @@ struct ConvCache {
     fwd: std::sync::Arc<dyn rustfft::Fft<f64>>,
     inv: std::sync::Arc<dyn rustfft::Fft<f64>>,
     hspec: Vec<Complex64>,
+}
+
+// ---------------------------------------------------------------------------
+// Single-sideband frequency shift (analytic-signal / Hilbert method), used to
+// move a band-limited top band down to baseband for coding and back up after
+// decoding. A band-limited Opus track whose content sits only in the top
+// octave is coded poorly on its own: the band allocation is content-blind,
+// so the empty low bands keep their share and the actual content starves.
+// Shifting the band to baseband puts every bit on the content.
+
+/// Hilbert transformer length. 8001 taps (Kaiser beta 9) keep the transition
+/// at the DC/Nyquist edges ~35 Hz wide, so the band edge at the shift
+/// carrier is reconstructed cleanly.
+pub const HILBERT_TAPS: usize = 8001;
+
+/// Half the Hilbert kernel length: the leading/trailing context a shifted
+/// output frame needs, in frames at the shift operating rate.
+pub const HILBERT_DELAY: usize = (HILBERT_TAPS - 1) / 2;
+
+/// Windowed Hilbert transformer taps (odd length, Kaiser beta 9, the same
+/// window family as the crossover tables). Under the zero-phase convolution
+/// convention (output i uses input [i-d, i+d]) the filter produces the
+/// quadrature component of its input: x + j*H{x} is the analytic signal
+/// (negative frequencies suppressed).
+pub fn hilbert_taps() -> Vec<f64> {
+    let w = kaiser_window(HILBERT_TAPS);
+    let d = (HILBERT_TAPS - 1) / 2;
+    (0..HILBERT_TAPS)
+        .map(|k| {
+            let m = k as isize - d as isize;
+            if m % 2 == 0 {
+                0.0
+            } else {
+                2.0 / (std::f64::consts::PI * m as f64) * w[k]
+            }
+        })
+        .collect()
+}
+
+/// SSB shift core: out[i] = x[i]*cos(w*(origin+i)) -/+ H{x}[i]*sin(w*(...))
+/// with w = 2*pi*fc/fs; `up` selects the sign (down: +sin, up: -sin).
+/// `origin` is the absolute frame index carried by output frame 0 (the
+/// carrier phase reference; negative values are fine).
+fn ssb_shift(x: &[f64], ch: usize, fc: f64, fs: u32, origin: i64, up: bool) -> Vec<f64> {
+    let h = hilbert_taps();
+    let d = HILBERT_DELAY;
+    let n = x.len() / ch;
+    let w0 = 2.0 * std::f64::consts::PI * fc / fs as f64;
+    let mut out = vec![0.0; x.len()];
+    for c in 0..ch {
+        let mono: Vec<f64> = x.iter().skip(c).step_by(ch).copied().collect();
+        let conv = fftconvolve_mono(&mono, &h);
+        for i in 0..n {
+            let ph = w0 * (origin + i as i64) as f64;
+            let (s, co) = ph.sin_cos();
+            let q = conv[i + d];
+            out[i * ch + c] = if up {
+                mono[i] * co - q * s
+            } else {
+                mono[i] * co + q * s
+            };
+        }
+    }
+    out
+}
+
+/// Shift content at/above `fc` down to baseband (encode side of the
+/// three-track top band). Carrier phase zero at output frame 0.
+pub fn shift_down(x: &[f64], ch: usize, fc: f64, fs: u32) -> Vec<f64> {
+    ssb_shift(x, ch, fc, fs, 0, false)
+}
+
+/// Inverse of [`shift_down`]: move a baseband signal back up by `fc`.
+/// Carrier phase zero at output frame 0.
+pub fn shift_up(x: &[f64], ch: usize, fc: f64, fs: u32) -> Vec<f64> {
+    ssb_shift(x, ch, fc, fs, 0, true)
+}
+
+/// [`shift_up`] with an explicit carrier origin: output frame 0 carries the
+/// phase of absolute frame `origin` (used when the shifted window does not
+/// start at the playable timeline origin).
+pub fn shift_up_offset(x: &[f64], ch: usize, fc: f64, fs: u32, origin: i64) -> Vec<f64> {
+    ssb_shift(x, ch, fc, fs, origin, true)
+}
+
+/// Streaming chunk-fed SSB down-shift matching [`shift_down`]: output frame
+/// i uses input [i-d, i+d] (zero-phase aligned, d = [`HILBERT_DELAY`]) and
+/// the carrier phase of the global frame index, so chunked output equals the
+/// batch function over the concatenated input. Output latency is d frames.
+pub struct ShiftStream {
+    h: Vec<f64>,
+    fc: f64,
+    fs: u32,
+    win: Vec<f64>, // interleaved, starting at global frame `win_start`
+    win_start: usize,
+    emitted: usize,
+    ch: usize,
+    finishing: bool,
+    conv_cache: Option<ConvCache>,
+}
+
+impl ShiftStream {
+    /// Down-shift by `fc` (encode side of the three-track top band).
+    pub fn down(fc: f64, fs: u32) -> Self {
+        Self {
+            h: hilbert_taps(),
+            fc,
+            fs,
+            win: Vec::new(),
+            win_start: 0,
+            emitted: 0,
+            ch: 0,
+            finishing: false,
+            conv_cache: None,
+        }
+    }
+
+    /// Feed interleaved input frames; returns the shifted interleaved
+    /// frames that are fully settled (may be empty).
+    pub fn push(&mut self, x: &[f64], ch: usize) -> Vec<f64> {
+        assert!(!self.finishing, "push after finish");
+        assert!(x.len() % ch == 0, "input not interleaved at {ch} channels");
+        if self.ch == 0 {
+            self.ch = ch;
+        } else {
+            assert_eq!(self.ch, ch, "channel count changed");
+        }
+        self.win.extend_from_slice(x);
+        self.emit(ch)
+    }
+
+    /// Flush the remaining latency (zero padding after the final input
+    /// sample), returning the settled shifted frames.
+    pub fn finish(&mut self, ch: usize) -> Vec<f64> {
+        assert!(!self.finishing, "finish called twice");
+        assert_eq!(self.ch, ch, "channel count changed");
+        self.finishing = true;
+        self.emit(ch)
+    }
+
+    fn emit(&mut self, ch: usize) -> Vec<f64> {
+        let d = HILBERT_DELAY;
+        let end = self.win_start + self.win.len() / ch;
+        let cnt = if self.finishing {
+            end.saturating_sub(self.emitted)
+        } else {
+            end.saturating_sub(d).saturating_sub(self.emitted)
+        };
+        if cnt == 0 {
+            return Vec::new();
+        }
+        let n = self.win.len() / ch;
+        let conv = self.win_convolve(ch, n);
+        let w0 = 2.0 * std::f64::consts::PI * self.fc / self.fs as f64;
+        let mut out = vec![0.0; cnt * ch];
+        for j in 0..cnt {
+            let gi = self.emitted + j;
+            let wi = gi - self.win_start;
+            let ph = w0 * gi as f64;
+            let (s, co) = ph.sin_cos();
+            for c in 0..ch {
+                // down-shift: Re{(x + j*H{x}) * e^{-jwt}} = x*cos + H{x}*sin
+                out[j * ch + c] = self.win[wi * ch + c] * co + conv[(wi + d) * ch + c] * s;
+            }
+        }
+        self.emitted += cnt;
+        // Keep only the past context needed by the next output.
+        let keep_from = self.emitted.saturating_sub(d);
+        let drop = (keep_from - self.win_start) * ch;
+        if drop > 0 {
+            self.win.drain(..drop);
+            self.win_start = keep_from;
+        }
+        out
+    }
+
+    /// FFT convolution of the current window with the Hilbert kernel,
+    /// reusing the plan and kernel spectrum across chunks (same caching
+    /// strategy as the crossover).
+    fn win_convolve(&mut self, ch: usize, n: usize) -> Vec<f64> {
+        let out_len = n + self.h.len() - 1;
+        let fft_len = out_len.next_power_of_two();
+        let cache_ok = self
+            .conv_cache
+            .as_ref()
+            .map(|c| c.fft_len == fft_len)
+            .unwrap_or(false);
+        if !cache_ok {
+            let mut planner = FftPlanner::<f64>::new();
+            let fwd = planner.plan_fft_forward(fft_len);
+            let inv = planner.plan_fft_inverse(fft_len);
+            let mut hspec = vec![Complex64::default(); fft_len];
+            for (i, &v) in self.h.iter().enumerate() {
+                hspec[i] = Complex64::new(v, 0.0);
+            }
+            fwd.process(&mut hspec);
+            self.conv_cache = Some(ConvCache {
+                fft_len,
+                fwd,
+                inv,
+                hspec,
+            });
+        }
+        let c = self.conv_cache.as_ref().unwrap();
+        let mut out = vec![0.0; out_len * ch];
+        let mut buf = vec![Complex64::default(); fft_len];
+        for i in 0..ch {
+            for j in 0..fft_len {
+                buf[j] = Complex64::new(if j < n { self.win[j * ch + i] } else { 0.0 }, 0.0);
+            }
+            c.fwd.process(&mut buf);
+            for j in 0..fft_len {
+                buf[j] = buf[j] * c.hspec[j];
+            }
+            c.inv.process(&mut buf);
+            let scale = 1.0 / fft_len as f64;
+            for j in 0..out_len {
+                out[j * ch + i] = buf[j].re * scale;
+            }
+        }
+        out
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1325,6 +1555,174 @@ mod tests {
             e < 1e-9,
             "strength 0 should be a pure delay line, max err {e}"
         );
+    }
+
+    /// The Hilbert filter turns a cosine into a sine (quadrature) with
+    /// unit gain across the band, so x + j*H{x} is analytic.
+    #[test]
+    fn hilbert_quadrature_accuracy() {
+        let h = hilbert_taps();
+        let d = HILBERT_DELAY;
+        let n = 48_000usize;
+        for freq in [1000.0, 5000.0, 12000.0, 18000.0, 22000.0] {
+            let x = sine(freq, 48000, n);
+            let conv = fftconvolve_mono(&x, &h);
+            let mut maxe = 0.0f64;
+            for i in d + 100..n - d - 100 {
+                let got = conv[i + d];
+                let phase = 2.0 * std::f64::consts::PI * freq * i as f64 / 48000.0;
+                // x = sin(w i) -> quadrature is -cos(w i)
+                let want_q = -phase.cos();
+                maxe = maxe.max((got - want_q).abs());
+            }
+            assert!(maxe < 2e-3, "hilbert quadrature at {freq} Hz: {maxe}");
+        }
+    }
+
+    /// shift_down moves a tone at fc+df to df, with the conjugate image
+    /// (at 2*fc+df equivalents) suppressed by the Hilbert stopband.
+    #[test]
+    fn shift_down_places_band_at_baseband() {
+        let n = 48_000usize;
+        let fc = 15600.0;
+        // tone at fc + 2000 Hz plus one at fc + 7000 Hz
+        let mut x = vec![0.0; n];
+        for i in 0..n {
+            let t = i as f64 / 48000.0;
+            x[i] = 0.5 * (2.0 * std::f64::consts::PI * 17600.0 * t).cos()
+                + 0.3 * (2.0 * std::f64::consts::PI * 22600.0 * t).cos();
+        }
+        let y = shift_down(&x, 1, fc, 48000);
+        // FFT of the settled region; expect peaks at 2000 and 7000 Hz only.
+        let m = 1 << 15;
+        let skip = HILBERT_DELAY + 100;
+        let mut buf: Vec<Complex64> = (0..m)
+            .map(|k| Complex64::new(y[skip + k], 0.0))
+            .collect();
+        let mut planner = FftPlanner::<f64>::new();
+        planner.plan_fft_forward(m).process(&mut buf);
+        let peak_at = |f: f64| -> f64 {
+            let k = (f / 48000.0 * m as f64).round() as usize;
+            buf[k].norm()
+        };
+        let p_lo = peak_at(2000.0);
+        let p_hi = peak_at(7000.0);
+        assert!(p_lo > 0.4 * 0.5 * m as f64, "2 kHz peak too small: {p_lo}");
+        assert!(p_hi > 0.4 * 0.3 * m as f64, "7 kHz peak too small: {p_hi}");
+        // images: 2*fc - band content would appear as mirrored junk; check a
+        // few bins that must be empty (e.g. 4800 Hz = image of nothing, and
+        // 13600 = 15600-2000 is below-carrier mirror of the shifted band).
+        for f in [4800.0, 13600.0, 11600.0] {
+            let p = peak_at(f);
+            assert!(p < 1e-3 * p_lo, "image at {f} Hz: {p} vs {p_lo}");
+        }
+    }
+
+    /// shift_up inverts shift_down for band content clear of the carrier
+    /// edges: tones between fc+400 Hz and 22.5 kHz come back within the
+    /// Hilbert/resampler ripple.
+    #[test]
+    fn shift_roundtrip_recovers_band() {
+        let n = 48_000usize;
+        let fc = 15600.0;
+        let mut x = vec![0.0; n];
+        for (f, a) in [(16000.0, 0.4), (17500.0, 0.3), (19000.0, 0.2), (22500.0, 0.2)] {
+            for (i, v) in x.iter_mut().enumerate() {
+                *v += a * (2.0 * std::f64::consts::PI * f * i as f64 / 48000.0).cos();
+            }
+        }
+        let down = shift_down(&x, 1, fc, 48000);
+        let back = shift_up(&down, 1, fc, 48000);
+        let mut maxe = 0.0f64;
+        let skip = HILBERT_DELAY + 200;
+        for i in skip..n - skip {
+            maxe = maxe.max((back[i] - x[i]).abs());
+        }
+        assert!(maxe < 2e-3, "roundtrip error {maxe}");
+    }
+
+    /// Content within ~35 Hz of the carrier sits in the Hilbert transition
+    /// of the decode-side shift: a tone at fc+50 Hz must still come back at
+    /// nearly full amplitude, and its mirror image below fc stays small.
+    #[test]
+    fn shift_roundtrip_carrier_edge() {
+        let n = 48_000usize * 2;
+        let fc = 15600.0;
+        let f = 15650.0;
+        let x = sine(f, 48000, n);
+        let back = shift_up(&shift_down(&x, 1, fc, 48000), 1, fc, 48000);
+        let skip = HILBERT_DELAY + 200;
+        let m = 1 << 16;
+        // Hann window (coherent gain 1/2) to keep spectral leakage from
+        // contaminating the image measurement.
+        let mut buf: Vec<Complex64> = (0..m)
+            .map(|k| {
+                let w = 0.5 - 0.5 * (2.0 * std::f64::consts::PI * k as f64 / m as f64).cos();
+                Complex64::new(back[skip + k] * w, 0.0)
+            })
+            .collect();
+        let mut planner = FftPlanner::<f64>::new();
+        planner.plan_fft_forward(m).process(&mut buf);
+        let mag = |f: f64| buf[(f / 48000.0 * m as f64).round() as usize].norm() * 4.0 / m as f64;
+        let main = mag(f);
+        let image = mag(2.0 * fc - f);
+        assert!(main > 0.8, "edge tone amplitude collapsed: {main}");
+        assert!(image < 0.2 * main, "edge image {image} vs main {main}");
+    }
+
+    /// Chunk-fed ShiftStream must equal the batch shift_down.
+    #[test]
+    fn shift_stream_matches_batch() {
+        let n = 48_000 * 3;
+        let x: Vec<f64> = sine(18_100.0, 48000, n)
+            .iter()
+            .flat_map(|&v| [v, v * 0.5])
+            .collect();
+        let batch = shift_down(&x, 2, 15600.0, 48000);
+        let mut s = ShiftStream::down(15600.0, 48000);
+        let mut streamed = Vec::new();
+        for chunk in x.chunks(48_000) {
+            streamed.extend(s.push(chunk, 2));
+        }
+        streamed.extend(s.finish(2));
+        assert_eq!(streamed.len(), batch.len());
+        let maxe = streamed
+            .iter()
+            .zip(batch.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f64::max);
+        assert!(maxe < 1e-8, "stream vs batch shift error {maxe}");
+    }
+
+    /// The encode-side top-band chain is a near-perfect roundtrip before the
+    /// codec: split complement -> shift down -> 48k->16k -> 16k->48k ->
+    /// shift up recovers the band (tones clear of both edges).
+    #[test]
+    fn top_band_channel_roundtrip() {
+        let n = 48_000usize * 2;
+        let fc = 15600.0;
+        let mut x = vec![0.0; n * 2];
+        for (f, a) in [(16100.0, 0.3), (18000.0, 0.3), (21000.0, 0.2), (22400.0, 0.15)] {
+            for i in 0..n {
+                let v = a * (2.0 * std::f64::consts::PI * f * i as f64 / 48000.0).cos();
+                x[i * 2] += v;
+                x[i * 2 + 1] += 0.7 * v;
+            }
+        }
+        let (_low, top) = split(&x, 2, fc);
+        let down = shift_down(&top, 2, fc, 48000);
+        let bb = Resampler::new(48000, 16000).process(&down, 2);
+        let up = Resampler::new(16000, 48000).process(&bb, 2);
+        let back = shift_up(&up, 2, fc, 48000);
+        let skip = HILBERT_DELAY + 2400;
+        let n_up = back.len() / 2;
+        let mut maxe = 0.0f64;
+        for i in skip..n_up.min(n) - skip {
+            for c in 0..2 {
+                maxe = maxe.max((back[i * 2 + c] - top[i * 2 + c]).abs());
+            }
+        }
+        assert!(maxe < 5e-3, "top band roundtrip error {maxe}");
     }
 
     #[test]

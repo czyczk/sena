@@ -38,7 +38,11 @@ pub struct EncoderConfig<'a> {
     pub use_senav: bool,
     /// Three-track layout: split the 600 Hz-high band again at the Opus
     /// b19 edge (15600 Hz) and encode the top band as a second opus track
-    /// (`A_OPUSHF`, fixed 64 kbit/s nominal).
+    /// (`A_OPUSHF`, fixed 64 kbit/s nominal). The top band is shifted down
+    /// to baseband (analytic-signal SSB shift by 15600 Hz) and carried at
+    /// 16 kHz: a directly coded top-octave-only track starves under Opus's
+    /// content-blind band allocation, while shifted baseband content is
+    /// served normally.
     pub three_track: bool,
     /// Value passed through to the opusenc-senav mid encode as
     /// `AUDIFF_TOPBAND_STEREO` (kbps, unmodified). None = knob off.
@@ -60,7 +64,8 @@ pub struct Encoded {
     pub hf_preskip: u16,
     pub lf_aus: Vec<Vec<u8>>,
     pub lf_asc: Vec<u8>,
-    /// A_OPUSHF track (15.6 kHz - Nyquist); empty in the two-track layout.
+    /// A_OPUSHF track (the 15600 Hz+ band, shifted to baseband and carried
+    /// at 16 kHz); empty in the two-track layout.
     pub hf2_packets: Vec<Vec<u8>>,
     pub hf2_head: Vec<u8>,
     pub hf2_preskip: u16,
@@ -350,8 +355,12 @@ pub fn encode_stream<R: std::io::Read>(
     let mut ws = wav::WavStream::new();
     let mut norm: Option<StreamResampler> = None;
     let mut split_s: Option<CrossoverStream> = None;
-    // Second split (three-track layout): 15600 Hz on the 600 Hz-high band.
+    // Second split (three-track layout): 15600 Hz on the 600 Hz-high band,
+    // then the top band is SSB-shifted down to baseband and resampled to
+    // 16 kHz for the A_OPUSHF encode.
     let mut split_hf: Option<CrossoverStream> = None;
+    let mut shift_hf: Option<sena_dsp::ShiftStream> = None;
+    let mut tf_rs: Option<StreamResampler> = None;
     let mut tilt: Option<sena_dsp::FirStream> = cfg
         .hf_tilt_pct
         .filter(|&s| s > 0.0)
@@ -390,6 +399,12 @@ pub fn encode_stream<R: std::io::Read>(
             split_hf = cfg
                 .three_track
                 .then(|| CrossoverStream::new(sena_core::HF_SPLIT_HZ));
+            shift_hf = cfg
+                .three_track
+                .then(|| sena_dsp::ShiftStream::down(sena_core::HF_SPLIT_HZ, SAMPLE_RATE));
+            tf_rs = cfg
+                .three_track
+                .then(|| StreamResampler::new(SAMPLE_RATE, sena_core::HF_TRACK_RATE));
             lf_rs = Some(StreamResampler::new(SAMPLE_RATE, lf_rate));
             lf_wr = Some(wav::WavWriter::create(&wd.join("lf.wav"), lf_rate, 16, 2)?);
             if cfg.three_track {
@@ -402,7 +417,11 @@ pub fn encode_stream<R: std::io::Read>(
             }
             hf_wr = Some(wav::WavWriter::create(
                 &wd.join("hf.wav"),
-                SAMPLE_RATE,
+                if cfg.three_track {
+                    sena_core::HF_TRACK_RATE
+                } else {
+                    SAMPLE_RATE
+                },
                 32,
                 2,
             )?);
@@ -417,6 +436,8 @@ pub fn encode_stream<R: std::io::Read>(
                     norm.as_mut().unwrap(),
                     split_s.as_mut().unwrap(),
                     split_hf.as_mut(),
+                    shift_hf.as_mut(),
+                    tf_rs.as_mut(),
                     lf_rs.as_mut().unwrap(),
                     lf_wr.as_mut().unwrap(),
                     mid_wr.as_mut(),
@@ -444,6 +465,8 @@ pub fn encode_stream<R: std::io::Read>(
     let mut norm = norm.unwrap();
     let mut split_s = split_s.unwrap();
     let mut split_hf = split_hf.take();
+    let mut shift_hf = shift_hf.take();
+    let mut tf_rs = tf_rs.take();
     let mut lf_rs = lf_rs.unwrap();
     let mut lf_wr = lf_wr.unwrap();
     let mut mid_wr = mid_wr.take();
@@ -473,13 +496,26 @@ pub fn encode_stream<R: std::io::Read>(
         let high_in: Vec<f64> = high_a.iter().chain(high_b.iter()).cloned().collect();
         if let Some(split_hf) = split_hf.as_mut() {
             // Three-track tail: split the high band at 15600 Hz, tilt and
-            // pad the mid band, pad the top band.
+            // pad the mid band; shift the top band to baseband, resample
+            // to 16 kHz and pad.
             st.begin();
             let (mid_a, top_a) = split_hf.push(&high_in, ch);
             let (mid_b, top_b) = split_hf.finish(ch);
+            let shift = shift_hf.as_mut().unwrap();
+            let tf_rs = tf_rs.as_mut().unwrap();
+            let top_s = {
+                let mut v = shift.push(&top_a, ch);
+                v.extend(shift.push(&top_b, ch));
+                v.extend(shift.finish(ch));
+                v
+            };
+            let top16 = {
+                let mut v = tf_rs.push(&top_s, ch);
+                v.extend(tf_rs.finish(ch));
+                v
+            };
             end_tick(&mut st.t, &mut st.split);
             let mid_in: Vec<f64> = mid_a.iter().chain(mid_b.iter()).cloned().collect();
-            let top_in: Vec<f64> = top_a.iter().chain(top_b.iter()).cloned().collect();
             let mid_f = if let Some(t) = tilt.as_mut() {
                 let mut v = t.push(&mid_in, ch);
                 v.extend(t.finish(ch));
@@ -488,7 +524,7 @@ pub fn encode_stream<R: std::io::Read>(
                 mid_in
             };
             let mid_p: Vec<f64> = mid_f.iter().map(|v| v * PRE_GAIN).collect();
-            let top_p: Vec<f64> = top_in.iter().map(|v| v * PRE_GAIN).collect();
+            let top_p: Vec<f64> = top16.iter().map(|v| v * PRE_GAIN).collect();
             st.begin();
             mid_wr.as_mut().unwrap().push(&mid_p)?;
             hf_wr.push(&top_p)?;
@@ -602,9 +638,9 @@ fn end_tick(tick: &mut Option<std::time::Instant>, acc: &mut f64) {
 
 /// One chunk through normalize -> split -> pad -> LF downsample -> writers.
 /// In the three-track layout the LF branch (downsample + LF write) and the
-/// HF branch (15600 Hz split + tilt + mid/top writes) are independent and
-/// run concurrently; their stage timers overlap, so the SENAENC_TIME sum
-/// can exceed the wall time.
+/// HF branch (15600 Hz split + tilt + mid write + top-band shift/downsample/
+/// write) are independent and run concurrently; their stage timers overlap,
+/// so the SENAENC_TIME sum can exceed the wall time.
 #[allow(clippy::too_many_arguments)]
 fn push_chunk(
     x: &[f64],
@@ -612,6 +648,8 @@ fn push_chunk(
     norm: &mut sena_dsp::StreamResampler,
     split_s: &mut sena_dsp::CrossoverStream,
     split_hf: Option<&mut sena_dsp::CrossoverStream>,
+    shift_hf: Option<&mut sena_dsp::ShiftStream>,
+    tf_rs: Option<&mut sena_dsp::StreamResampler>,
     lf_rs: &mut sena_dsp::StreamResampler,
     lf_wr: &mut wav::WavWriter,
     mut mid_wr: Option<&mut wav::WavWriter>,
@@ -638,6 +676,8 @@ fn push_chunk(
                     &high,
                     ch,
                     split_hf,
+                    shift_hf.unwrap(),
+                    tf_rs.unwrap(),
                     tilt,
                     mid_wr.as_mut().unwrap(),
                     hf_wr,
@@ -702,13 +742,16 @@ fn lf_branch(
 }
 
 /// Three-track HF branch: 15600 Hz split (the tilt, if any, shapes the mid
-/// band only) -> PRE_GAIN -> mid/top WAV writes. Returns its (split,
-/// write) elapsed times through `t`.
+/// band only) -> PRE_GAIN -> mid write; the top band is SSB-shifted down to
+/// baseband and resampled to 16 kHz before its (PRE_GAIN) write. Returns
+/// its (split, write) elapsed times through `t`.
 #[allow(clippy::too_many_arguments)]
 fn hf_branch3(
     high: &[f64],
     ch: usize,
     split_hf: &mut sena_dsp::CrossoverStream,
+    shift_hf: &mut sena_dsp::ShiftStream,
+    tf_rs: &mut sena_dsp::StreamResampler,
     tilt: &mut Option<sena_dsp::FirStream>,
     mid_wr: &mut wav::WavWriter,
     hf_wr: &mut wav::WavWriter,
@@ -716,6 +759,12 @@ fn hf_branch3(
 ) -> Result<(), Error> {
     let t0 = std::time::Instant::now();
     let (mid, top) = split_hf.push(high, ch);
+    let top16 = if top.is_empty() {
+        top
+    } else {
+        let shifted = shift_hf.push(&top, ch);
+        tf_rs.push(&shifted, ch)
+    };
     t.0 += t0.elapsed().as_secs_f64();
     let mut err: Option<Error> = None;
     if !mid.is_empty() {
@@ -731,8 +780,8 @@ fn hf_branch3(
         }
         t.1 += t1.elapsed().as_secs_f64();
     }
-    if err.is_none() && !top.is_empty() {
-        let top_p: Vec<f64> = top.iter().map(|v| v * PRE_GAIN).collect();
+    if err.is_none() && !top16.is_empty() {
+        let top_p: Vec<f64> = top16.iter().map(|v| v * PRE_GAIN).collect();
         let t2 = std::time::Instant::now();
         if let Err(e) = hf_wr.push(&top_p) {
             err = Some(e);
@@ -774,9 +823,10 @@ fn run_codecs(
     // --- encode ---
     // The codec passes are independent (separate input files, separate
     // output files) and each is single-threaded, so run them concurrently.
-    // Two-track: opusenc codes hf.wav (600 Hz..Nyquist). Three-track: it
-    // codes mid.wav (600 Hz..15600 Hz) and a second opusenc codes hf.wav
-    // (15600 Hz..Nyquist) at a fixed 64k nominal.
+    // Two-track: opusenc codes hf.wav (600 Hz..Nyquist at 48 kHz).
+    // Three-track: it codes mid.wav (600 Hz..15600 Hz at 48 kHz) and a
+    // second opusenc codes hf.wav (the 15600 Hz+ band shifted to baseband,
+    // 16 kHz) at a fixed 64k nominal.
     let lf_m4a = wd.join("lf.m4a");
     let hf_ogg = wd.join("hf.opus");
     let mid_ogg = wd.join("mid.opus");
@@ -933,8 +983,10 @@ fn run_codecs(
             tracks.push(Track {
                 codec_id: "A_OPUSHF".into(),
                 codec_private: hf2_head.clone(),
-                sample_rate: SAMPLE_RATE as f64,
+                sample_rate: sena_core::HF_TRACK_RATE as f64,
                 channels: 2,
+                // OpusHead pre-skip counts 48 kHz units regardless of the
+                // track rate (RFC 7845).
                 codec_delay_ns: (hf2_preskip as u64) * 1_000_000_000 / SAMPLE_RATE as u64,
                 bit_depth: Some(32),
             });
@@ -1535,9 +1587,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&wd);
     }
 
-    /// Three-track streaming DSP: mid.wav + hf.wav must equal the batch
-    /// reference (split@600 -> split@15600 on the high band -> PRE_GAIN),
-    /// and mid + top must sum back to the 600 Hz-high band.
+    /// Three-track streaming DSP: mid.wav must equal the batch reference
+    /// (split@600 -> split@15600 low -> PRE_GAIN) and hf.wav the shifted +
+    /// downsampled top band (split@15600 high -> shift_down -> 48k->16k ->
+    /// PRE_GAIN). Decoding the top track (16k->48k -> shift_up) and adding
+    /// the mid band must reconstruct the 600 Hz-high band.
     #[test]
     fn stream_three_track_matches_batch() {
         let src = synth_wav(3, 44100, true);
@@ -1564,14 +1618,21 @@ mod tests {
         let (_low, high) = sena_dsp::split(&x48, 2, 300.0);
         let (mid, top) = sena_dsp::split(&high, 2, sena_core::HF_SPLIT_HZ);
         let mid_p: Vec<f64> = mid.iter().map(|v| v * PRE_GAIN).collect();
-        let top_p: Vec<f64> = top.iter().map(|v| v * PRE_GAIN).collect();
+        let top_s = sena_dsp::shift_down(&top, 2, sena_core::HF_SPLIT_HZ, SAMPLE_RATE);
+        let top16 = sena_dsp::Resampler::new(SAMPLE_RATE, sena_core::HF_TRACK_RATE)
+            .process(&top_s, 2);
+        let top_p: Vec<f64> = top16.iter().map(|v| v * PRE_GAIN).collect();
         let ref_mid = wd.join("ref_mid.wav");
         let ref_top = wd.join("ref_top.wav");
         wav::write_f32(&ref_mid, &mid_p, SAMPLE_RATE).unwrap();
-        wav::write_f32(&ref_top, &top_p, SAMPLE_RATE).unwrap();
+        wav::write_f32(&ref_top, &top_p, sena_core::HF_TRACK_RATE).unwrap();
 
         let got_mid = wav::read_f64(&wd.join("mid.wav")).unwrap().0;
-        let got_top = wav::read_f64(&wd.join("hf.wav")).unwrap().0;
+        let (got_top, top_rate) = {
+            let (v, _, r) = wav::read_f64(&wd.join("hf.wav")).unwrap();
+            (v, r)
+        };
+        assert_eq!(top_rate, sena_core::HF_TRACK_RATE);
         let (rmid, _, _) = wav::read_f64(&ref_mid).unwrap();
         let (rtop, _, _) = wav::read_f64(&ref_top).unwrap();
         assert_eq!(got_mid.len(), rmid.len(), "mid lengths differ");
@@ -1589,15 +1650,20 @@ mod tests {
         assert!(mm < 1e-6, "mid max diff {mm}");
         assert!(mt < 1e-6, "top max diff {mt}");
 
-        // Complementarity: mid + top reconstructs the 600 Hz-high band
-        // (settled region only; both writers pad the FIR tails with zeros).
+        // Reconstruction: mid + decode-side top chain (upsample + shift up)
+        // recovers the 600 Hz-high band (settled region; the synth input
+        // has essentially no 15.6 kHz+ content, so this stays tight).
         let n = high.len() / 2;
-        let settle = 2100usize;
+        let back16: Vec<f64> = got_top.iter().map(|v| v / PRE_GAIN).collect();
+        let up = sena_dsp::Resampler::new(sena_core::HF_TRACK_RATE, SAMPLE_RATE)
+            .process(&back16, 2);
+        let back = sena_dsp::shift_up(&up, 2, sena_core::HF_SPLIT_HZ, SAMPLE_RATE);
+        let settle = 6200usize;
         for i in settle..n - settle {
-            let sum_l = got_mid[i * 2] + got_top[i * 2];
-            let sum_r = got_mid[i * 2 + 1] + got_top[i * 2 + 1];
-            assert!((sum_l - high[i * 2]).abs() < 1e-6, "frame {i} L");
-            assert!((sum_r - high[i * 2 + 1]).abs() < 1e-6, "frame {i} R");
+            let sum_l = got_mid[i * 2] / PRE_GAIN + back[i * 2];
+            let sum_r = got_mid[i * 2 + 1] / PRE_GAIN + back[i * 2 + 1];
+            assert!((sum_l - high[i * 2]).abs() < 1e-4, "frame {i} L");
+            assert!((sum_r - high[i * 2 + 1]).abs() < 1e-4, "frame {i} R");
         }
         let _ = std::fs::remove_dir_all(&wd);
     }

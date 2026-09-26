@@ -18,10 +18,12 @@ stdin/file WAV --WavStream--> [normalize any rate -> 48 kHz]
                                      v                  v
                               LF downsample       (two-track: 600 Hz..24 kHz -> hf.wav)
                               48k -> 16k/32k       (three-track, total >= 256k:
-                                     |              CrossoverStream @15600 -> mid.wav + hf.wav)
+                                     |              CrossoverStream @15600 -> mid.wav
+                                     |              + ShiftStream down 15.6 kHz -> baseband
+                                     |              + 48k->16k -> hf.wav)
                                      v                           |
                                  lf.wav (s16, streaming)         v
-                                     |                    mid.wav / hf.wav (f32, streaming)
+                                     |                    mid.wav (48k f32) / hf.wav (16k f32)
                                      |
                      (EOF)  ------+---------------------------+------>
                      run exhale (lf.wav) || opusenc (mid) || opusenc (hf, 3-track only)
@@ -35,11 +37,18 @@ stdin/file WAV --WavStream--> [normalize any rate -> 48 kHz]
   `<lf>@15600`): the 600 Hz-high band splits again at the Opus b19 edge
   (15600 Hz; FIR_15600, 2001 taps, cutoff 15480, 240 Hz transition ->
   >= ~95 dB at 15600). The mid track (`A_OPUS`) codes 600 Hz..15.6 kHz at
-  `total - deduct - 64`; the top track (`A_OPUSHF`) codes 15.6 kHz..24 kHz
-  at a fixed 64k nominal. Both opus tracks use whichever opusenc build the
-  mode selected (`--opus-senav` / `--opus-original`); the three codec
-  processes run concurrently. `--hf-tilt`, when enabled, shapes the mid
-  band only.
+  `total - deduct - 64`. The top band is not coded directly: an Opus track
+  whose content sits only above 15.6 kHz starves under the codec's
+  content-blind band allocation (the empty low bands keep their share), so
+  the top band is SSB-shifted down to baseband (analytic signal via an
+  8001-tap Hilbert FIR, Kaiser beta 9; carrier = the 15600 Hz split) and
+  resampled 48k -> 16k; the top track (`A_OPUSHF`) codes that 16 kHz
+  baseband at a fixed 64k nominal. Decoding reverses it: decode at 16 kHz,
+  zero-phase upsample back to 48 kHz, shift back up (carrier phase locked
+  to the playable timeline), mix. Both opus tracks use whichever opusenc
+  build the mode selected (`--opus-senav` / `--opus-original`); the three
+  codec processes run concurrently. `--hf-tilt`, when enabled, shapes the
+  mid band only.
 - opus-senav topband-stereo: `AUDIFF_TOPBAND_STEREO` is armed for the mid
   encode only - by default at the Opus budget when the total is in
   [192, 256) kbit/s with senav, or verbatim via

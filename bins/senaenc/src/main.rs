@@ -19,7 +19,8 @@ fn usage() -> ! {
          --hf-tilt <pct>: optional gentle high-frequency tilt on the Opus band (percent of the \
          reference curve; 0 = off; default off)\n\
          totals >= {THREE_TRACK_MIN_KBPS}k use the three-track layout: exhale LF + \
-         Opus mid (600 Hz..15.6 kHz) + Opus top (15.6 kHz+, fixed 64k)\n\
+         Opus mid (600 Hz..15.6 kHz) + Opus top (15.6 kHz+ band shifted to baseband, \
+         16 kHz stream, fixed 64k)\n\
          senaenc doctor                              check required encoder tools\n\
          minimum bitrate: {}k (@600) / {}k (@300); below {RECOMMENDED_MIN_TOTAL_KBPS}k plain Opus\n\
          is recommended and senaenc refuses unless --bypass-recommendations is given\n\

@@ -13,10 +13,12 @@ import sys
 import numpy as np
 import soundfile as sf
 import soxr
+from scipy.signal import hilbert
 
 SR = 48000
 PAD = 0.631
 DELAY = {300: 3072, 600: 1536}
+HF_SPLIT_HZ = 15600.0
 
 
 def read_vint(f, p):
@@ -233,14 +235,13 @@ def main():
     tracks, tags, clusters, frames = parse_mka(sena_path)
     assert tracks[1]["codec"] == "A_OPUS", tracks
     assert tracks[2]["codec"] == "A_SENALF", tracks
-    assert tags["SENA_PROFILE"] == profile_s, tags
-    assert clusters > 10, clusters
     # Three-track layout (>=256k): A_OPUSHF rides along as track 3 and the
     # mid encode's elementary stream is mid.opus, not hf.opus.
-    three_track = len(tracks) > 3
+    three_track = len(tracks) > 2
     if three_track:
         assert tracks[3]["codec"] == "A_OPUSHF", tracks
-        assert tags["SENA_PROFILE"] == f"{profile}@15600", tags
+    assert tags["SENA_PROFILE"] == (f"{profile}@15600" if three_track else profile_s), tags
+    assert clusters > 10, clusters
     # 延迟 = 1024 个核心样本 × 实际流率（mdhd）；容器 CodecDelay 应等于 1024×1e9/率
     lf_rate_hz = int(round(tracks[2].get("rate_hz", 0)))
     assert lf_rate_hz in (16000, 32000), f"unexpected LF rate {lf_rate_hz}"
@@ -286,11 +287,17 @@ def main():
     lf /= PAD
     hp /= PAD
     if three_track:
-        hp2, _ = sf.read(f"{wd}/hf2_dec.wav", dtype="float64", always_2d=True)
+        hp2, fs2 = sf.read(f"{wd}/hf2_dec.wav", dtype="float64", always_2d=True)
         hp2 /= PAD
-        # opusdec pads the two band tracks to the same length; sum mid+top
-        # (the encoder split is complementary, so this equals the 600 Hz-high
-        # band) before the lag/correlation checks.
+        # The A_OPUSHF track carries the 15.6 kHz+ band SSB-shifted to
+        # baseband at 16 kHz: resample back to 48 kHz and shift it back up
+        # (analytic signal times exp(+2j*pi*fc*t), take real part) before
+        # summing with the mid band.
+        if fs2 != SR:
+            hp2 = soxr.resample(hp2, fs2, SR, quality="HQ")
+        t = np.arange(len(hp2)) / SR
+        hp2 = np.real(hilbert(hp2, axis=0) * np.exp(2j * np.pi * HF_SPLIT_HZ * t)[:, None])
+        # the two band tracks reconstruct the 600 Hz-high band
         m = min(len(hp), len(hp2))
         hp = hp[:m] + hp2[:m]
     lag_l = xcorr_lag(ref.mean(axis=1), lf.mean(axis=1), SR)

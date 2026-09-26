@@ -57,7 +57,8 @@ pub struct DecodedInfo {
     /// LF profile number (300 or 600); the HF split is reported separately.
     pub profile: u32,
     /// Three-track layout (SENA_PROFILE `<lf>@15600`): an A_OPUSHF track
-    /// covering 15.6 kHz..Nyquist rides along and mixes into the output.
+    /// carrying the 15.6 kHz+ band (SSB-shifted to baseband, 16 kHz stream)
+    /// rides along; it is shifted back up and mixed into the output.
     pub three_track: bool,
     pub sena_version: u32,
     /// SENA_AUDIO_SHA256 tag (hash of the encoded elementary streams
@@ -83,8 +84,8 @@ pub struct Decoded {
     pcm: Vec<f64>,
     lf_track_pcm: Vec<f64>,
     hf_track_pcm: Vec<f64>,
-    /// A_OPUSHF (15.6 kHz+) track, upmixed by 1/PRE_GAIN; empty in the
-    /// two-track layout.
+    /// A_OPUSHF (15.6 kHz+ band, restored from the shifted 16 kHz stream)
+    /// track, upmixed by 1/PRE_GAIN; empty in the two-track layout.
     hf2_track_pcm: Vec<f64>,
     bits_total: Vec<f64>,
     pub warnings: Vec<String>,
@@ -111,10 +112,13 @@ pub(crate) struct OpusPacketInfo {
     pub(crate) bits: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct OpusHead {
     pub(crate) pre_skip: u16,
     pub(crate) output_gain: i16,
+    /// OpusHead input sample rate field (the track's stream rate: 48000 for
+    /// A_OPUS, 16000 for the shifted A_OPUSHF top band).
+    pub(crate) input_rate: u32,
 }
 
 pub(crate) fn parse_opus_head(data: &[u8]) -> Result<OpusHead, DecodeError> {
@@ -133,12 +137,6 @@ pub(crate) fn parse_opus_head(data: &[u8]) -> Result<OpusHead, DecodeError> {
             "OpusHead channels {channels}, expected 2"
         )));
     }
-    let input_rate = u32::from_le_bytes(data[12..16].try_into().unwrap());
-    if input_rate != SAMPLE_RATE {
-        return Err(DecodeError::Unsupported(format!(
-            "OpusHead input sample rate {input_rate}, expected {SAMPLE_RATE}"
-        )));
-    }
     if data[18] != 0 {
         return Err(DecodeError::Unsupported(
             "OpusHead channel mapping family != 0".into(),
@@ -147,6 +145,7 @@ pub(crate) fn parse_opus_head(data: &[u8]) -> Result<OpusHead, DecodeError> {
     Ok(OpusHead {
         pre_skip: u16::from_le_bytes(data[10..12].try_into().unwrap()),
         output_gain: i16::from_le_bytes(data[16..18].try_into().unwrap()),
+        input_rate: u32::from_le_bytes(data[12..16].try_into().unwrap()),
     })
 }
 
@@ -232,16 +231,23 @@ fn decode_lf(
     Ok((pcm, infos, core_rate as usize, errors))
 }
 
+/// Decode an opus track at its stream rate. Packet positions in the
+/// returned infos are in 48 kHz units (scaled by 48000/`rate`) so the bit
+/// accounting lines up with the playable timeline; the OpusHead pre-skip
+/// is already in 48 kHz units (RFC 7845).
 fn decode_opus(
     frames: &[Frame],
     head: &OpusHead,
+    rate: u32,
 ) -> Result<(Vec<f32>, Vec<OpusPacketInfo>), DecodeError> {
-    let mut dec = OpusDecoder::new(SAMPLE_RATE, Channels::Stereo)
+    let mut dec = OpusDecoder::new(rate, Channels::Stereo)
         .map_err(|e| DecodeError::Codec(format!("opus init: {e}")))?;
     if head.output_gain != 0 {
         dec.set_gain(i32::from(head.output_gain))
             .map_err(|e| DecodeError::Codec(format!("opus output gain: {e}")))?;
     }
+    let scale = (SAMPLE_RATE / rate) as i128;
+    assert_eq!(rate * scale as u32, SAMPLE_RATE, "opus rate must divide 48k");
     let mut pcm: Vec<f32> = Vec::new();
     let mut buf = vec![0.0f32; 5760 * 2];
     let mut infos = Vec::with_capacity(frames.len());
@@ -262,8 +268,8 @@ fn decode_opus(
         n = n.min(5760);
         pcm.extend_from_slice(&buf[..n * 2]);
         infos.push(OpusPacketInfo {
-            start_48k: (before / 2) as i128,
-            samples_48k: n as i128,
+            start_48k: (before / 2) as i128 * scale,
+            samples_48k: n as i128 * scale,
             bits: (frame.data.len() * 8) as u64,
         });
     }
@@ -393,18 +399,27 @@ fn validate_layout<M: ContainerMeta>(
     }
 
     // Optional third track (A_OPUSHF): required exactly when the profile
-    // tag declares the 15600 Hz split, rejected otherwise.
+    // tag declares the 15600 Hz split, rejected otherwise. The track carries
+    // the top band shifted down to baseband at 16 kHz.
     let hf2_track = demux.meta_track("A_OPUSHF");
     match (&hf2_track, three_track) {
         (Some(t), true) => {
-            if t.sample_rate.round() as u32 != SAMPLE_RATE || t.channels != 2 {
+            if t.sample_rate.round() as u32 != sena_core::HF_TRACK_RATE || t.channels != 2 {
                 return Err(DecodeError::Unsupported(
                     "A_OPUSHF track rates/channels do not match Sena P0".into(),
                 ));
             }
             // Structural OpusHead validation + delay cross-check (mirrors
-            // the A_OPUS track).
+            // the A_OPUS track). The pre-skip counts 48 kHz units (RFC 7845)
+            // even though the track rate is 16 kHz.
             let head = parse_opus_head(&t.codec_private)?;
+            if head.input_rate != sena_core::HF_TRACK_RATE {
+                return Err(DecodeError::Unsupported(format!(
+                    "A_OPUSHF OpusHead input sample rate {}, expected {}",
+                    head.input_rate,
+                    sena_core::HF_TRACK_RATE
+                )));
+            }
             let delay_expected = (head.pre_skip as u64) * 1_000_000_000 / SAMPLE_RATE as u64;
             if let Some(actual) = t.codec_delay_ns {
                 if actual != delay_expected {
@@ -437,6 +452,12 @@ fn validate_layout<M: ContainerMeta>(
         }
     }
     let opus_head = parse_opus_head(&hf_track.codec_private)?;
+    if opus_head.input_rate != SAMPLE_RATE {
+        return Err(DecodeError::Unsupported(format!(
+            "A_OPUS OpusHead input sample rate {}, expected {SAMPLE_RATE}",
+            opus_head.input_rate
+        )));
+    }
     let hf_delay_expected = (opus_head.pre_skip as u64) * 1_000_000_000 / SAMPLE_RATE as u64;
     if let Some(actual) = hf_track.codec_delay_ns {
         if actual != hf_delay_expected {
@@ -514,13 +535,14 @@ pub fn decode(demux: &Demuxed) -> Result<Decoded, DecodeError> {
     // streaming decoder consumes the tracks interleaved instead).
     let (lf_res, mid_res, hf2_res) = std::thread::scope(|s| {
         let hlf = s.spawn(|| decode_lf(lf_track, &lf_frames, &asc));
-        let hmid = s.spawn(|| decode_opus(&hf_frames, &opus_head));
+        let hmid = s.spawn(|| decode_opus(&hf_frames, &opus_head, SAMPLE_RATE));
         let htop = s.spawn(
             || -> Result<(Vec<f32>, Vec<OpusPacketInfo>, OpusHead), DecodeError> {
                 match &hf2_track {
                     Some(t) => {
                         let head = parse_opus_head(&t.codec_private)?;
-                        let (raw, infos) = decode_opus(&hf2_frames, &head)?;
+                        let (raw, infos) =
+                            decode_opus(&hf2_frames, &head, sena_core::HF_TRACK_RATE)?;
                         Ok((raw, infos, head))
                     }
                     None => Ok((
@@ -529,6 +551,7 @@ pub fn decode(demux: &Demuxed) -> Result<Decoded, DecodeError> {
                         OpusHead {
                             pre_skip: 0,
                             output_gain: 0,
+                            input_rate: sena_core::HF_TRACK_RATE,
                         },
                     )),
                 }
@@ -576,16 +599,29 @@ pub fn decode(demux: &Demuxed) -> Result<Decoded, DecodeError> {
         .map(|&s| f64::from(s))
         .collect();
     let hf2_skip = hf2_head.pre_skip as usize;
-    if hf2_raw.len() < hf2_skip * 2 {
-        return Err(DecodeError::ShortOutput {
-            have: (hf2_raw.len() / 2) as u64,
-            need: hf2_skip as u64,
-        });
-    }
-    let hf2_after: Vec<f64> = hf2_raw[hf2_skip * 2..]
-        .iter()
-        .map(|&s| f64::from(s))
-        .collect();
+    let hf2_after: Vec<f64> = if three_track {
+        // The A_OPUSHF stream decodes at 16 kHz: upsample back to 48 kHz
+        // (zero-phase, grid-exact x3), shift the baseband content back up
+        // to the 15.6 kHz+ band, then drop the pre-skip (48 kHz units).
+        let raw16: Vec<f64> = hf2_raw.iter().map(|&s| f64::from(s)).collect();
+        let up = Resampler::new(sena_core::HF_TRACK_RATE, SAMPLE_RATE).process(&raw16, 2);
+        if up.len() < hf2_skip * 2 {
+            return Err(DecodeError::ShortOutput {
+                have: (up.len() / 2) as u64,
+                need: hf2_skip as u64,
+            });
+        }
+        let shifted = sena_dsp::shift_up_offset(
+            &up,
+            2,
+            sena_core::HF_SPLIT_HZ,
+            SAMPLE_RATE,
+            -(hf2_skip as i64),
+        );
+        shifted[hf2_skip * 2..].to_vec()
+    } else {
+        Vec::new()
+    };
 
     let lf48 = Resampler::new(core_rate as u32, SAMPLE_RATE).process(&lf_after, 2);
     let hf48 = hf_after;
@@ -662,7 +698,8 @@ impl Decoded {
     pub fn hf_track_pcm(&self) -> &[f64] {
         &self.hf_track_pcm
     }
-    /// A_OPUSHF (15.6 kHz+) track PCM; empty slice in the two-track layout.
+    /// A_OPUSHF (15.6 kHz+ band) track PCM; empty slice in the two-track
+    /// layout.
     pub fn hf2_track_pcm(&self) -> &[f64] {
         &self.hf2_track_pcm
     }

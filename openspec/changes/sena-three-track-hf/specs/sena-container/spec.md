@@ -6,10 +6,11 @@
 A Sena file is Matroska with exactly one `A_OPUS` track, exactly one
 `A_SENALF` track, and optionally (three-track layout, `SENA_PROFILE`
 `<lf>@15600`) exactly one `A_OPUSHF` track. The `A_OPUSHF` track carries
-an Opus stream (OpusHead private data, 48000 Hz, 2 channels, 20 ms
-packets) covering 15600 Hz - Nyquist, with its own CodecDelay matching
-its OpusHead pre-skip. `A_OPUSHF` without the three-track profile tag
-(or vice versa) is a format error.
+an Opus stream (OpusHead private data, 16000 Hz, 2 channels, 20 ms
+packets) holding the 15600 Hz+ band SSB-shifted down to baseband, with
+its own CodecDelay matching its OpusHead pre-skip (48 kHz units). The
+track's Matroska sampling rate is 16000 Hz. `A_OPUSHF` without the
+three-track profile tag (or vice versa) is a format error.
 
 #### Scenario: three-track file
 - GIVEN `SENA_PROFILE=600@15600`

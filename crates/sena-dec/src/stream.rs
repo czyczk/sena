@@ -24,8 +24,29 @@ use crate::pipeline::{
     DecodeError, DecodedInfo, LfAuInfo, OpusPacketInfo, ReadInfo, SAMPLE_RATE, add_bits_interval,
     parse_opus_head,
 };
+use sena_dsp::HILBERT_DELAY;
 
 const MIN_CHUNK_FRAMES: u64 = 4800; // 100 ms @48k
+
+/// Emittable A_OPUSHF output frames (48 kHz, playable timeline) from the
+/// current `tf_raw` window: upsample the whole pending 16 kHz window, keep
+/// only fully-supported outputs (resampler guard on the right unless the
+/// stream is finished, Hilbert half-length for the shift), and count what
+/// lies ahead of the current emit point. Negative means "need more input".
+fn tf_emittable(st: &State) -> i128 {
+    let Some(rs) = st.tf_resampler.as_ref() else {
+        return i128::MAX;
+    };
+    let w16 = st.tf_raw.len() / 2;
+    let right_cap = if st.finished {
+        rs.output_frames(w16)
+    } else {
+        rs.output_frames(w16.saturating_sub(rs.guard_frames()))
+            .saturating_sub(HILBERT_DELAY)
+    };
+    let j_start = st.produced as i128 + st.tf_trim as i128 - 3 * st.tf_base16 as i128;
+    right_cap as i128 - j_start
+}
 
 /// Where codec frame payloads come from. Both variants share the same
 /// `FrameRef` index; only the payload fetch differs.
@@ -118,7 +139,9 @@ struct State {
     lf_skip_aus: usize,
     hf_skip_pkts: usize,
     /// A_OPUSHF (three-track layout): own pre-skip trim and seek-skip
-    /// counter; `tf` decoders stay None for a two-track file.
+    /// counter; `tf` decoders stay None for a two-track file. `tf_trim` is
+    /// in 48 kHz units (the OpusHead pre-skip convention) and is applied on
+    /// the upsampled/shifted timeline, not on the raw 16 kHz samples.
     tf_trim: usize,
     tf_skip_pkts: usize,
     /// Seek (true): keep the raw LF context before the trim point so the
@@ -140,15 +163,25 @@ struct State {
     lf_zero_prefix: usize,
     xdec: UsacDecoder,
     opus: OpusDecoder,
-    /// Decoder for the A_OPUSHF track (three-track layout only).
+    /// Decoder for the A_OPUSHF track (three-track layout only): decodes
+    /// the 16 kHz shifted-baseband stream.
     opus2: Option<OpusDecoder>,
+    /// 16 kHz -> 48 kHz zero-phase resampler for the A_OPUSHF track.
+    tf_resampler: Option<Resampler>,
     frame_index: usize,
     lf_raw: VecDeque<f32>,
     hf_raw: VecDeque<f32>,
-    /// Decoded samples of the A_OPUSHF track (empty for two-track files).
+    /// Decoded 16 kHz samples of the A_OPUSHF track (empty for two-track
+    /// files); the head frame corresponds to raw 16 kHz index `tf_base16`.
     tf_raw: VecDeque<f32>,
+    /// Total raw 16 kHz frames drained from the `tf_raw` head so far.
+    tf_base16: usize,
+    /// Playable frame index of the last (re)start: the shift-up carrier
+    /// phase is locked to the playable timeline (phase 0 at frame 0).
+    tf_seek_base: u64,
     lf_total_before: i128,
     opus_total_before: i128,
+    /// Decoded tf frames in 48 kHz units (3x the 16 kHz count).
     tf_total_before: i128,
     lf_infos: Vec<LfAuInfo>,
     opus_infos: Vec<OpusPacketInfo>,
@@ -229,14 +262,23 @@ impl StreamingDecoder {
                 .map_err(|e| DecodeError::Codec(format!("opus output gain: {e}")))?;
         }
         let mut opus2 = None;
+        let mut tf_resampler = None;
         if let Some(head) = tf_head.as_ref() {
-            let mut d = OpusDecoder::new(SAMPLE_RATE, Channels::Stereo)
+            if head.input_rate != sena_core::HF_TRACK_RATE {
+                return Err(DecodeError::Unsupported(format!(
+                    "A_OPUSHF OpusHead input sample rate {}, expected {}",
+                    head.input_rate,
+                    sena_core::HF_TRACK_RATE
+                )));
+            }
+            let mut d = OpusDecoder::new(sena_core::HF_TRACK_RATE, Channels::Stereo)
                 .map_err(|e| DecodeError::Codec(format!("opus init (A_OPUSHF): {e}")))?;
             if head.output_gain != 0 {
                 d.set_gain(i32::from(head.output_gain))
                     .map_err(|e| DecodeError::Codec(format!("opus output gain: {e}")))?;
             }
             opus2 = Some(d);
+            tf_resampler = Some(Resampler::new(sena_core::HF_TRACK_RATE, SAMPLE_RATE));
         }
         let tf_trim = tf_head.as_ref().map_or(0, |h| h.pre_skip as usize);
         self.state = Some(State {
@@ -255,10 +297,13 @@ impl StreamingDecoder {
             xdec,
             opus,
             opus2,
+            tf_resampler,
             frame_index: 0,
             lf_raw: VecDeque::new(),
             hf_raw: VecDeque::new(),
             tf_raw: VecDeque::new(),
+            tf_base16: 0,
+            tf_seek_base: 0,
             lf_total_before: 0,
             opus_total_before: 0,
             tf_total_before: 0,
@@ -343,8 +388,11 @@ impl StreamingDecoder {
             });
             st.lf_total_before += samples as i128;
         } else if tf_num == Some(frame.track) {
-            // A_OPUSHF (three-track layout): an independent opus stream over
-            // b19/b20; skipped packets at a seek jump straight by index.
+            // A_OPUSHF (three-track layout): an independent 16 kHz opus
+            // stream carrying the SSB-shifted top band; skipped packets at
+            // a seek jump straight by index. Packet bookkeeping is in 48
+            // kHz units (x3) so the bit accounting matches the output
+            // timeline.
             if st.tf_skip_pkts > 0 {
                 st.tf_skip_pkts -= 1;
                 return Ok(true);
@@ -371,10 +419,10 @@ impl StreamingDecoder {
             st.tf_raw.extend(buf[..n * 2].iter().copied());
             st.tf_infos.push(OpusPacketInfo {
                 start_48k: st.tf_total_before,
-                samples_48k: n as i128,
+                samples_48k: (n * 3) as i128,
                 bits: (data.len() * 8) as u64,
             });
-            st.tf_total_before += n as i128;
+            st.tf_total_before += (n * 3) as i128;
         } else if frame.track == mid_num {
             if st.hf_skip_pkts > 0 {
                 st.hf_skip_pkts -= 1;
@@ -501,13 +549,12 @@ impl StreamingDecoder {
     }
 
     fn produce_chunk(&mut self) -> Result<(), DecodeError> {
-        let (lf_skip, hf_skip, tf_skip, trim_after) = {
+        let (lf_skip, hf_skip, trim_after) = {
             let st = self.state.as_ref().unwrap();
             let first = st.first;
             (
                 if first { st.lf_trim } else { 0 },
                 if first { st.hf_trim } else { 0 },
-                if first { st.tf_trim } else { 0 },
                 first && st.lf_trim_after,
             )
         };
@@ -515,15 +562,16 @@ impl StreamingDecoder {
             let st = self.state.as_ref().unwrap();
             // Fresh = buffered beyond the retained left context and the
             // one-time leading trim (at a seek the trim region is itself
-            // kept as context).
+            // kept as context). The A_OPUSHF readiness additionally covers
+            // its resample + shift-up latency.
             let fresh_lf = (st.lf_raw.len() / 2)
                 .saturating_sub(st.lf_ctx + if trim_after { 0 } else { lf_skip });
             let fresh_hf = (st.hf_raw.len() / 2).saturating_sub(hf_skip);
-            let fresh_tf = (st.tf_raw.len() / 2).saturating_sub(tf_skip);
+            let fresh_tf = st.opus2.is_none() || tf_emittable(st) > 0;
             (
                 st.lf_ctx,
                 st.lf_resampler.guard_frames(),
-                fresh_lf == 0 || fresh_hf == 0 || (st.opus2.is_some() && fresh_tf == 0),
+                fresh_lf == 0 || fresh_hf == 0 || !fresh_tf,
             )
         };
         if raw_empty {
@@ -542,7 +590,11 @@ impl StreamingDecoder {
         }
 
         let has_tf = self.state.as_ref().unwrap().opus2.is_some();
-        let (lf48, lf_off, hf_after, tf_after, take, start, rate, lf_pass_core, lf_consume_core) = {
+        struct TfOut {
+            shifted: Vec<f64>,
+            j_start: usize,
+        }
+        let (lf48, lf_off, hf_after, tf_out, take, start, rate, lf_pass_core, lf_consume_core) = {
             let st = self.state.as_ref().unwrap();
             let resampler = &st.lf_resampler;
             // The resample window is the whole pending LF raw: retained left
@@ -570,12 +622,41 @@ impl StreamingDecoder {
                 .skip(hf_skip * 2)
                 .map(|&s| f64::from(s))
                 .collect();
-            let tf_after: Vec<f64> = st
-                .tf_raw
-                .iter()
-                .skip(tf_skip * 2)
-                .map(|&s| f64::from(s))
-                .collect();
+            // A_OPUSHF: upsample the whole pending 16 kHz window to 48 kHz
+            // and shift the baseband content back up to the 15.6 kHz+ band.
+            // The carrier phase is locked to the playable timeline (frame 0
+            // = phase 0), so a seek just changes the window origin. The
+            // leading trim is applied through the j_start index below (the
+            // pre-target region stays in the window as left context, which
+            // keeps the resampler/Hilbert edges identical to the whole-file
+            // decode).
+            let tf_out = if has_tf {
+                let rs = st.tf_resampler.as_ref().unwrap();
+                let win16: Vec<f64> = st.tf_raw.iter().map(|&s| f64::from(s)).collect();
+                let up = rs.process(&win16, 2);
+                let origin =
+                    st.tf_seek_base as i64 + 3 * st.tf_base16 as i64 - st.tf_trim as i64;
+                let shifted = sena_dsp::shift_up_offset(
+                    &up,
+                    2,
+                    sena_core::HF_SPLIT_HZ,
+                    SAMPLE_RATE,
+                    origin,
+                );
+                let j_start = st.produced as i128 + st.tf_trim as i128
+                    - 3 * st.tf_base16 as i128;
+                if j_start < 0 {
+                    return Err(DecodeError::Format(
+                        "A_OPUSHF window underrun (negative emit index)".into(),
+                    ));
+                }
+                Some(TfOut {
+                    shifted,
+                    j_start: j_start as usize,
+                })
+            } else {
+                None
+            };
             let lf48 = resampler.process(&lf_after, 2);
             let lf_off = resampler.output_frames(window_front_core);
             // Without a right guard the window tail would ring; emit only
@@ -590,25 +671,39 @@ impl StreamingDecoder {
             let n = right_cap
                 .saturating_sub(lf_off)
                 .min(hf_after.len() / 2)
-                .min(if st.opus2.is_some() {
-                    tf_after.len() / 2
+                .min(if let Some(t) = &tf_out {
+                    let w48 = t.shifted.len() / 2;
+                    let cap = if st.finished {
+                        w48
+                    } else {
+                        let rs = st.tf_resampler.as_ref().unwrap();
+                        rs.output_frames((st.tf_raw.len() / 2).saturating_sub(rs.guard_frames()))
+                            .saturating_sub(HILBERT_DELAY)
+                    };
+                    cap.saturating_sub(t.j_start)
                 } else {
                     usize::MAX
                 });
             let remaining = self.info.playable_frames.saturating_sub(st.produced);
             let mut take = (n as u64).min(remaining) as usize;
+            if take == 0 {
+                return Ok(());
+            }
             // The rational ratio only represents some output counts exactly;
             // trim up to 2 frames from the chunk so the resampler can map the
             // consumed core count one-to-one (the frames are emitted by the
-            // next chunk).
-            let consume_core = loop {
-                if take == 0 {
-                    return Ok(());
+            // next chunk). At stream end the window tail is zero-padded
+            // anyway, so the final chunk emits everything left regardless of
+            // representability (the bookkeeping is moot once drained).
+            let consume_core = if st.finished {
+                window_core.saturating_sub(front_core)
+            } else {
+                loop {
+                    if let Some(k) = resampler.input_frames_for_output(take) {
+                        break k;
+                    }
+                    take -= 1;
                 }
-                if let Some(k) = resampler.input_frames_for_output(take) {
-                    break k;
-                }
-                take -= 1;
             };
             // Core samples passed over from the `lf_raw` head up to the new
             // fresh base: context/trim region plus the consumed fresh part.
@@ -632,7 +727,7 @@ impl StreamingDecoder {
                 lf48,
                 lf_off,
                 hf_after,
-                tf_after,
+                tf_out,
                 take,
                 start,
                 rate,
@@ -648,11 +743,14 @@ impl StreamingDecoder {
             let r = lf48[(i + lf_off) * 2 + 1] * gain;
             let hl = hf_after[i * 2] * gain;
             let hr = hf_after[i * 2 + 1] * gain;
-            // A_OPUSHF mixes on top when the layout carries it (tf_after is
-            // empty for two-track files, so tf sample access stays in-bounds
-            // by the min() above).
-            let (tl, tr) = if has_tf {
-                (tf_after[i * 2] * gain, tf_after[i * 2 + 1] * gain)
+            // A_OPUSHF mixes on top when the layout carries it: the shifted
+            // band restored to 15.6 kHz+ (j_start indexes the window at the
+            // chunk's first playable frame).
+            let (tl, tr) = if let Some(t) = &tf_out {
+                (
+                    t.shifted[(t.j_start + i) * 2] * gain,
+                    t.shifted[(t.j_start + i) * 2 + 1] * gain,
+                )
             } else {
                 (0.0, 0.0)
             };
@@ -665,13 +763,34 @@ impl StreamingDecoder {
             st.output.extend(chunk_out);
             st.produced = start + take as u64;
             // Retain the last `lf_guard` core samples of the passed region as
-            // the next chunk's left context; drop everything older.
-            let retain = lf_pass_core.min(st.lf_resampler.guard_frames());
-            st.lf_raw.drain(..(lf_pass_core - retain) * 2);
-            st.lf_ctx = retain;
+            // the next chunk's left context; drop everything older. The
+            // drain must stay on the resampler's decimation grid (multiple
+            // of m): an off-grid window base would shift all later outputs
+            // by a fraction of a frame against the whole-file decode.
+            let grid = st.lf_resampler.decimation();
+            let fresh_drain = lf_pass_core.saturating_sub(st.lf_resampler.guard_frames());
+            let drain_core = fresh_drain - fresh_drain % grid;
+            st.lf_raw.drain(..drain_core * 2);
+            st.lf_ctx = lf_pass_core - drain_core;
             st.hf_raw.drain(..(hf_skip + take) * 2);
             if st.opus2.is_some() {
-                st.tf_raw.drain(..(tf_skip + take) * 2);
+                // Drain only raw 16 kHz frames whose 48 kHz support is fully
+                // behind the next emit point: the shift needs HILBERT_DELAY
+                // frames of left context and the resampler its guard, both
+                // covered by keeping everything from
+                // (j_next - HILBERT_DELAY)/3 - guard - 1 onward.
+                let rs = st.tf_resampler.as_ref().unwrap();
+                let j_next = (st.produced + st.tf_trim as u64) as i128
+                    - 3 * st.tf_base16 as i128;
+                let keep_from16 =
+                    ((j_next - HILBERT_DELAY as i128) / 3 - rs.guard_frames() as i128 - 1).max(0)
+                        as usize;
+                let cur16 = st.tf_raw.len() / 2;
+                let drain = keep_from16.min(cur16);
+                if drain > 0 {
+                    st.tf_raw.drain(..drain * 2);
+                    st.tf_base16 += drain;
+                }
             }
             // `lf_consume_core` bookkeeping for the bit accounting: the infos
             // track the fresh timeline, which advances by the consumed count
@@ -724,8 +843,11 @@ impl StreamingDecoder {
                         ((st.hf_raw.len() / 2) as i128 - trim).max(0) as u64
                     };
                     let tf_ready = {
-                        let trim = if st.first { st.tf_trim as i128 } else { 0 };
-                        ((st.tf_raw.len() / 2) as i128 - trim).max(0) as u64
+                        // Emittable shifted-band frames ahead of the emit
+                        // point (accounts the resampler guard and the
+                        // Hilbert half-length; the trim region stays in the
+                        // window as context).
+                        tf_emittable(st).max(0) as u64
                     };
                     let ready = lf_ready.min(hf_ready);
                     (
@@ -850,11 +972,16 @@ impl StreamingDecoder {
         let j0 = (f + pre_skip) / 960;
         let hf_trim = f + pre_skip - j0 * 960;
 
-        // A_OPUSHF jumps by its own packet index / pre-skip.
+        // A_OPUSHF jumps by its own packet index / pre-skip. The jump backs
+        // off up to 8 packets (160 ms) so the zero-phase upsampler and the
+        // shift-up Hilbert have real context at the target frame; the extra
+        // packets decode into the window and are trimmed by the index math.
         let (tf_j0, tf_trim) = match self.tracks.iter().find(|t| t.codec_id == "A_OPUSHF") {
             Some(t) => {
                 let ps = parse_opus_head(&t.codec_private)?.pre_skip as usize;
                 let j0 = (f + ps) / 960;
+                let ctx = j0.min(8);
+                let j0 = j0 - ctx;
                 (j0, f + ps - j0 * 960)
             }
             None => (0, 0),
@@ -873,6 +1000,7 @@ impl StreamingDecoder {
             st.lf_skip_aus = start_au;
             st.hf_skip_pkts = j0;
             st.tf_skip_pkts = tf_j0;
+            st.tf_seek_base = frame;
             if st.opus2.is_some() {
                 st.tf_trim = tf_trim;
             }
@@ -1004,6 +1132,69 @@ mod tests {
                 "{asset}: max streaming-vs-whole-file diff {max}"
             );
         }
+    }
+
+    /// Three-track seek: the A_OPUSHF track jumps by packet index (with a
+    /// few packets of context back-off for the upsample/shift chain) and
+    /// the playable length stays exact. seek(0) reproduces the continuous
+    /// decode bit-closely; a mid-file seek is within the LF track's
+    /// documented format-inherent inexactness (identical magnitude to the
+    /// two-track layout).
+    #[test]
+    fn three_track_seek() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../assets/e2e/01__p600__3t__hf160+64.sena"
+        );
+        let bytes = std::fs::read(path).unwrap();
+        let whole = crate::pipeline::decode(&Demuxed::parse(bytes.clone()).unwrap()).unwrap();
+        let whole_pcm: Vec<f32> = whole.pcm_f64().iter().map(|&v| v as f32).collect();
+        let playable = whole.info().playable_frames as usize;
+
+        // seek(0): bit-close to the continuous decode.
+        let mut dec = StreamingDecoder::open(Demuxed::parse(bytes.clone()).unwrap()).unwrap();
+        dec.seek(0).unwrap();
+        let mut got = Vec::new();
+        let mut buf = vec![0.0f32; 4096 * 2];
+        loop {
+            let n = dec.read_f32(&mut buf, 4096).unwrap();
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..n as usize * 2]);
+        }
+        assert_eq!(got.len(), playable * 2);
+        let max = got
+            .iter()
+            .zip(whole_pcm.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max < 1e-4, "seek(0) vs continuous: {max}");
+
+        // Mid-file seek: exact length; the diff stays within the LF seek
+        // inexactness class (the LF AU jump dominates; the top band rejoins
+        // after its ~160 ms context window).
+        let target = (playable / 3) as u64;
+        let mut dec = StreamingDecoder::open(Demuxed::parse(bytes).unwrap()).unwrap();
+        dec.seek(target).unwrap();
+        let mut got = Vec::new();
+        loop {
+            let n = dec.read_f32(&mut buf, 4096).unwrap();
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..n as usize * 2]);
+        }
+        assert_eq!(got.len(), (playable - target as usize) * 2);
+        let settle = 24000; // 0.5 s
+        let mut max = 0.0f32;
+        for i in settle..playable - target as usize {
+            for c in 0..2 {
+                let d = (got[i * 2 + c] - whole_pcm[target as usize * 2 + i * 2 + c]).abs();
+                max = max.max(d);
+            }
+        }
+        assert!(max < 1.1, "mid-file seek diff {max}");
     }
 
     /// Regression guard for the foobar2000 macOS stack overflow: the fb2k
