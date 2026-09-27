@@ -70,11 +70,20 @@ uint64_t cb_size(void * ctx) {
     try { t_filesize s = c->f->get_size(*c->abort); return s == filesize_invalid ? UINT64_MAX : (uint64_t)s; } catch (...) { return UINT64_MAX; }
 }
 
-bool load_entries(service_ptr_t<file> f, abort_callback & abort, pfc::list_t<art_entry> & out) {
-    io_ctx ctx = { f, &abort };
+SenaFileIo make_file_io(io_ctx & ctx) {
     SenaFileIo io{};
     io.user_data = &ctx;
-    io.read = cb_read; io.write = cb_write; io.seek = cb_seek; io.tell = cb_tell; io.size = cb_size;
+    io.read = cb_read;
+    io.write = cb_write;
+    io.seek = cb_seek;
+    io.tell = cb_tell;
+    io.size = cb_size;
+    return io;
+}
+
+bool load_entries(service_ptr_t<file> f, abort_callback & abort, pfc::list_t<art_entry> & out) {
+    io_ctx ctx = { f, &abort };
+    SenaFileIo io = make_file_io(ctx);
     SenaArtHandle * list = nullptr;
     char err[256] = {};
     int rc = sena_file_art_read(&io, &list, err, sizeof(err));
@@ -99,9 +108,7 @@ bool load_entries(service_ptr_t<file> f, abort_callback & abort, pfc::list_t<art
 
 bool save_entries(service_ptr_t<file> f, abort_callback & abort, const pfc::list_t<art_entry> & entries) {
     io_ctx ctx = { f, &abort };
-    SenaFileIo io{};
-    io.user_data = &ctx;
-    io.read = cb_read; io.write = cb_write; io.seek = cb_seek; io.tell = cb_tell; io.size = cb_size;
+    SenaFileIo io = make_file_io(ctx);
     pfc::list_t<SenaArtInput> inputs;
     for (t_size i = 0; i < entries.get_count(); i++) {
         const art_entry & e = entries[i];

@@ -72,6 +72,34 @@ static uint64_t sena_io_size(void *opaque)
     return size > 0 ? (uint64_t)size : 0;
 }
 
+/* IO-callback tables over the demuxer's AVIOContext. The decode handle and
+ * the file/tag/art entry points take different struct types; both wrap the
+ * same trampolines above. */
+static SenaDecIo sena_dec_io(AVIOContext *pb)
+{
+    SenaDecIo io = {
+        .user_data = pb,
+        .read      = sena_io_read,
+        .seek      = sena_io_seek,
+        .tell      = sena_io_tell,
+        .size      = sena_io_size,
+    };
+    return io;
+}
+
+static SenaFileIo sena_file_io(AVIOContext *pb)
+{
+    SenaFileIo io = {
+        .user_data = pb,
+        .read      = sena_io_read,
+        .write     = NULL,
+        .seek      = sena_io_seek,
+        .tell      = sena_io_tell,
+        .size      = sena_io_size,
+    };
+    return io;
+}
+
 /* --------------------------------------------------------------- demuxer */
 
 /* Image mime -> codec mapping for Matroska attachments (cover art). */
@@ -99,14 +127,7 @@ static void sena_read_attachments(AVFormatContext *s)
 {
     SenaDemuxContext *c = s->priv_data;
     SenaArtHandle *art = NULL;
-    SenaFileIo io = {
-        .user_data = s->pb,
-        .read      = sena_io_read,
-        .write     = NULL,
-        .seek      = sena_io_seek,
-        .tell      = sena_io_tell,
-        .size      = sena_io_size,
-    };
+    SenaFileIo io = sena_file_io(s->pb);
     char err[128] = { 0 };
     uint32_t i, n;
 
@@ -169,14 +190,7 @@ static void sena_read_metadata(AVFormatContext *s, const SenaDecInfo *info)
 {
     SenaDemuxContext *c = s->priv_data;
     SenaTags *tags = NULL;
-    SenaFileIo io = {
-        .user_data = s->pb,
-        .read      = sena_io_read,
-        .write     = NULL,
-        .seek      = sena_io_seek,
-        .tell      = sena_io_tell,
-        .size      = sena_io_size,
-    };
+    SenaFileIo io = sena_file_io(s->pb);
     char err[128] = { 0 };
     uint32_t i, n;
 
@@ -204,13 +218,7 @@ static void sena_read_metadata(AVFormatContext *s, const SenaDecInfo *info)
 static int sena_read_header(AVFormatContext *s)
 {
     SenaDemuxContext *c = s->priv_data;
-    SenaDecIo io = {
-        .user_data = s->pb,
-        .read      = sena_io_read,
-        .seek      = sena_io_seek,
-        .tell      = sena_io_tell,
-        .size      = sena_io_size,
-    };
+    SenaDecIo io = sena_dec_io(s->pb);
     SenaDecInfo info;
     AVStream *st;
     char err[256] = { 0 };

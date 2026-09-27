@@ -22,6 +22,29 @@ void throw_sena_error(int code) {
 
 } // namespace
 
+// IO-callback tables over this instance's file handle; the decode and
+// tag/art entry points take different struct types but share the trampolines.
+SenaDecIo input_sena::make_dec_io() {
+    SenaDecIo io{};
+    io.user_data = this;
+    io.read = io_read;
+    io.seek = io_seek;
+    io.tell = io_tell;
+    io.size = io_size;
+    return io;
+}
+
+SenaFileIo input_sena::make_file_io() {
+    SenaFileIo io{};
+    io.user_data = this;
+    io.read = io_read;
+    io.write = io_write;
+    io.seek = io_seek;
+    io.tell = io_tell;
+    io.size = io_size;
+    return io;
+}
+
 input_sena::~input_sena() {
     // Drops the Rust decoder handle (index + buffers). Pure deallocation:
     // no io callbacks fire during sena_dec_close, so no abort_callback is
@@ -50,12 +73,7 @@ void input_sena::get_info(file_info &info, abort_callback &abort) {
         if (!m_has_probe) {
             m_abort = &abort;
             m_file->reopen(abort);
-            SenaDecIo io{};
-            io.user_data = this;
-            io.read = io_read;
-            io.seek = io_seek;
-            io.tell = io_tell;
-            io.size = io_size;
+            SenaDecIo io = make_dec_io();
             char errbuf[256];
             int rc = sena_dec_probe_info(&io, &m_probe_info, errbuf, sizeof(errbuf));
             if (rc != SENA_DEC_OK) {
@@ -226,14 +244,7 @@ void input_sena::retag(const file_info &info, abort_callback &abort) {
         entries.add_item(SenaMetaEntry{rg_names[i].get_ptr(), rg_values[i].get_ptr()});
     }
 
-    SenaFileIo io{};
-    io.user_data = this;
-    io.read = io_read;
-    io.write = io_write;
-    io.seek = io_seek;
-    io.tell = io_tell;
-    io.size = io_size;
-
+    SenaFileIo io = make_file_io();
     char errbuf[256];
     int rc = sena_file_write_tags(&io, entries.get_ptr(), (uint32_t)entries.get_count(), errbuf, sizeof(errbuf));
     if (rc != SENA_DEC_OK) {
@@ -244,14 +255,7 @@ void input_sena::retag(const file_info &info, abort_callback &abort) {
 void input_sena::remove_tags(abort_callback &abort) {
     m_abort = &abort;
     m_file->reopen(abort);
-    SenaFileIo io{};
-    io.user_data = this;
-    io.read = io_read;
-    io.write = io_write;
-    io.seek = io_seek;
-    io.tell = io_tell;
-    io.size = io_size;
-
+    SenaFileIo io = make_file_io();
     char errbuf[256];
     int rc = sena_file_remove_tags(&io, errbuf, sizeof(errbuf));
     if (rc != SENA_DEC_OK) {
@@ -284,12 +288,7 @@ void input_sena::open_decoder(abort_callback &abort) {
     // do it here rather than at every call site (decode_initialize, the lazy
     // decode_run/decode_seek fallback).
     m_file->reopen(abort);
-    SenaDecIo io{};
-    io.user_data = this;
-    io.read = io_read;
-    io.seek = io_seek;
-    io.tell = io_tell;
-    io.size = io_size;
+    SenaDecIo io = make_dec_io();
     char errbuf[256];
     int rc = sena_dec_open(&io, &m_dec, errbuf, sizeof(errbuf));
     if (rc != SENA_DEC_OK) {
@@ -310,14 +309,7 @@ void input_sena::read_user_tags(file_info &info, abort_callback &abort) {
         return;
     }
     m_file->reopen(abort);
-    SenaFileIo io{};
-    io.user_data = this;
-    io.read = io_read;
-    io.write = io_write;
-    io.seek = io_seek;
-    io.tell = io_tell;
-    io.size = io_size;
-
+    SenaFileIo io = make_file_io();
     SenaTags *tags = nullptr;
     char errbuf[256];
     if (sena_file_read_tags(&io, &tags, errbuf, sizeof(errbuf)) != SENA_DEC_OK) {

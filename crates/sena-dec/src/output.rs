@@ -45,11 +45,11 @@ fn f32_to_s16(x: f64, dither: &mut Option<SplitMix64>) -> i16 {
     (x * 32768.0 + noise).round().clamp(-32768.0, 32767.0) as i16
 }
 
-pub fn encode_wav(pcm: &[f64], format: SampleFormat, dither: Dither) -> Result<Vec<u8>, String> {
+fn encode_body(pcm: &[f64], format: SampleFormat, dither: Dither) -> Result<Vec<u8>, String> {
     if pcm.len() % 2 != 0 {
         return Err("interleaved stereo buffer has odd length".into());
     }
-    let mut body = match format {
+    Ok(match format {
         SampleFormat::F32 => {
             let mut b = Vec::with_capacity(pcm.len() * 4);
             for &s in pcm {
@@ -76,7 +76,11 @@ pub fn encode_wav(pcm: &[f64], format: SampleFormat, dither: Dither) -> Result<V
             }
             b
         }
-    };
+    })
+}
+
+pub fn encode_wav(pcm: &[f64], format: SampleFormat, dither: Dither) -> Result<Vec<u8>, String> {
+    let mut body = encode_body(pcm, format, dither)?;
     let data_len = u32::try_from(body.len()).map_err(|_| "audio too large for RIFF".to_string())?;
     let (format_tag, bits) = match format {
         SampleFormat::F32 => (3u16, 32u16),
@@ -101,36 +105,7 @@ pub fn encode_wav(pcm: &[f64], format: SampleFormat, dither: Dither) -> Result<V
 }
 
 pub fn encode_raw(pcm: &[f64], format: SampleFormat, dither: Dither) -> Result<Vec<u8>, String> {
-    let mut out = match format {
-        SampleFormat::F32 => {
-            let mut b = Vec::with_capacity(pcm.len() * 4);
-            for &s in pcm {
-                b.extend_from_slice(&(s as f32).to_le_bytes());
-            }
-            b
-        }
-        SampleFormat::S24 => {
-            let mut b = Vec::with_capacity(pcm.len() * 3);
-            for &s in pcm {
-                let q = f32_to_s24(s);
-                b.extend_from_slice(&q.to_le_bytes()[..3]);
-            }
-            b
-        }
-        SampleFormat::S16 => {
-            let mut rng = match dither {
-                Dither::Tpdf => Some(SplitMix64::new(0x5345_4E41_0000_0001)),
-                Dither::None => None,
-            };
-            let mut b = Vec::with_capacity(pcm.len() * 2);
-            for &s in pcm {
-                b.extend_from_slice(&f32_to_s16(s, &mut rng).to_le_bytes());
-            }
-            b
-        }
-    };
-    out.retain(|_| true);
-    Ok(out)
+    encode_body(pcm, format, dither)
 }
 
 #[cfg(test)]

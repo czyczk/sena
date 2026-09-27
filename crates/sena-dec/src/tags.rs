@@ -58,10 +58,6 @@ where
         Ok(len + 1)
     }
 
-    fn vint_len(first: u8) -> Result<usize, String> {
-        id_len(first)
-    }
-
     // `buf` holds exactly one element header; `base` is its absolute offset.
     fn elem_at(buf: &[u8], base: u64) -> Result<(Vec<u8>, crate::demux::Elem), String> {
         let idl = id_len(*buf.first().ok_or("empty element header")?)?;
@@ -106,7 +102,7 @@ where
         let sizefirst = *read_at(pos + idl as u64, 1)?
             .first()
             .ok_or("unexpected end of file in EBML size")?;
-        let sizel = vint_len(sizefirst)?;
+        let sizel = id_len(sizefirst)?;
         buf.push(sizefirst);
         if sizel > 1 {
             buf.extend(read_at(pos + idl as u64 + 1, sizel - 1)?);

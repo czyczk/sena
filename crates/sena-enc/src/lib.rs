@@ -3,7 +3,6 @@
 use sena_core::{PRE_GAIN, Profile, SAMPLE_RATE};
 use sena_mux::mka::{self, Frame, Track};
 use sha2::{Digest, Sha256};
-use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -1293,13 +1292,6 @@ fn find_aus(f: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
     Ok(aus)
 }
 
-#[allow(dead_code)]
-fn _io_write(v: &[u8]) -> std::io::Result<()> {
-    let s = Stdio::piped();
-    let _ = s;
-    std::io::stdout().write_all(v)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1585,6 +1577,190 @@ mod tests {
             .fold(0.0, f64::max);
         assert!(mh < 1e-6, "HF max diff {mh}");
         let _ = std::fs::remove_dir_all(&wd);
+    }
+
+    /// Build a minimal m4a: moov(trak(mdia(mdhd, minf(stbl(stsd(mp4a(esds)),
+    /// stsz, stco))))), mdat. Returns (bytes, asc, aus).
+    fn synth_m4a(asc: &[u8], aus: &[&[u8]], rate: u32, preamble: &[u8]) -> Vec<u8> {
+        fn bx(tag: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+            let mut out = Vec::new();
+            out.extend_from_slice(&((8 + payload.len()) as u32).to_be_bytes());
+            out.extend_from_slice(tag);
+            out.extend_from_slice(payload);
+            out
+        }
+        // MPEG-4 descriptors: ES (0x03) -> DecoderConfig (0x04) -> DecSpecific (0x05).
+        let mut desc = vec![0x05, asc.len() as u8];
+        desc.extend_from_slice(asc);
+        let mut dcfg = vec![0x04, (13 + desc.len()) as u8];
+        dcfg.extend_from_slice(&[0x40, 0x15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]); // 13 fixed
+        dcfg.extend_from_slice(&desc);
+        let mut es = vec![0x03, 3 + dcfg.len() as u8];
+        es.extend_from_slice(&[0, 1, 0]); // ES_ID + flags
+        es.extend_from_slice(&dcfg);
+        let mut esds_payload = vec![0u8; 4]; // version/flags
+        esds_payload.extend_from_slice(&es);
+        let esds = bx(b"esds", &esds_payload);
+
+        let mut mp4a_entry = Vec::new();
+        mp4a_entry.extend_from_slice(&[0u8; 6]); // reserved
+        mp4a_entry.extend_from_slice(&1u16.to_be_bytes()); // data reference index
+        mp4a_entry.extend_from_slice(&[0u8; 8]); // reserved
+        mp4a_entry.extend_from_slice(&2u16.to_be_bytes()); // channels
+        mp4a_entry.extend_from_slice(&16u16.to_be_bytes()); // sample size
+        mp4a_entry.extend_from_slice(&[0u8; 4]); // pre-defined + reserved
+        mp4a_entry.extend_from_slice(&(rate << 16).to_be_bytes()); // sample rate 16.16
+        let mut mp4a_full_payload = mp4a_entry.clone();
+        mp4a_full_payload.extend_from_slice(&esds);
+        let mp4a = bx(b"mp4a", &mp4a_full_payload);
+
+        let mut stsd_payload = vec![0u8; 4]; // version/flags
+        stsd_payload.extend_from_slice(&1u32.to_be_bytes()); // entry count
+        stsd_payload.extend_from_slice(&mp4a);
+        let stsd = bx(b"stsd", &stsd_payload);
+
+        let mut stsz_payload = vec![0u8; 4];
+        stsz_payload.extend_from_slice(&0u32.to_be_bytes()); // sample_size (variable)
+        stsz_payload.extend_from_slice(&(aus.len() as u32).to_be_bytes());
+        for au in aus {
+            stsz_payload.extend_from_slice(&(au.len() as u32).to_be_bytes());
+        }
+        let stsz = bx(b"stsz", &stsz_payload);
+
+        // stco is patched below once the mdat offset is known; reserve a
+        // placeholder chunk offset, then fix it up after assembling the file.
+        let stco_offset_pos;
+        let stco = {
+            let mut p = vec![0u8; 4];
+            p.extend_from_slice(&1u32.to_be_bytes()); // entry count
+            stco_offset_pos = 8 + 4 + 4; // header + verflags + count
+            p.extend_from_slice(&0u32.to_be_bytes());
+            bx(b"stco", &p)
+        };
+
+        let mut mdhd_payload = vec![0u8; 4]; // version 0 + flags
+        mdhd_payload.extend_from_slice(&[0u8; 8]); // creation + modification
+        mdhd_payload.extend_from_slice(&rate.to_be_bytes()); // timescale
+        mdhd_payload.extend_from_slice(&0u32.to_be_bytes()); // duration
+        mdhd_payload.extend_from_slice(&[0u8; 4]); // language + quality
+        let mdhd = bx(b"mdhd", &mdhd_payload);
+
+        let mut stbl = Vec::new();
+        stbl.extend_from_slice(&stsd);
+        stbl.extend_from_slice(&stsz);
+        stbl.extend_from_slice(&stco);
+        let minf = bx(b"minf", &bx(b"stbl", &stbl));
+        let mut mdia = Vec::new();
+        mdia.extend_from_slice(&mdhd);
+        mdia.extend_from_slice(&minf);
+        let trak = bx(b"trak", &bx(b"mdia", &mdia));
+        let moov = bx(b"moov", &trak);
+
+        let mut mdat_payload = preamble.to_vec();
+        let au0_file_offset = moov.len() + 8 + preamble.len();
+        for au in aus {
+            mdat_payload.extend_from_slice(au);
+        }
+        let mdat = bx(b"mdat", &mdat_payload);
+
+        let mut file = moov;
+        file.extend_from_slice(&mdat);
+        // Locate the stco tag anywhere in the file and patch its first entry.
+        let tag = b"stco";
+        for pos in 0..file.len().saturating_sub(4) {
+            if &file[pos..pos + 4] == tag {
+                let entry_pos = pos - 4 + stco_offset_pos;
+                file[entry_pos..entry_pos + 4]
+                    .copy_from_slice(&(au0_file_offset as u32).to_be_bytes());
+                break;
+            }
+        }
+        file
+    }
+
+    #[test]
+    fn m4a_extract_asc_and_aus() {
+        let asc = vec![0x2B, 0x92, 0x08];
+        let au0 = vec![1u8, 2, 3];
+        let au1 = vec![4u8, 5];
+        let bytes = synth_m4a(&asc, &[&au0, &au1], 16_000, &[0, 0]);
+        let dir = std::env::temp_dir().join(format!("sena-m4a-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.m4a");
+        std::fs::write(&path, &bytes).unwrap();
+        let (got_asc, got_aus) = extract_m4a(&path).unwrap();
+        assert_eq!(got_asc, asc);
+        assert_eq!(got_aus, vec![au0, au1]);
+        assert_eq!(m4a_stream_rate(&path).unwrap(), 16_000);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn m4a_extract_falls_back_to_mdat_preamble_without_stco() {
+        // Same file, but strip the stco box: extraction must fall back to the
+        // historical "two-byte preamble after the mdat header" assumption.
+        let asc = vec![0x2B];
+        let au = vec![9u8, 9, 9, 9];
+        let bytes = synth_m4a(&asc, &[&au], 16_000, &[0, 0]);
+        // Zero out the stco tag (leave the box in place but unrecognized).
+        let mut bytes = bytes;
+        let mut pos = 0usize;
+        while pos + 8 <= bytes.len() {
+            if &bytes[pos + 4..pos + 8] == b"stco" {
+                bytes[pos + 4..pos + 8].copy_from_slice(b"free");
+            }
+            let sz = u32::from_be_bytes([
+                bytes[pos],
+                bytes[pos + 1],
+                bytes[pos + 2],
+                bytes[pos + 3],
+            ]) as usize;
+            pos += sz.max(8);
+        }
+        let dir = std::env::temp_dir().join(format!("sena-m4a-test2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.m4a");
+        std::fs::write(&path, &bytes).unwrap();
+        let (got_asc, got_aus) = extract_m4a(&path).unwrap();
+        assert_eq!(got_asc, asc);
+        assert_eq!(got_aus, vec![au]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn m4a_boxes_iterator_bounds() {
+        // A truncated box (size larger than the buffer) must terminate the walk.
+        let mut f = Vec::new();
+        f.extend_from_slice(&100u32.to_be_bytes());
+        f.extend_from_slice(b"moov");
+        f.extend_from_slice(&[0u8; 4]); // short
+        let out = boxes(&f, 0, f.len());
+        assert!(out.is_empty());
+        // A zero/too-small size must terminate the walk (no infinite loop).
+        let mut f = Vec::new();
+        f.extend_from_slice(&4u32.to_be_bytes());
+        f.extend_from_slice(b"moov");
+        let out = boxes(&f, 0, f.len());
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn m4a_walk_descs_finds_specific_info() {
+        // 0x03 (ES) wrapping 0x04 (DecoderConfig) wrapping 0x05 (DecSpecific).
+        let payload = [0xAA, 0xBB];
+        let mut d = vec![0x05, payload.len() as u8];
+        d.extend_from_slice(&payload);
+        let mut dcfg = vec![0x04, 13 + d.len() as u8];
+        dcfg.extend_from_slice(&[0u8; 13]);
+        dcfg.extend_from_slice(&d);
+        let mut es = vec![0x03, 3 + dcfg.len() as u8];
+        es.extend_from_slice(&[0, 1, 0]);
+        es.extend_from_slice(&dcfg);
+        assert_eq!(walk_descs(&es, 0, es.len()), Some(payload.to_vec()));
+        // Truncated length must not over-read.
+        let mut short = vec![0x05, 10u8, 1];
+        assert_eq!(walk_descs(&short, 0, short.len()), None);
+        short.clear();
     }
 
     /// Three-track streaming DSP: mid.wav must equal the batch reference

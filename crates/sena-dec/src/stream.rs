@@ -28,6 +28,50 @@ use sena_dsp::HILBERT_DELAY;
 
 const MIN_CHUNK_FRAMES: u64 = 4800; // 100 ms @48k
 
+/// One Opus decode lane (the 48 kHz mid track or the 16 kHz A_OPUSHF top
+/// track): decoder, scratch state and bookkeeping shared by `decode_next_frame`.
+struct OpusLane<'a> {
+    dec: &'a mut OpusDecoder,
+    /// Track label for diagnostics ("Opus" / "A_OPUSHF").
+    name: &'static str,
+    errors: &'a mut usize,
+    raw: &'a mut VecDeque<f32>,
+    infos: &'a mut Vec<OpusPacketInfo>,
+    total_before: &'a mut i128,
+    /// 48 kHz samples per decoded sample: 1 at 48 kHz, 3 for the 16 kHz stream
+    /// (positions in `infos` are in 48 kHz units so bit accounting lines up
+    /// with the playable timeline).
+    scale: i128,
+}
+
+/// Decode one Opus packet with PLC fallback, append the PCM to the lane's
+/// raw queue and record the packet info.
+fn decode_opus_packet(lane: &mut OpusLane, data: &[u8], t_ns: u64) -> Result<(), DecodeError> {
+    let mut buf = vec![0.0f32; 5760 * 2];
+    let mut n = match lane.dec.decode_float(Some(data), &mut buf, DecodeMode::Normal) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!(
+                "warning: {} packet decode error ({t_ns}): {e}; using PLC",
+                lane.name
+            );
+            *lane.errors += 1;
+            lane.dec
+                .decode_float(None, &mut buf, DecodeMode::Normal)
+                .map_err(|e| DecodeError::Codec(format!("opus PLC ({}): {e}", lane.name)))?
+        }
+    };
+    n = n.min(5760);
+    lane.raw.extend(buf[..n * 2].iter().copied());
+    lane.infos.push(OpusPacketInfo {
+        start_48k: *lane.total_before,
+        samples_48k: (n as i128) * lane.scale,
+        bits: (data.len() * 8) as u64,
+    });
+    *lane.total_before += (n as i128) * lane.scale;
+    Ok(())
+}
+
 /// Emittable A_OPUSHF output frames (48 kHz, playable timeline) from the
 /// current `tf_raw` window: upsample the whole pending 16 kHz window, keep
 /// only fully-supported outputs (resampler guard on the right unless the
@@ -397,62 +441,34 @@ impl StreamingDecoder {
                 st.tf_skip_pkts -= 1;
                 return Ok(true);
             }
-            let opus2 = st
-                .opus2
-                .as_mut()
-                .ok_or_else(|| DecodeError::Format("A_OPUSHF frame without a decoder".into()))?;
-            let mut buf = vec![0.0f32; 5760 * 2];
-            let mut n = match opus2.decode_float(Some(&data), &mut buf, DecodeMode::Normal) {
-                Ok(n) => n,
-                Err(e) => {
-                    eprintln!(
-                        "warning: A_OPUSHF packet decode error ({}): {e}; using PLC",
-                        frame.t_ns
-                    );
-                    st.tf_errors += 1;
-                    opus2
-                        .decode_float(None, &mut buf, DecodeMode::Normal)
-                        .map_err(|e| DecodeError::Codec(format!("opus PLC (A_OPUSHF): {e}")))?
-                }
+            let mut lane = OpusLane {
+                dec: st
+                    .opus2
+                    .as_mut()
+                    .ok_or_else(|| DecodeError::Format("A_OPUSHF frame without a decoder".into()))?,
+                name: "A_OPUSHF",
+                errors: &mut st.tf_errors,
+                raw: &mut st.tf_raw,
+                infos: &mut st.tf_infos,
+                total_before: &mut st.tf_total_before,
+                scale: 3,
             };
-            n = n.min(5760);
-            st.tf_raw.extend(buf[..n * 2].iter().copied());
-            st.tf_infos.push(OpusPacketInfo {
-                start_48k: st.tf_total_before,
-                samples_48k: (n * 3) as i128,
-                bits: (data.len() * 8) as u64,
-            });
-            st.tf_total_before += (n * 3) as i128;
+            decode_opus_packet(&mut lane, &data, frame.t_ns)?;
         } else if frame.track == mid_num {
             if st.hf_skip_pkts > 0 {
                 st.hf_skip_pkts -= 1;
                 return Ok(true);
             }
-            let mut buf = vec![0.0f32; 5760 * 2];
-            let mut n = match st
-                .opus
-                .decode_float(Some(&data), &mut buf, DecodeMode::Normal)
-            {
-                Ok(n) => n,
-                Err(e) => {
-                    eprintln!(
-                        "warning: Opus packet decode error ({}): {e}; using PLC",
-                        frame.t_ns
-                    );
-                    st.opus_errors += 1;
-                    st.opus
-                        .decode_float(None, &mut buf, DecodeMode::Normal)
-                        .map_err(|e| DecodeError::Codec(format!("opus PLC: {e}")))?
-                }
+            let mut lane = OpusLane {
+                dec: &mut st.opus,
+                name: "Opus",
+                errors: &mut st.opus_errors,
+                raw: &mut st.hf_raw,
+                infos: &mut st.opus_infos,
+                total_before: &mut st.opus_total_before,
+                scale: 1,
             };
-            n = n.min(5760);
-            st.hf_raw.extend(buf[..n * 2].iter().copied());
-            st.opus_infos.push(OpusPacketInfo {
-                start_48k: st.opus_total_before,
-                samples_48k: n as i128,
-                bits: (data.len() * 8) as u64,
-            });
-            st.opus_total_before += n as i128;
+            decode_opus_packet(&mut lane, &data, frame.t_ns)?;
         } else {
             return Err(DecodeError::Format(format!(
                 "block for unknown track {} in a Sena file",

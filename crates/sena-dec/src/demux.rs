@@ -373,7 +373,9 @@ fn parse_simple_block(
         .ok_or(DemuxError::Truncated {
             context: "simpleblock body",
         })?;
-    Ok((track, rel as u64 as i128 as u64, body.to_vec()))
+    // Sign-extending cast: negative relative timestamps wrap into large u64
+    // values, and the caller's saturating_mul/add keeps them in range.
+    Ok((track, rel as u64, body.to_vec()))
 }
 
 /// Return the byte offsets of every top-level Cluster element (test/diagnostic
@@ -399,6 +401,22 @@ pub fn read_cluster_starts(data: &[u8]) -> Result<Vec<usize>, DemuxError> {
         Ok(())
     })?;
     Ok(out)
+}
+
+/// Track-count layout warnings shared by [`Demuxed::parse`] and
+/// [`index_container`] (both in-memory and bounded scans see the same tracks).
+fn layout_warnings(tracks: &[Track]) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if tracks.iter().filter(|t| t.codec_id == "A_OPUS").count() != 1 {
+        warnings.push("expected exactly one A_OPUS track".into());
+    }
+    if tracks.iter().filter(|t| t.codec_id == "A_SENALF").count() != 1 {
+        warnings.push("expected exactly one A_SENALF track".into());
+    }
+    if tracks.iter().filter(|t| t.codec_id == "A_OPUSHF").count() > 1 {
+        warnings.push("more than one A_OPUSHF track".into());
+    }
+    warnings
 }
 
 impl Demuxed {
@@ -485,35 +503,7 @@ impl Demuxed {
     }
 
     fn validate_layout(&mut self) {
-        if self
-            .tracks
-            .iter()
-            .filter(|t| t.codec_id == "A_OPUS")
-            .count()
-            != 1
-        {
-            self.warnings
-                .push("expected exactly one A_OPUS track".into());
-        }
-        if self
-            .tracks
-            .iter()
-            .filter(|t| t.codec_id == "A_SENALF")
-            .count()
-            != 1
-        {
-            self.warnings
-                .push("expected exactly one A_SENALF track".into());
-        }
-        if self
-            .tracks
-            .iter()
-            .filter(|t| t.codec_id == "A_OPUSHF")
-            .count()
-            > 1
-        {
-            self.warnings.push("more than one A_OPUSHF track".into());
-        }
+        self.warnings.extend(layout_warnings(&self.tracks));
     }
 
     pub fn bytes(&self) -> &[u8] {
@@ -773,7 +763,8 @@ fn walk_cluster_w<R: FnMut(u64, usize) -> Result<Vec<u8>, String>>(
             } else {
                 0
             };
-            let rel = rel as u64 as i128 as u64;
+            // Sign-extending cast (see parse_simple_block).
+            let rel = rel as u64;
             let t_ns = cluster_t
                 .saturating_mul(TIMECODE_SCALE_NS)
                 .saturating_add(rel.saturating_mul(TIMECODE_SCALE_NS));
@@ -882,16 +873,7 @@ pub fn index_container<R: FnMut(u64, usize) -> Result<Vec<u8>, String>>(
         p = e.data_end;
     }
 
-    let mut warnings = Vec::new();
-    if tracks.iter().filter(|t| t.codec_id == "A_OPUS").count() != 1 {
-        warnings.push("expected exactly one A_OPUS track".into());
-    }
-    if tracks.iter().filter(|t| t.codec_id == "A_SENALF").count() != 1 {
-        warnings.push("expected exactly one A_SENALF track".into());
-    }
-    if tracks.iter().filter(|t| t.codec_id == "A_OPUSHF").count() > 1 {
-        warnings.push("more than one A_OPUSHF track".into());
-    }
+    let warnings = layout_warnings(&tracks);
     Ok(IndexedFile {
         tracks,
         tags,

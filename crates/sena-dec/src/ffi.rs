@@ -327,12 +327,13 @@ where
     }
 }
 
-unsafe fn read_all(io: &SenaDecIo) -> Result<Vec<u8>, String> {
-    let read = io.read.ok_or("io: read callback is NULL")?;
+/// Slurp the whole stream through the read callback (used when the host
+/// cannot seek). Shared by the SenaDecIo and SenaFileIo wrappers below.
+unsafe fn slurp(user: *mut c_void, read: RawReadFn) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     let mut buf = vec![0u8; 64 * 1024];
     loop {
-        let n = unsafe { read(io.user_data, buf.as_mut_ptr().cast(), buf.len() as u64) };
+        let n = unsafe { read(user, buf.as_mut_ptr().cast(), buf.len() as u64) };
         if n < 0 {
             return Err(format!("io: read failed ({n})"));
         }
@@ -346,6 +347,11 @@ unsafe fn read_all(io: &SenaDecIo) -> Result<Vec<u8>, String> {
         out.extend_from_slice(&buf[..n]);
     }
     Ok(out)
+}
+
+unsafe fn read_all(io: &SenaDecIo) -> Result<Vec<u8>, String> {
+    let read = io.read.ok_or("io: read callback is NULL")?;
+    unsafe { slurp(io.user_data, read) }
 }
 
 unsafe fn read_file_at(io: &SenaFileIo, pos: u64, len: usize) -> Result<Vec<u8>, String> {
@@ -384,23 +390,7 @@ unsafe fn read_file_at(io: &SenaFileIo, pos: u64, len: usize) -> Result<Vec<u8>,
 
 unsafe fn read_all_file(io: &SenaFileIo) -> Result<Vec<u8>, String> {
     let read = io.read.ok_or("io: read callback is NULL")?;
-    let mut out = Vec::new();
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let n = unsafe { read(io.user_data, buf.as_mut_ptr().cast(), buf.len() as u64) };
-        if n < 0 {
-            return Err(format!("io: read failed ({n})"));
-        }
-        if n == 0 {
-            break;
-        }
-        let n = n as usize;
-        if n > buf.len() {
-            return Err("io: read callback returned more than the buffer size".into());
-        }
-        out.extend_from_slice(&buf[..n]);
-    }
-    Ok(out)
+    unsafe { slurp(io.user_data, read) }
 }
 
 /// In-place rewrite strategy: compare old and new bytes and write only the

@@ -38,6 +38,8 @@ private:
     void close_decoder();
     void read_user_tags(file_info &info, abort_callback &abort);
     void ensure_decoder(abort_callback &abort);
+    SenaDecIo make_dec_io();
+    SenaFileIo make_file_io();
     static int64_t io_read(void *ctx, void *buf, uint64_t len);
     static int64_t io_seek(void *ctx, int64_t offset, int whence);
     static int64_t io_tell(void *ctx);
