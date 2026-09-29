@@ -54,6 +54,9 @@ pub fn write_sena(
     ebml::uint(&mut te, &[0x83], 2); // audio
     ebml::str(&mut te, &[0x86], es::SENA_CODEC_ID);
     ebml::str(&mut te, &[0x25, 0x86, 0x88], codec_name);
+    // Language defaults to "eng" when omitted (spec); "und" keeps tools
+    // from asserting a language the encoder never measured.
+    ebml::str(&mut te, &[0x22, 0xB5, 0x9C], "und");
     ebml::bin(&mut te, &[0x63, 0xA2], codec_private);
     // CodecDelay is 0 (default; trims are internal to the ES) — omitted.
     ebml::uint(&mut te, &[0x23, 0xE3, 0x83], es::BLOCK_NS); // DefaultDuration (ns)
