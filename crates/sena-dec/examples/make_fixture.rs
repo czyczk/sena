@@ -34,7 +34,7 @@ fn main() {
     }
     // The fixture must stay fully decodable.
     let demux = sena_dec::demux::Demuxed::parse(bytes.clone()).unwrap();
-    let (info, _) = sena_dec::pipeline::probe(&demux).unwrap();
+    let (info, _) = sena_dec::pipeline::probe_params(&demux.init, demux.audio_span_bytes).unwrap();
     std::fs::write(&output, &bytes).unwrap();
     eprintln!(
         "wrote {output}: playable={} tags={} art={}",

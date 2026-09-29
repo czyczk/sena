@@ -6,9 +6,10 @@ use opus_decoder::{Channels, DecodeMode, Decoder as OpusDecoder};
 use rxaac_dec_lib::asc::AudioSpecificConfig;
 use rxaac_dec_lib::usac::UsacDecoder;
 use sena_core::PRE_GAIN;
+use sena_core::es;
 use sena_dsp::Resampler;
 
-use crate::demux::{ContainerMeta, Demuxed, Frame, Track};
+use crate::demux::Demuxed;
 
 pub const SAMPLE_RATE: u32 = 48000;
 pub const XHE_TRIM_CORE_SAMPLES: usize = 1024;
@@ -56,13 +57,14 @@ pub struct DecodedInfo {
     pub playable_frames: u64,
     /// LF profile number (300 or 600); the HF split is reported separately.
     pub profile: u32,
-    /// Three-track layout (SENA_PROFILE `<lf>@15600`): an A_OPUSHF track
-    /// carrying the 15.6 kHz+ band (SSB-shifted to baseband, 16 kHz stream)
-    /// rides along; it is shifted back up and mixed into the output.
+    /// Three-track layout: a top layer carrying the 15.6 kHz+ band
+    /// (SSB-shifted to baseband, 16 kHz stream) rides along; it is shifted
+    /// back up and mixed into the output.
     pub three_track: bool,
+    /// ES format version (SENA-INIT version field).
     pub sena_version: u32,
-    /// SENA_AUDIO_SHA256 tag (hash of the encoded elementary streams
-    /// carried by the container); empty for files that predate the tag.
+    /// SENA-INIT audio_sha256 (hash of the INIT blob plus composite block
+    /// payloads), hex.
     pub audio_sha256: String,
     /// Encoded size of all Cluster elements: codec payloads plus block
     /// framing, excluding Tags, Attachments (cover art) and Void filler.
@@ -76,6 +78,14 @@ pub struct ReadInfo {
     pub start_frame: u64,
     pub frames: u64,
     pub payload_bits: u64,
+}
+
+/// One codec frame of a single layer, split out of a composite block.
+#[derive(Debug, Clone)]
+pub(crate) struct LaneFrame {
+    /// Source block timestamp (diagnostics only).
+    pub(crate) t_ns: u64,
+    pub(crate) data: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -113,12 +123,12 @@ pub(crate) struct OpusPacketInfo {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct OpusHead {
-    pub(crate) pre_skip: u16,
-    pub(crate) output_gain: i16,
-    /// OpusHead input sample rate field (the track's stream rate: 48000 for
-    /// A_OPUS, 16000 for the shifted A_OPUSHF top band).
-    pub(crate) input_rate: u32,
+pub struct OpusHead {
+    pub pre_skip: u16,
+    pub output_gain: i16,
+    /// OpusHead input sample rate field (the layer's stream rate: 48000 for
+    /// the mid layer, 16000 for the shifted top layer).
+    pub input_rate: u32,
 }
 
 pub(crate) fn parse_opus_head(data: &[u8]) -> Result<OpusHead, DecodeError> {
@@ -149,7 +159,7 @@ pub(crate) fn parse_opus_head(data: &[u8]) -> Result<OpusHead, DecodeError> {
     })
 }
 
-fn lf_decoder(track: &Track, asc: &AudioSpecificConfig) -> Result<UsacDecoder, DecodeError> {
+fn lf_decoder(asc: &AudioSpecificConfig, lf_rate: u32) -> Result<UsacDecoder, DecodeError> {
     let dec = UsacDecoder::new(asc).map_err(|e| DecodeError::Codec(format!("rxaac init: {e}")))?;
     if dec.num_channels() != 2 {
         return Err(DecodeError::Unsupported(format!(
@@ -158,21 +168,20 @@ fn lf_decoder(track: &Track, asc: &AudioSpecificConfig) -> Result<UsacDecoder, D
         )));
     }
     let core_rate = dec.output_rate();
-    if core_rate != track.sample_rate.round() as u32 {
+    if core_rate != lf_rate {
         return Err(DecodeError::Format(format!(
-            "rxaac output rate {core_rate} != container LF rate {}",
-            track.sample_rate
+            "rxaac output rate {core_rate} != LF rate {lf_rate}"
         )));
     }
     Ok(dec)
 }
 
 fn decode_lf(
-    track: &Track,
-    frames: &[Frame],
+    lf_rate: u32,
+    frames: &[LaneFrame],
     asc: &AudioSpecificConfig,
 ) -> Result<(Vec<f32>, Vec<LfAuInfo>, usize, usize), DecodeError> {
-    let mut dec = lf_decoder(track, asc)?;
+    let mut dec = lf_decoder(asc, lf_rate)?;
     let core_rate = dec.output_rate();
     // Cache the valid frame geometry before any decode so failed-frame
     // padding never has to query a decoder that may have been left in an
@@ -204,7 +213,7 @@ fn decode_lf(
                 pcm.truncate(before);
                 pcm.resize(before + frame_samples, 0.0);
                 errors += 1;
-                dec = lf_decoder(track, asc)?;
+                dec = lf_decoder(asc, lf_rate)?;
             }
             Err(_) => {
                 return Err(DecodeError::Codec(format!(
@@ -236,7 +245,7 @@ fn decode_lf(
 /// accounting lines up with the playable timeline; the OpusHead pre-skip
 /// is already in 48 kHz units (RFC 7845).
 fn decode_opus(
-    frames: &[Frame],
+    frames: &[LaneFrame],
     head: &OpusHead,
     rate: u32,
 ) -> Result<(Vec<f32>, Vec<OpusPacketInfo>), DecodeError> {
@@ -337,208 +346,68 @@ fn build_bit_accounting(
     (rate_per_frame, total_bits)
 }
 
-/// Parse and validate a Sena container without decoding audio. This is the
-/// fast path used by playlist "read info" and tag-read operations. Works on
-/// any [`ContainerMeta`] view: a fully parsed in-memory `Demuxed` or a
-/// bounded-memory `IndexedFile` head scan.
-/// Layout + tag validation shared by `probe` and `decode`: works on any
-/// [`ContainerMeta`] view (in-memory `Demuxed` or bounded-memory
-/// `IndexedFile`). Returns (playable, lf profile number, three-track);
-/// layout warnings are appended to `warnings`.
-fn validate_layout<M: ContainerMeta>(
-    demux: &M,
-    warnings: &mut Vec<String>,
-) -> Result<(u64, u32, bool), DecodeError> {
-    let profile = demux
-        .meta_immutable_tag("SENA_PROFILE")
-        .ok_or_else(|| DecodeError::Unsupported("missing SENA_PROFILE tag".into()))?;
-    let (profile_def, hf_split) = sena_core::parse_profile_tag(profile)
-        .ok_or_else(|| DecodeError::Unsupported(format!("bad SENA_PROFILE {profile}")))?;
-    let profile_num = profile_def.crossover_hz() as u32;
-    let three_track = hf_split.is_some();
-    let version = demux
-        .meta_immutable_tag("SENA_VERSION")
-        .ok_or_else(|| DecodeError::Unsupported("missing SENA_VERSION tag".into()))?;
-    let version_num: u32 = version
-        .parse()
-        .map_err(|_| DecodeError::Unsupported(format!("bad SENA_VERSION {version}")))?;
-    if version_num != 1 {
-        return Err(DecodeError::Unsupported(format!(
-            "SENA_VERSION {version_num}"
-        )));
-    }
-    let playable: u64 = demux
-        .meta_immutable_tag("SENA_PLAYABLE_SAMPLES")
-        .ok_or_else(|| DecodeError::Unsupported("missing SENA_PLAYABLE_SAMPLES tag".into()))?
-        .parse()
-        .map_err(|_| DecodeError::Unsupported(format!("bad SENA_PLAYABLE_SAMPLES {version}")))?;
-    if playable == 0 {
-        return Err(DecodeError::Unsupported(
-            "SENA_PLAYABLE_SAMPLES is zero".into(),
-        ));
-    }
-
-    warnings.extend(demux.meta_warnings().iter().cloned());
-    let lf_track = demux
-        .meta_track("A_SENALF")
-        .ok_or_else(|| DecodeError::Format("missing A_SENALF track".into()))?;
-    let hf_track = demux
-        .meta_track("A_OPUS")
-        .ok_or_else(|| DecodeError::Format("missing A_OPUS track".into()))?;
-    let lf_rate = lf_track.sample_rate.round() as u32;
-    if lf_rate != 16_000 && lf_rate != 32_000 {
-        return Err(DecodeError::Unsupported(format!("LF track rate {lf_rate}")));
-    }
-    if hf_track.sample_rate.round() as u32 != SAMPLE_RATE
-        || lf_track.channels != 2
-        || hf_track.channels != 2
-    {
-        return Err(DecodeError::Unsupported(
-            "track rates/channels do not match Sena P0".into(),
-        ));
-    }
-
-    // Optional third track (A_OPUSHF): required exactly when the profile
-    // tag declares the 15600 Hz split, rejected otherwise. The track carries
-    // the top band shifted down to baseband at 16 kHz.
-    let hf2_track = demux.meta_track("A_OPUSHF");
-    match (&hf2_track, three_track) {
-        (Some(t), true) => {
-            if t.sample_rate.round() as u32 != sena_core::HF_TRACK_RATE || t.channels != 2 {
-                return Err(DecodeError::Unsupported(
-                    "A_OPUSHF track rates/channels do not match Sena P0".into(),
-                ));
-            }
-            // Structural OpusHead validation + delay cross-check (mirrors
-            // the A_OPUS track). The pre-skip counts 48 kHz units (RFC 7845)
-            // even though the track rate is 16 kHz.
-            let head = parse_opus_head(&t.codec_private)?;
-            if head.input_rate != sena_core::HF_TRACK_RATE {
-                return Err(DecodeError::Unsupported(format!(
-                    "A_OPUSHF OpusHead input sample rate {}, expected {}",
-                    head.input_rate,
-                    sena_core::HF_TRACK_RATE
-                )));
-            }
-            let delay_expected = (head.pre_skip as u64) * 1_000_000_000 / SAMPLE_RATE as u64;
-            if let Some(actual) = t.codec_delay_ns {
-                if actual != delay_expected {
-                    warnings.push(format!(
-                        "A_OPUSHF CodecDelay {actual} != expected {delay_expected} ns; using OpusHead pre-skip"
-                    ));
-                }
-            }
-        }
-        (Some(_), false) => {
-            return Err(DecodeError::Unsupported(
-                "A_OPUSHF track in a two-track file (SENA_PROFILE has no HF split)".into(),
-            ));
-        }
-        (None, true) => {
-            return Err(DecodeError::Format(
-                "three-track profile tag but no A_OPUSHF track".into(),
-            ));
-        }
-        (None, false) => {}
-    }
-
-    // CodecDelay cross-check (informational).
-    let lf_delay_expected = (XHE_TRIM_CORE_SAMPLES as u64) * 1_000_000_000 / lf_rate as u64;
-    if let Some(actual) = lf_track.codec_delay_ns {
-        if actual != lf_delay_expected {
-            warnings.push(format!(
-                "LF CodecDelay {actual} != expected {lf_delay_expected} ns; using 1024-frame trim"
-            ));
-        }
-    }
-    let opus_head = parse_opus_head(&hf_track.codec_private)?;
-    if opus_head.input_rate != SAMPLE_RATE {
-        return Err(DecodeError::Unsupported(format!(
-            "A_OPUS OpusHead input sample rate {}, expected {SAMPLE_RATE}",
-            opus_head.input_rate
-        )));
-    }
-    let hf_delay_expected = (opus_head.pre_skip as u64) * 1_000_000_000 / SAMPLE_RATE as u64;
-    if let Some(actual) = hf_track.codec_delay_ns {
-        if actual != hf_delay_expected {
-            warnings.push(format!(
-                "Opus CodecDelay {actual} != expected {hf_delay_expected} ns; using OpusHead pre-skip"
-            ));
-        }
-    }
-    // ASC is parsed for validation only; no decoder state is created here.
-    AudioSpecificConfig::parse(&lf_track.codec_private)
-        .map_err(|e| DecodeError::Format(format!("ASC parse: {e}")))?;
-    Ok((playable, profile_num, three_track))
-}
-
-/// Parse and validate a Sena container without decoding audio. This is the
-/// fast path used by playlist "read info" and tag-read operations. Works on
-/// any [`ContainerMeta`] view: a fully parsed in-memory `Demuxed` or a
-/// bounded-memory `IndexedFile` head scan.
-pub fn probe<M: ContainerMeta>(demux: &M) -> Result<(DecodedInfo, Vec<String>), DecodeError> {
-    let mut warnings = Vec::new();
-    let (playable, profile, three_track) = validate_layout(demux, &mut warnings)?;
-    let audio_sha256 = demux
-        .meta_immutable_tag("SENA_AUDIO_SHA256")
-        .unwrap_or("")
-        .to_string();
-    Ok((
-        DecodedInfo {
-            sample_rate: SAMPLE_RATE,
-            channels: 2,
-            playable_frames: playable,
-            profile,
-            three_track,
-            sena_version: 1,
-            audio_sha256,
-            audio_span_bytes: demux.meta_audio_span_bytes(),
-        },
-        warnings,
-    ))
+/// Parse and validate a Sena INIT blob without decoding audio. This is the
+/// fast path used by playlist "read info" and tag-read operations.
+pub fn probe_params(
+    init: &es::Init,
+    audio_span_bytes: u64,
+) -> Result<(DecodedInfo, Vec<String>), DecodeError> {
+    let params = crate::es::parse_params(init.clone())?;
+    let mut info = params.info;
+    info.audio_span_bytes = audio_span_bytes;
+    Ok((info, params.warnings))
 }
 
 pub fn decode(demux: &Demuxed) -> Result<Decoded, DecodeError> {
-    let mut warnings = Vec::new();
-    let (playable, profile_num, three_track) = validate_layout(demux, &mut warnings)?;
-    let lf_track = demux
-        .track("A_SENALF")
-        .ok_or_else(|| DecodeError::Format("missing A_SENALF track".into()))?;
-    let hf_track = demux
-        .track("A_OPUS")
-        .ok_or_else(|| DecodeError::Format("missing A_OPUS track".into()))?;
-    let opus_head = parse_opus_head(&hf_track.codec_private)?;
-    let hf2_track = if three_track {
-        Some(
-            demux
-                .track("A_OPUSHF")
-                .ok_or_else(|| DecodeError::Format("missing A_OPUSHF track".into()))?,
-        )
-    } else {
-        None
-    };
+    let init = &demux.init;
+    let params = crate::es::parse_params(init.clone())?;
+    let mut warnings = params.warnings.clone();
+    let playable = init.playable_samples;
+    let profile_num = init.profile.crossover_hz() as u32;
+    let three_track = init.three_track;
+    let lf_rate = init.lf_rate;
+    let asc = &params.asc;
+    let opus_head = params.mid_head;
+    let tf_head = params.tf_head;
 
-    let asc = AudioSpecificConfig::parse(&lf_track.codec_private)
-        .map_err(|e| DecodeError::Format(format!("ASC parse: {e}")))?;
-    let lf_frames: Vec<Frame> = demux.frames_for(lf_track.number).cloned().collect();
-    let hf_frames: Vec<Frame> = demux.frames_for(hf_track.number).cloned().collect();
-    let hf2_frames: Vec<Frame> = match &hf2_track {
-        Some(t) => demux.frames_for(t.number).cloned().collect(),
-        None => Vec::new(),
-    };
-    if lf_frames.is_empty() || hf_frames.is_empty() || (three_track && hf2_frames.is_empty()) {
+    // Split the composite blocks into per-layer codec frames (timeline
+    // order; timestamps are diagnostics only).
+    let mut lf_frames: Vec<LaneFrame> = Vec::new();
+    let mut mid_frames: Vec<LaneFrame> = Vec::new();
+    let mut tf_frames: Vec<LaneFrame> = Vec::new();
+    for b in &demux.blocks {
+        let block = es::decode_block(&b.data)
+            .map_err(|e| DecodeError::Format(format!("composite block: {e}")))?;
+        mid_frames.push(LaneFrame {
+            t_ns: b.t_ns,
+            data: block.mid.to_vec(),
+        });
+        for au in &block.lf {
+            lf_frames.push(LaneFrame {
+                t_ns: b.t_ns,
+                data: au.to_vec(),
+            });
+        }
+        for p in &block.hf {
+            tf_frames.push(LaneFrame {
+                t_ns: b.t_ns,
+                data: p.to_vec(),
+            });
+        }
+    }
+    if lf_frames.is_empty() || mid_frames.is_empty() || (three_track && tf_frames.is_empty()) {
         return Err(DecodeError::Format("container has no audio blocks".into()));
     }
 
-    // The track decodes are independent, and so is each track's
-    // post-decode DSP (LF warmup trim + upsample, mid pre-skip trim, top
-    // band upsample + shift-back + pre-skip trim): run all of it
-    // concurrently so the whole-file path overlaps the DSP with the codec
-    // decodes instead of serializing it after them (the product streaming
-    // decoder consumes the tracks interleaved instead).
+    // The layer decodes are independent, and so is each layer's post-decode
+    // DSP (LF warmup trim + upsample, mid pre-skip trim, top band upsample +
+    // shift-back + pre-skip trim): run all of it concurrently so the
+    // whole-file path overlaps the DSP with the codec decodes instead of
+    // serializing it after them (the ES core consumes blocks interleaved
+    // instead).
     let (lf_res, mid_res, hf2_res) = std::thread::scope(|s| {
         let hlf = s.spawn(|| -> Result<(Vec<f64>, Vec<LfAuInfo>, usize, usize), DecodeError> {
-            let (lf_raw, lf_infos, core_rate, lf_errors) = decode_lf(lf_track, &lf_frames, &asc)?;
+            let (lf_raw, lf_infos, core_rate, lf_errors) = decode_lf(lf_rate, &lf_frames, asc)?;
             let lf_trim = XHE_TRIM_CORE_SAMPLES;
             if lf_raw.len() < lf_trim * 2 {
                 return Err(DecodeError::ShortOutput {
@@ -555,7 +424,7 @@ pub fn decode(demux: &Demuxed) -> Result<Decoded, DecodeError> {
         });
         let hmid =
             s.spawn(|| -> Result<(Vec<f64>, Vec<OpusPacketInfo>), DecodeError> {
-                let (hf_raw, opus_infos) = decode_opus(&hf_frames, &opus_head, SAMPLE_RATE)?;
+                let (hf_raw, opus_infos) = decode_opus(&mid_frames, &opus_head, SAMPLE_RATE)?;
                 let hf_skip = opus_head.pre_skip as usize;
                 if hf_raw.len() < hf_skip * 2 {
                     return Err(DecodeError::ShortOutput {
@@ -570,16 +439,15 @@ pub fn decode(demux: &Demuxed) -> Result<Decoded, DecodeError> {
                 Ok((hf_after, opus_infos))
             });
         let htop = s.spawn(
-            || -> Result<(Vec<f64>, Vec<OpusPacketInfo>, OpusHead), DecodeError> {
-                match &hf2_track {
-                    Some(t) => {
-                        let head = parse_opus_head(&t.codec_private)?;
+            || -> Result<(Vec<f64>, Vec<OpusPacketInfo>), DecodeError> {
+                match &tf_head {
+                    Some(head) => {
                         let (raw16, infos) =
-                            decode_opus(&hf2_frames, &head, sena_core::HF_TRACK_RATE)?;
-                        // The A_OPUSHF stream decodes at 16 kHz: upsample
-                        // back to 48 kHz (zero-phase, grid-exact x3), shift
-                        // the baseband content back up to the 15.6 kHz+
-                        // band, then drop the pre-skip (48 kHz units).
+                            decode_opus(&tf_frames, head, sena_core::HF_TRACK_RATE)?;
+                        // The top stream decodes at 16 kHz: upsample back to
+                        // 48 kHz (zero-phase, grid-exact x3), shift the
+                        // baseband content back up to the 15.6 kHz+ band,
+                        // then drop the pre-skip (48 kHz units).
                         let hf2_skip = head.pre_skip as usize;
                         let raw: Vec<f64> = raw16.iter().map(|&s| f64::from(s)).collect();
                         let up =
@@ -597,17 +465,9 @@ pub fn decode(demux: &Demuxed) -> Result<Decoded, DecodeError> {
                             SAMPLE_RATE,
                             -(hf2_skip as i64),
                         );
-                        Ok((shifted[hf2_skip * 2..].to_vec(), infos, head))
+                        Ok((shifted[hf2_skip * 2..].to_vec(), infos))
                     }
-                    None => Ok((
-                        Vec::new(),
-                        Vec::new(),
-                        OpusHead {
-                            pre_skip: 0,
-                            output_gain: 0,
-                            input_rate: sena_core::HF_TRACK_RATE,
-                        },
-                    )),
+                    None => Ok((Vec::new(), Vec::new())),
                 }
             },
         );
@@ -622,7 +482,7 @@ pub fn decode(demux: &Demuxed) -> Result<Decoded, DecodeError> {
     });
     let (lf48, lf_infos, core_rate, lf_errors) = lf_res?;
     let (hf48, opus_infos) = mid_res?;
-    let (hf2_after, hf2_infos, hf2_head) = hf2_res?;
+    let (hf2_after, hf2_infos) = hf2_res?;
     if lf_errors != 0 {
         warnings.push(format!(
             "{lf_errors} LF AU decode errors replaced by silence"
@@ -661,13 +521,9 @@ pub fn decode(demux: &Demuxed) -> Result<Decoded, DecodeError> {
         &opus_infos,
         opus_head.pre_skip as usize,
         &hf2_infos,
-        hf2_head.pre_skip as usize,
+        tf_head.as_ref().map_or(0, |h| h.pre_skip) as usize,
     );
 
-    let audio_sha256 = demux
-        .immutable_tag("SENA_AUDIO_SHA256")
-        .unwrap_or("")
-        .to_string();
     Ok(Decoded {
         info: DecodedInfo {
             sample_rate: SAMPLE_RATE,
@@ -675,8 +531,8 @@ pub fn decode(demux: &Demuxed) -> Result<Decoded, DecodeError> {
             playable_frames: playable,
             profile: profile_num,
             three_track,
-            sena_version: 1,
-            audio_sha256,
+            sena_version: es::ES_VERSION as u32,
+            audio_sha256: params.info.audio_sha256.clone(),
             audio_span_bytes: demux.audio_span_bytes,
         },
         pcm,
@@ -779,97 +635,71 @@ impl Decoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sena_mux::mka::{self, Frame as MuxFrame, Track as MuxTrack};
+    use sena_core::es as core_es;
+    use sena_mux::mka;
+
+    fn asset(name: &str) -> Vec<u8> {
+        std::fs::read(format!(
+            "{}/../../assets/e2e/{name}.sena",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap()
+    }
+
+    /// Build a tiny v2 file from the first `n_blocks` blocks of a real
+    /// asset, with playable_samples trimmed to `playable`.
+    fn trim_asset(name: &str, n_blocks: usize, playable: u64) -> Vec<u8> {
+        let demux = Demuxed::parse(asset(name)).unwrap();
+        let mut init = demux.init.clone();
+        init.playable_samples = playable;
+        init.audio_sha256 = [0; 32];
+        let cp = core_es::build_codec_private(&init, demux.avg_bytes_per_sec);
+        let blocks: Vec<mka::SenaBlock> = demux.blocks[..n_blocks]
+            .iter()
+            .map(|b| mka::SenaBlock {
+                t_ns: b.t_ns,
+                data: b.data.clone(),
+            })
+            .collect();
+        mka::write_sena(
+            &cp,
+            &blocks,
+            &core_es::codec_name(init.profile, init.three_track),
+            1000,
+            playable * 1_000_000_000 / SAMPLE_RATE as u64,
+        )
+    }
 
     #[test]
     fn small_au_warmup_lock_vector() {
-        // Build a tiny Sena file from the first 3 LF AUs and 3 Opus packets
-        // of a real asset. Three LF AUs are just enough to cover the
-        // 1024-sample warmup plus a short playable tail.
-        let asset = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../assets/e2e/01__p300__lfa__hf144.sena"
-        );
-        let bytes = std::fs::read(asset).unwrap();
-        let demux = Demuxed::parse(bytes).unwrap();
-        let lf = demux.track("A_SENALF").unwrap();
-        let hf = demux.track("A_OPUS").unwrap();
-        let lf_frames: Vec<_> = demux.frames_for(lf.number).take(3).cloned().collect();
-        let hf_frames: Vec<_> = demux.frames_for(hf.number).take(3).cloned().collect();
-
-        let tracks = vec![
-            MuxTrack {
-                codec_id: "A_OPUS".into(),
-                codec_private: hf.codec_private.clone(),
-                sample_rate: 48000.0,
-                channels: 2,
-                codec_delay_ns: hf.codec_delay_ns.unwrap_or(0),
-                bit_depth: Some(32),
-            },
-            MuxTrack {
-                codec_id: "A_SENALF".into(),
-                codec_private: lf.codec_private.clone(),
-                sample_rate: lf.sample_rate,
-                channels: 2,
-                codec_delay_ns: lf.codec_delay_ns.unwrap_or(0),
-                bit_depth: None,
-            },
-        ];
-        let mut frames = Vec::new();
-        for (i, f) in hf_frames.iter().enumerate() {
-            frames.push(MuxFrame {
-                track: 0,
-                t_ns: i as u64 * 20_000_000,
-                data: f.data.clone(),
-            });
-        }
-        for (i, f) in lf_frames.iter().enumerate() {
-            frames.push(MuxFrame {
-                track: 1,
-                t_ns: i as u64 * 64_000_000,
-                data: f.data.clone(),
-            });
-        }
-        // After LF trim: (3072-1024)*3 = 6144 frames; Opus trim is 312
-        // samples -> 3*960-312 = 2568 frames. Use the smaller timeline.
-        let tags = [
-            ("SENA_PROFILE", "300"),
-            ("SENA_VERSION", "1"),
-            ("SENA_PLAYABLE_SAMPLES", "2568"),
-        ];
-        let playable_ns = 2568u64 * 1_000_000_000 / 48_000;
-        let file = mka::write_mka(&tracks, frames, &tags, 1000, playable_ns);
+        // Four blocks of a @300 asset: LF AU 0 (warmup) at block 0 and AU 1
+        // at block 3 (by-end placement) cover playable [0, 1024) core =
+        // 3072 frames at 48 kHz after the warmup trim.
+        let file = trim_asset("01__p300__lfa__hf144", 4, 3072);
         let small = Demuxed::parse(file).unwrap();
         let dec = Decoder::open(&small).unwrap();
-        assert_eq!(dec.info().playable_frames, 2568);
-        let mut buf = vec![0.0f32; 2568 * 2];
+        assert_eq!(dec.info().playable_frames, 3072);
+        let mut buf = vec![0.0f32; 3072 * 2];
         let n = {
             let mut d = dec;
             d.read_f32(&mut buf, 4096).unwrap()
         };
-        assert_eq!(n, 2568);
+        assert_eq!(n, 3072);
+        assert!(buf.iter().any(|&s| s != 0.0), "decoded output is silent");
     }
 
-    /// Three-track layout: probe reports the layout, whole-file decode mixes
-    /// the A_OPUSHF track, and layout/tag mismatches are rejected.
+    /// Three-layer layout: probe reports it, whole-file decode mixes the top
+    /// band, and the mix is exactly lf+mid+top.
     #[test]
     fn three_track_layout() {
-        let asset = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../assets/e2e/01__p600__3t__hf160+64.sena"
-        );
-        let bytes = std::fs::read(asset).unwrap();
-        let demux = Demuxed::parse(bytes.clone()).unwrap();
+        let demux = Demuxed::parse(asset("01__p600__3t__hf160+64")).unwrap();
 
-        // probe: layout reported, tag validated.
-        let (info, warnings) = probe(&demux).unwrap();
+        let (info, warnings) = probe_params(&demux.init, demux.audio_span_bytes).unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(info.profile, 600);
         assert!(info.three_track);
-        assert!(!demux.track("A_OPUSHF").unwrap().codec_private.is_empty());
+        assert!(demux.init.hf_head.is_some());
 
-        // Whole-file decode: the three tracks mix to full length, and the
-        // mid/top track dumps are non-trivial and band-complementary.
         let decoded = decode(&demux).unwrap();
         assert!(decoded.info().three_track);
         assert_eq!(decoded.pcm_f64().len(), 960000 * 2);
@@ -878,143 +708,24 @@ mod tests {
             .hf2_track_pcm()
             .iter()
             .fold(0.0f64, |a, &v| a.max(v.abs()));
-        assert!(
-            hf2_peak > 1e-4,
-            "A_OPUSHF track is silent (peak {hf2_peak})"
-        );
+        assert!(hf2_peak > 1e-4, "top layer is silent (peak {hf2_peak})");
         let mix_peak = decoded
             .pcm_f64()
             .iter()
-            .zip(
-                decoded.lf_track_pcm().iter().zip(
-                    decoded
-                        .hf_track_pcm()
-                        .iter()
-                        .zip(decoded.hf2_track_pcm().iter()),
-                ),
-            )
+            .zip(decoded.lf_track_pcm().iter().zip(decoded.hf_track_pcm().iter().zip(decoded.hf2_track_pcm().iter())))
             .map(|(m, (l, (h, t)))| (m - l - h - t).abs())
             .fold(0.0f64, f64::max);
         assert!(mix_peak < 1e-9, "pcm != lf+mid+top (max {mix_peak})");
+    }
 
-        // Mismatch 1: two-track profile tag with an A_OPUSHF track present.
-        let mut two_track_file = {
-            let mut tracks = Vec::new();
-            let mut frames = Vec::new();
-            for (idx, t) in ["A_OPUS", "A_SENALF", "A_OPUSHF"].iter().enumerate() {
-                let tr = demux.track(t).unwrap();
-                tracks.push(MuxTrack {
-                    codec_id: (*t).into(),
-                    codec_private: tr.codec_private.clone(),
-                    sample_rate: tr.sample_rate,
-                    channels: 2,
-                    codec_delay_ns: tr.codec_delay_ns.unwrap_or(0),
-                    bit_depth: Some(32),
-                });
-                for (k, f) in demux.frames_for(tr.number).take(3).enumerate() {
-                    frames.push(MuxFrame {
-                        track: idx,
-                        t_ns: k as u64 * 20_000_000,
-                        data: f.data.clone(),
-                    });
-                }
-            }
-            let tags = [
-                ("SENA_PROFILE", "600"),
-                ("SENA_VERSION", "1"),
-                ("SENA_PLAYABLE_SAMPLES", "2568"),
-            ];
-            let playable_ns = 2568u64 * 1_000_000_000 / 48_000;
-            mka::write_mka(&tracks, frames, &tags, 1000, playable_ns)
-        };
-        match probe(&Demuxed::parse(two_track_file.clone()).unwrap()) {
-            Err(DecodeError::Unsupported(e)) => assert!(e.contains("A_OPUSHF"), "{e}"),
-            other => panic!("expected Unsupported, got {other:?}"),
-        }
-
-        // Mismatch 2: three-track profile tag without the A_OPUSHF track.
-        {
-            let demux2 = Demuxed::parse(two_track_file.clone()).unwrap();
-            let mut tracks = Vec::new();
-            let mut frames = Vec::new();
-            for (idx, t) in ["A_OPUS", "A_SENALF"].iter().enumerate() {
-                let tr = demux2.track(t).unwrap();
-                tracks.push(MuxTrack {
-                    codec_id: (*t).into(),
-                    codec_private: tr.codec_private.clone(),
-                    sample_rate: tr.sample_rate,
-                    channels: 2,
-                    codec_delay_ns: tr.codec_delay_ns.unwrap_or(0),
-                    bit_depth: Some(32),
-                });
-                for (k, f) in demux2.frames_for(tr.number).take(3).enumerate() {
-                    frames.push(MuxFrame {
-                        track: idx,
-                        t_ns: k as u64 * 20_000_000,
-                        data: f.data.clone(),
-                    });
-                }
-            }
-            let tags = [
-                ("SENA_PROFILE", "600@15600"),
-                ("SENA_VERSION", "1"),
-                ("SENA_PLAYABLE_SAMPLES", "2568"),
-            ];
-            let playable_ns = 2568u64 * 1_000_000_000 / 48_000;
-            two_track_file = mka::write_mka(&tracks, frames, &tags, 1000, playable_ns);
-        }
-        match probe(&Demuxed::parse(two_track_file).unwrap()) {
-            Err(DecodeError::Format(e)) => assert!(e.contains("A_OPUSHF"), "{e}"),
-            other => panic!("expected Format, got {other:?}"),
-        }
-
-        // Unknown HF split point is rejected.
-        {
-            let mut tr = Vec::new();
-            let mut fr = Vec::new();
-            let a = demux.track("A_OPUS").unwrap();
-            tr.push(MuxTrack {
-                codec_id: "A_OPUS".into(),
-                codec_private: a.codec_private.clone(),
-                sample_rate: 48000.0,
-                channels: 2,
-                codec_delay_ns: a.codec_delay_ns.unwrap_or(0),
-                bit_depth: Some(32),
-            });
-            let b = demux.track("A_SENALF").unwrap();
-            tr.push(MuxTrack {
-                codec_id: "A_SENALF".into(),
-                codec_private: b.codec_private.clone(),
-                sample_rate: b.sample_rate,
-                channels: 2,
-                codec_delay_ns: b.codec_delay_ns.unwrap_or(0),
-                bit_depth: None,
-            });
-            for (k, f) in demux.frames_for(a.number).take(3).enumerate() {
-                fr.push(MuxFrame {
-                    track: 0,
-                    t_ns: k as u64 * 20_000_000,
-                    data: f.data.clone(),
-                });
-            }
-            for (k, f) in demux.frames_for(b.number).take(3).enumerate() {
-                fr.push(MuxFrame {
-                    track: 1,
-                    t_ns: k as u64 * 64_000_000,
-                    data: f.data.clone(),
-                });
-            }
-            let tags = [
-                ("SENA_PROFILE", "600@14400"),
-                ("SENA_VERSION", "1"),
-                ("SENA_PLAYABLE_SAMPLES", "2568"),
-            ];
-            let playable_ns = 2568u64 * 1_000_000_000 / 48_000;
-            let file = mka::write_mka(&tr, fr, &tags, 1000, playable_ns);
-            match probe(&Demuxed::parse(file).unwrap()) {
-                Err(DecodeError::Unsupported(e)) => assert!(e.contains("SENA_PROFILE"), "{e}"),
-                other => panic!("expected Unsupported, got {other:?}"),
-            }
-        }
+    /// INIT-level consistency: the three-track flag requires the top head.
+    #[test]
+    fn three_track_flag_requires_head() {
+        let demux = Demuxed::parse(asset("01__p600__lfd__hf136")).unwrap();
+        assert!(!demux.init.three_track);
+        let mut bad = demux.init.encode();
+        // set flags bit0 (three-track) without adding a head
+        bad[7] |= 1;
+        assert!(core_es::Init::decode(&bad).is_err());
     }
 }

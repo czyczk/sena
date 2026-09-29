@@ -22,3 +22,6 @@ rxaac-dec-lib.workspace = true
 # (foobar2000 component). Runtime-loaded hosts (ffmpeg/LAV demuxer) use
 # crates/sena-dec-capi, which packages this crate as a cdylib.
 crate-type = ["rlib", "staticlib"]
+
+[dev-dependencies]
+sha2.workspace = true

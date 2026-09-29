@@ -1,13 +1,13 @@
 /*
- * Runtime loader for the sena-dec core library (sena demuxer backend)
+ * Runtime loader for the sena-dec core library (Sena decoder backend)
  *
  * This file is part of the Sena plugin for FFmpeg; it is distributed under
  * the same licence as FFmpeg (LGPL 2.1 or later when built into FFmpeg).
  *
  * Search order for the core library:
  *   1. $SENA_DEC_LIBRARY        - full path override (development, testing)
- *   2. <dir of this module>     - libavformat/avformat-*.dll location, which
- *                                 is also where LAV Filters keeps its DLLs
+ *   2. <dir of this module>     - the avcodec-*.dll location, which is also
+ *                                 where LAV Filters keeps its DLLs
  *   3. platform default search  - dlopen(soname) / LoadLibrary(name)
  */
 
@@ -75,7 +75,7 @@ static void *sena_sym(void *mod, const char *name)
 }
 
 /* Try <dir of the module containing this code>/<libname>. This makes the
- * demuxer work when the core library is deployed next to libavformat (the
+ * decoder work when the core library is deployed next to libavcodec (the
  * LAV Filters layout) without touching PATH / LD_LIBRARY_PATH. */
 static void *sena_open_module_relative(void)
 {
@@ -124,24 +124,18 @@ static void sena_load_once_fn(void)
         size_t offset;
     } syms[] = {
 #define SENA_SYM(field) { #field, offsetof(SenaDecAPI, field) }
-        SENA_SYM(sena_dec_open),
-        SENA_SYM(sena_dec_close),
-        SENA_SYM(sena_dec_get_info),
-        SENA_SYM(sena_dec_read_f32),
-        SENA_SYM(sena_dec_seek),
         SENA_SYM(sena_dec_version),
-        SENA_SYM(sena_file_read_tags),
-        SENA_SYM(sena_tags_count),
-        SENA_SYM(sena_tags_key),
-        SENA_SYM(sena_tags_value),
-        SENA_SYM(sena_tags_close),
-        SENA_SYM(sena_file_art_read),
-        SENA_SYM(sena_art_count),
-        SENA_SYM(sena_art_name),
-        SENA_SYM(sena_art_mime),
-        SENA_SYM(sena_art_data),
-        SENA_SYM(sena_art_data_len),
-        SENA_SYM(sena_art_close),
+        SENA_SYM(sena_es_open),
+        SENA_SYM(sena_es_push),
+        SENA_SYM(sena_es_pull),
+        SENA_SYM(sena_es_finish),
+        SENA_SYM(sena_es_reset),
+        SENA_SYM(sena_es_set_output_start),
+        SENA_SYM(sena_es_warmup_seek),
+        SENA_SYM(sena_es_get_info),
+        SENA_SYM(sena_es_get_read_info),
+        SENA_SYM(sena_es_get_stats),
+        SENA_SYM(sena_es_close),
 #undef SENA_SYM
     };
     void *mod = NULL;
@@ -160,7 +154,7 @@ static void sena_load_once_fn(void)
     if (!mod)
         mod = sena_open_module(SENA_DEC_LIBNAME);
     if (!mod) {
-        sena_set_error("%s not found (set " SENA_DEC_ENV_VAR " or install it next to libavformat)", SENA_DEC_LIBNAME);
+        sena_set_error("%s not found (set " SENA_DEC_ENV_VAR " or install it next to libavcodec)", SENA_DEC_LIBNAME);
         return;
     }
 
@@ -178,7 +172,7 @@ static void sena_load_once_fn(void)
 const SenaDecAPI *ff_sena_dec_api(void)
 {
     ff_thread_once(&sena_load_once, sena_load_once_fn);
-    return sena_api.sena_dec_open ? &sena_api : NULL;
+    return sena_api.sena_es_open ? &sena_api : NULL;
 }
 
 const char *ff_sena_dec_load_error(void)

@@ -1,10 +1,10 @@
 //! sena-enc: pipeline orchestration (WAV IO, subprocess drivers, packet extraction).
 
-use sena_core::{PRE_GAIN, Profile, SAMPLE_RATE};
-use sena_mux::mka::{self, Frame, Track};
+use sena_core::{PRE_GAIN, Profile, SAMPLE_RATE, es};
+use sena_mux::mka::{self, SenaBlock};
 use sha2::{Digest, Sha256};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 pub mod ogg;
 pub mod wav;
@@ -267,68 +267,22 @@ pub fn encode_bytes(cfg: &EncoderConfig, input: &[u8], output: &Path) -> Result<
 /// Audio SHA-256 of the encoded audio elementary streams carried by the
 /// container: the Opus stream (OpusHead + Opus audio packets) and the
 /// xHE-AAC stream (ASC + raw AUs), in Sena track order. The streams are the
-/// exact bytes copied into the muxed file; the hash is length-prefixed and
-/// domain-separated so it is deterministic and independent of container
-/// layout, timestamps and tags. It intentionally does NOT hash the input
-/// PCM or the decoded output.
-pub fn encoded_audio_sha256(
-    opus_head: &[u8],
-    opus_packets: &[Vec<u8>],
-    lf_asc: &[u8],
-    lf_aus: &[Vec<u8>],
-) -> String {
-    hash_streams(
-        "SENA encoded audio sha256 v1\0",
-        &[
-            ("A_OPUS", opus_head, opus_packets),
-            ("A_SENALF", lf_asc, lf_aus),
-        ],
-    )
-}
-
-/// Three-track variant (`A_OPUSHF` added, v2 domain): the two-track hash
-/// bytes stay frozen so existing files keep their recorded value.
-pub fn encoded_audio_sha256_3(
-    opus_head: &[u8],
-    opus_packets: &[Vec<u8>],
-    lf_asc: &[u8],
-    lf_aus: &[Vec<u8>],
-    hf2_head: &[u8],
-    hf2_packets: &[Vec<u8>],
-) -> String {
-    hash_streams(
-        "SENA encoded audio sha256 v2\0",
-        &[
-            ("A_OPUS", opus_head, opus_packets),
-            ("A_SENALF", lf_asc, lf_aus),
-            ("A_OPUSHF", hf2_head, hf2_packets),
-        ],
-    )
-}
-
-fn hash_streams(domain: &str, streams: &[(&str, &[u8], &[Vec<u8>])]) -> String {
+/// Audio content hash (domain v3): SHA-256 over the zeroed-hash SENA-INIT
+/// blob and all composite block payloads in decode order. The hash is
+/// length-prefixed and domain-separated so it is deterministic and
+/// independent of container layout, timestamps and tags. It intentionally
+/// does NOT hash the input PCM or the decoded output.
+pub fn encoded_audio_sha256_es(init_zeroed_blob: &[u8], blocks: &[Vec<u8>]) -> [u8; 32] {
     let mut h = Sha256::new();
-    h.update(domain.as_bytes());
-    h.update((streams.len() as u32).to_le_bytes()); // stream count
-    for (codec_id, private, packets) in streams {
-        let id = codec_id.as_bytes();
-        h.update((id.len() as u32).to_le_bytes());
-        h.update(id);
-        h.update((private.len() as u32).to_le_bytes());
-        h.update(private);
-        h.update((packets.len() as u64).to_le_bytes());
-        for p in packets.iter() {
-            h.update((p.len() as u32).to_le_bytes());
-            h.update(p);
-        }
+    h.update(es::SHA256_DOMAIN_V3);
+    h.update((init_zeroed_blob.len() as u32).to_le_bytes());
+    h.update(init_zeroed_blob);
+    h.update((blocks.len() as u64).to_le_bytes());
+    for b in blocks {
+        h.update((b.len() as u32).to_le_bytes());
+        h.update(b);
     }
-    let out = h.finalize();
-    let mut hex = String::with_capacity(64);
-    for b in out {
-        use std::fmt::Write;
-        let _ = write!(hex, "{b:02x}");
-    }
-    hex
+    h.finalize().into()
 }
 
 /// Full encode pipeline over a streaming input (stdin-safe).
@@ -923,117 +877,98 @@ fn run_codecs(
     end_tick(&mut st.t, &mut st.mux);
     let (
         hf_head,
-        preskip,
+        _preskip,
         hf_packets,
         hf2_head,
-        hf2_preskip,
+        _hf2_preskip,
         hf2_packets,
         lf_asc,
         lf_aus,
         lf_stream_rate,
     ) = extracted?;
 
-    // Hash the encoded streams exactly as they are about to be muxed. The
-    // container tags (including this hash) are written afterwards, so the
-    // hash covers the elementary streams and nothing else. Three-track
-    // files use the v2 domain (3 streams); two-track files keep v1.
-    let audio_sha256 = if cfg.three_track {
-        encoded_audio_sha256_3(
-            &hf_head,
-            &hf_packets,
-            &lf_asc,
-            &lf_aus,
-            &hf2_head,
-            &hf2_packets,
-        )
-    } else {
-        encoded_audio_sha256(&hf_head, &hf_packets, &lf_asc, &lf_aus)
-    };
-
-    // --- frame timings / mux: the remaining tail is tiny and measured with
-    // the extraction stage (st.mux). ---
+    // --- assemble composite ES blocks on the 20 ms mid grid; the audio
+    // hash (v3) covers the zeroed-hash SENA-INIT blob plus the block
+    // payloads. The remaining tail is tiny and measured with the
+    // extraction stage (st.mux). ---
     let muxed = (|| {
-        let hf_frame_ns = 20_000_000u64; // 20 ms Opus frames
-        // LF AU duration: one 1024-sample core frame at the actual stream rate
-        // (64 ms at 16 kHz, 32 ms at 32 kHz).
-        let lf_frame_ns =
-            (sena_core::XHE_WARMUP_CORE as u64) * 1_000_000_000 / lf_stream_rate as u64;
+        let n_blocks = hf_packets.len() as u64;
 
-        let mut tracks = vec![
-            Track {
-                codec_id: "A_OPUS".into(),
-                codec_private: hf_head.to_vec(),
-                sample_rate: SAMPLE_RATE as f64,
-                channels: 2,
-                codec_delay_ns: (preskip as u64) * 1_000_000_000 / SAMPLE_RATE as u64,
-                bit_depth: Some(32),
-            },
-            Track {
-                codec_id: "A_SENALF".into(),
-                codec_private: lf_asc.clone(),
-                sample_rate: lf_stream_rate as f64,
-                channels: 2,
-                codec_delay_ns: (sena_core::XHE_WARMUP_CORE as u64) * 1_000_000_000
-                    / lf_stream_rate as u64,
-                bit_depth: None,
-            },
-        ];
+        // LF AU k lands in the block containing its last playable sample
+        // (by-end placement, clamped to the final block at EOS).
+        let mut lf_by_block: std::collections::BTreeMap<u64, Vec<(u32, &[u8])>> =
+            Default::default();
+        for (k, au) in lf_aus.iter().enumerate() {
+            lf_by_block
+                .entry(es::lf_block(k as u64, lf_stream_rate, n_blocks))
+                .or_default()
+                .push((k as u32, au));
+        }
+        // Top-layer packet j lands in block j (clamped to the final block).
+        let mut hf2_by_block: std::collections::BTreeMap<u64, Vec<&[u8]>> = Default::default();
         if cfg.three_track {
-            tracks.push(Track {
-                codec_id: "A_OPUSHF".into(),
-                codec_private: hf2_head.clone(),
-                sample_rate: sena_core::HF_TRACK_RATE as f64,
-                channels: 2,
-                // OpusHead pre-skip counts 48 kHz units regardless of the
-                // track rate (RFC 7845).
-                codec_delay_ns: (hf2_preskip as u64) * 1_000_000_000 / SAMPLE_RATE as u64,
-                bit_depth: Some(32),
-            });
-        }
-        let mut frames = vec![];
-        for (i, p) in hf_packets.iter().enumerate() {
-            frames.push(Frame {
-                track: 0,
-                t_ns: i as u64 * hf_frame_ns,
-                data: p.clone(),
-            });
-        }
-        let mut lf_t = 0u64;
-        for au in &lf_aus {
-            frames.push(Frame {
-                track: 1,
-                t_ns: lf_t,
-                data: au.clone(),
-            });
-            lf_t += lf_frame_ns;
-        }
-        if cfg.three_track {
-            for (i, p) in hf2_packets.iter().enumerate() {
-                frames.push(Frame {
-                    track: 2,
-                    t_ns: i as u64 * hf_frame_ns,
-                    data: p.clone(),
-                });
+            for (j, p) in hf2_packets.iter().enumerate() {
+                hf2_by_block.entry(es::hf_block(j as u64, n_blocks)).or_default().push(p);
             }
         }
-        let profile_tag = if cfg.three_track {
-            sena_core::three_track_tag(cfg.profile)
-        } else {
-            sena_core::profile_tag(cfg.profile)
+
+        let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(n_blocks as usize);
+        for i in 0..n_blocks {
+            let lf = match lf_by_block.remove(&i) {
+                Some(v) => {
+                    let au_index = v[0].0;
+                    let aus: Vec<&[u8]> = v.iter().map(|e| e.1).collect();
+                    (au_index, aus)
+                }
+                None => (0, Vec::new()),
+            };
+            let hf: Vec<&[u8]> = hf2_by_block.remove(&i).unwrap_or_default();
+            payloads.push(es::encode_block(&es::BlockParts {
+                mid: &hf_packets[i as usize],
+                lf: (lf.0, &lf.1),
+                hf: &hf,
+            }));
+        }
+        if !lf_by_block.is_empty() || !hf2_by_block.is_empty() {
+            return Err(Error::Format("layer packet outside the mid grid".into()));
+        }
+
+        let mut init = es::Init {
+            profile: cfg.profile,
+            three_track: cfg.three_track,
+            lf_rate: lf_stream_rate,
+            playable_samples: playable as u64,
+            audio_sha256: [0; 32],
+            lf_asc: lf_asc.clone(),
+            opus_head: hf_head.to_vec(),
+            hf_head: if cfg.three_track {
+                Some(hf2_head.clone())
+            } else {
+                None
+            },
         };
-        let version_tag = "1".to_string();
-        // input length in 48 kHz stereo frames (the normalized source timeline)
-        let playable_tag = playable.to_string();
-        let tags: Vec<(&str, &str)> = vec![
-            ("SENA_PROFILE", &profile_tag),
-            ("SENA_VERSION", &version_tag),
-            ("SENA_PLAYABLE_SAMPLES", &playable_tag),
-            // Audio SHA-256: hash of the encoded Opus + xHE-AAC streams
-            // (see `encoded_audio_sha256`), not of the input PCM.
-            ("SENA_AUDIO_SHA256", &audio_sha256),
-        ];
+        init.audio_sha256 = encoded_audio_sha256_es(&init.encode(), &payloads);
+
+        let total_bytes: u64 = payloads.iter().map(|p| p.len() as u64).sum();
         let playable_ns = (playable as u64) * 1_000_000_000 / SAMPLE_RATE as u64;
-        let mka_bytes = mka::write_mka(&tracks, frames, &tags, 1000, playable_ns);
+        let avg_bps = ((total_bytes as u128 * 1_000_000_000).div_ceil(playable_ns as u128)) as u32;
+        let codec_private = es::build_codec_private(&init, avg_bps);
+
+        let blocks: Vec<SenaBlock> = payloads
+            .into_iter()
+            .enumerate()
+            .map(|(i, data)| SenaBlock {
+                t_ns: i as u64 * es::BLOCK_NS,
+                data,
+            })
+            .collect();
+        let mka_bytes = mka::write_sena(
+            &codec_private,
+            &blocks,
+            &es::codec_name(cfg.profile, cfg.three_track),
+            1000,
+            playable_ns,
+        );
         std::fs::write(output, mka_bytes)?;
         Ok::<(), Error>(())
     })();
@@ -1335,38 +1270,29 @@ mod tests {
     }
 
     #[test]
-    fn encoded_audio_sha256_known_vector_and_determinism() {
+    fn encoded_audio_sha256_es_known_vector_and_determinism() {
         // Expected value computed independently in Python with the same
-        // length-prefixed stream layout.
-        let opus_head = b"opus-head";
-        let opus_packets = vec![vec![1, 2, 3], vec![4, 5]];
-        let lf_asc = b"asc";
-        let lf_aus = vec![vec![6], vec![7, 8]];
-        let h = encoded_audio_sha256(opus_head, &opus_packets, lf_asc, &lf_aus);
+        // length-prefixed layout (domain + INIT blob + blocks).
+        let init = b"fake-init";
+        let blocks = vec![vec![1, 2, 3], vec![4, 5]];
+        let h = encoded_audio_sha256_es(init, &blocks);
+        let hex: String = h.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
-            h,
-            "b20f384c7c0ab805a337ece19a67d14aafab2f3261f9a3832fb9c6dbe8c511ce"
+            hex,
+            "9f0c506f8220b88d8d5a243a0a62fdf9a8a881161d706cae7dafc0f9f5749475"
         );
-        assert_eq!(
-            encoded_audio_sha256(opus_head, &opus_packets, lf_asc, &lf_aus),
-            h,
-            "must be deterministic"
-        );
+        assert_eq!(encoded_audio_sha256_es(init, &blocks), h, "must be deterministic");
 
-        // Different encoded payloads must produce different hashes.
+        // Different payloads must produce different hashes.
         let other = vec![vec![1, 2, 3], vec![4, 6]];
-        assert_ne!(encoded_audio_sha256(opus_head, &other, lf_asc, &lf_aus), h);
+        assert_ne!(encoded_audio_sha256_es(init, &other), h);
+        let other_init = b"fake-init2";
+        assert_ne!(encoded_audio_sha256_es(other_init, &blocks), h);
 
-        // Length-prefix collisions are impossible by construction: a packet
-        // split changes the packet count and payload bytes.
+        // Length-prefix collisions are impossible by construction: a block
+        // split changes the block count and payload bytes.
         let split = vec![vec![1, 2], vec![3, 4, 5]];
-        assert_ne!(encoded_audio_sha256(opus_head, &split, lf_asc, &lf_aus), h);
-
-        // Stream order is fixed and significant (Opus first, then xHE-AAC).
-        assert_ne!(
-            encoded_audio_sha256(opus_head, &opus_packets, lf_asc, &lf_aus),
-            encoded_audio_sha256(lf_asc, &lf_aus, opus_head, &opus_packets)
-        );
+        assert_ne!(encoded_audio_sha256_es(init, &split), h);
     }
 
     fn synth_wav(secs: usize, rate: u32, stream_len: bool) -> Vec<u8> {

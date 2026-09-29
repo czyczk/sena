@@ -6,7 +6,7 @@ use std::process::ExitCode;
 
 use sena_dec::demux::Demuxed;
 use sena_dec::output::{self, Dither, SampleFormat};
-use sena_dec::pipeline::{decode, probe};
+use sena_dec::pipeline::{decode, probe_params};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Format {
@@ -136,13 +136,17 @@ fn run() -> Result<(), String> {
     let demux = Demuxed::parse(bytes).map_err(|e| e.to_string())?;
 
     if args.info {
-        let (info, warnings) = probe(&demux).map_err(|e| e.to_string())?;
+        let (info, warnings) = probe_params(&demux.init, demux.audio_span_bytes).map_err(|e| e.to_string())?;
         for w in &warnings {
             eprintln!("warning: {w}");
         }
         eprintln!(
-            "info: profile={} version={} rate={} ch={} playable={} frames ({:.6} s)",
-            info.profile,
+            "info: codec={} version={} rate={} ch={} playable={} frames ({:.6} s)",
+            sena_core::es::codec_name(
+                sena_core::Profile::from_crossover(info.profile as f64)
+                    .expect("profile number"),
+                info.three_track,
+            ),
             info.sena_version,
             info.sample_rate,
             info.channels,
@@ -161,8 +165,11 @@ fn run() -> Result<(), String> {
         eprintln!("warning: {w}");
     }
     eprintln!(
-        "info: profile={} version={} rate={} ch={} playable={} frames ({:.6} s)",
-        info.profile,
+        "info: codec={} version={} rate={} ch={} playable={} frames ({:.6} s)",
+        sena_core::es::codec_name(
+            sena_core::Profile::from_crossover(info.profile as f64).expect("profile number"),
+            info.three_track,
+        ),
         info.sena_version,
         info.sample_rate,
         info.channels,

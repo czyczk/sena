@@ -2,3 +2,6 @@
 name = "sena-mux"
 version.workspace = true
 edition.workspace = true
+
+[dependencies]
+sena-core.workspace = true

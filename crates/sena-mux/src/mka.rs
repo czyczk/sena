@@ -1,32 +1,26 @@
-//! Matroska writer for Sena: two audio tracks, interleaved clusters.
+//! Matroska writer for Sena v2: one composite audio track + Cues.
 
 use crate::ebml;
+use sena_core::es;
 
-pub const TIMECODE_SCALE: u64 = 1_000_000; // microseconds
+pub const TIMECODE_SCALE: u64 = 1_000_000; // 1 ms ticks
 
-pub struct Track {
-    pub codec_id: String,
-    pub codec_private: Vec<u8>,
-    pub sample_rate: f64,
-    pub channels: u64,
-    pub codec_delay_ns: u64,
-    pub bit_depth: Option<u64>,
-}
-
-pub struct Frame {
-    pub track: usize,
-    /// presentation timestamp in nanoseconds
+/// One composite ES block (see sena_core::es) with its playable-timeline
+/// timestamp.
+pub struct SenaBlock {
+    /// presentation timestamp in nanoseconds (multiple of es::BLOCK_NS)
     pub t_ns: u64,
     pub data: Vec<u8>,
 }
 
-/// Write a Sena mka file. Frames must be sorted by time. `playable_ns` is the
-/// playable length of the file (the source timeline length in nanoseconds);
-/// the Segment Info Duration is set to exactly this value (no padding).
-pub fn write_mka(
-    tracks: &[Track],
-    mut frames: Vec<Frame>,
-    tags: &[(&str, &str)],
+/// Write a Sena file: exactly one `A_MS/ACM` track carrying composite ES
+/// blocks, 1 s-ish clusters, and a Cues element (one CuePoint per cluster)
+/// after the last cluster. `playable_ns` is the playable length; the
+/// Segment Info Duration is set to exactly this value (no padding).
+pub fn write_sena(
+    codec_private: &[u8],
+    blocks: &[SenaBlock],
+    codec_name: &str,
     cluster_ms: u64,
     playable_ns: u64,
 ) -> Vec<u8> {
@@ -53,58 +47,42 @@ pub fn write_mka(
     ebml::float(&mut info, &[0x44, 0x89], playable_ns as f64 / 1e6);
     ebml::write_element(&mut out, &[0x15, 0x49, 0xA9, 0x66], &info);
 
-    // Tracks
+    // Tracks: the single composite Sena track
+    let mut te = vec![];
+    ebml::uint(&mut te, &[0xD7], 1); // TrackNumber
+    ebml::uint(&mut te, &[0x73, 0xC5], 1); // TrackUID
+    ebml::uint(&mut te, &[0x83], 2); // audio
+    ebml::str(&mut te, &[0x86], es::SENA_CODEC_ID);
+    ebml::str(&mut te, &[0x25, 0x86, 0x88], codec_name);
+    ebml::bin(&mut te, &[0x63, 0xA2], codec_private);
+    // CodecDelay is 0 (default; trims are internal to the ES) — omitted.
+    ebml::uint(&mut te, &[0x23, 0xE3, 0x83], es::BLOCK_NS); // DefaultDuration (ns)
+    ebml::uint(&mut te, &[0x56, 0xBB], es::SEEK_PREROLL_NS); // SeekPreRoll (ns, informational)
+    let mut audio = vec![];
+    ebml::float(&mut audio, &[0xB5], sena_core::SAMPLE_RATE as f64);
+    ebml::uint(&mut audio, &[0x9F], es::CHANNELS as u64);
+    ebml::write_element(&mut te, &[0xE1], &audio);
     let mut tracks_el = vec![];
-    for (i, t) in tracks.iter().enumerate() {
-        let mut te = vec![];
-        ebml::uint(&mut te, &[0xD7], (i + 1) as u64);
-        ebml::uint(&mut te, &[0x73, 0xC5], (i + 1) as u64);
-        ebml::uint(&mut te, &[0x83], 2); // audio
-        ebml::str(&mut te, &[0x86], &t.codec_id);
-        if !t.codec_private.is_empty() {
-            ebml::bin(&mut te, &[0x63, 0xA2], &t.codec_private);
-        }
-        ebml::uint(&mut te, &[0x56, 0xAA], t.codec_delay_ns);
-        let mut audio = vec![];
-        ebml::float(&mut audio, &[0xB5], t.sample_rate);
-        ebml::uint(&mut audio, &[0x9F], t.channels);
-        if let Some(bd) = t.bit_depth {
-            ebml::uint(&mut audio, &[0x62, 0x64], bd);
-        }
-        ebml::write_element(&mut te, &[0xE1], &audio);
-        ebml::write_element(&mut tracks_el, &[0xAE], &te);
-    }
+    ebml::write_element(&mut tracks_el, &[0xAE], &te);
     ebml::write_element(&mut out, &[0x16, 0x54, 0xAE, 0x6B], &tracks_el);
 
-    // Tags (container level)
-    if !tags.is_empty() {
-        let mut tags_el = vec![];
-        let mut tag = vec![];
-        for (k, v) in tags {
-            let mut st = vec![];
-            ebml::str(&mut st, &[0x45, 0xA3], k);
-            ebml::str(&mut st, &[0x44, 0x87], v);
-            ebml::write_element(&mut tag, &[0x67, 0xC8], &st);
-        }
-        ebml::write_element(&mut tags_el, &[0x73, 0x73], &tag);
-        ebml::write_element(&mut out, &[0x12, 0x54, 0xC3, 0x67], &tags_el);
-    }
-
-    // Clusters: pack frames into ~cluster_ms windows
-    frames.sort_by_key(|f| f.t_ns);
+    // Clusters: pack blocks into ~cluster_ms windows, recording cue points
+    let mut cues: Vec<(u64, u64)> = vec![]; // (time ms, cluster pos rel. to segment payload)
     let mut idx = 0;
-    while idx < frames.len() {
-        let start = frames[idx].t_ns;
+    while idx < blocks.len() {
+        let start = blocks[idx].t_ns;
         let end = start + cluster_ms * 1_000_000;
+        let cluster_pos = (out.len() - seg_payload_start) as u64;
+        cues.push((start / TIMECODE_SCALE, cluster_pos));
         let mut cluster = vec![];
         ebml::uint(&mut cluster, &[0xE7], start / TIMECODE_SCALE);
-        while idx < frames.len() && frames[idx].t_ns < end {
-            let f = &frames[idx];
+        while idx < blocks.len() && blocks[idx].t_ns < end {
+            let f = &blocks[idx];
             let mut sb = vec![];
-            ebml::write_vint(&mut sb, (f.track + 1) as u64);
-            // SimpleBlock relative timestamp is signed 16-bit in TimestampScale
-            // ticks. With TIMECODE_SCALE = 1 ms and 1 s clusters this is
-            // always within i16 range for Sena frame timing.
+            ebml::write_vint(&mut sb, 1); // track 1
+            // SimpleBlock relative timestamp is signed 16-bit in
+            // TimestampScale ticks; with 1 ms ticks and <= 1 s clusters
+            // this is always within i16 range for Sena block timing.
             let rel = ((f.t_ns - start) / TIMECODE_SCALE) as i16;
             sb.extend_from_slice(&rel.to_be_bytes());
             sb.push(0x80); // keyframe, no lacing
@@ -114,6 +92,20 @@ pub fn write_mka(
         }
         ebml::write_element(&mut out, &[0x1F, 0x43, 0xB6, 0x75], &cluster);
     }
+
+    // Cues: one CuePoint per cluster
+    let mut cues_el = vec![];
+    for (time_ms, cluster_pos) in cues {
+        let mut point = vec![];
+        ebml::uint(&mut point, &[0xB3], time_ms); // CueTime (ticks)
+        let mut pos = vec![];
+        ebml::uint(&mut pos, &[0xF7], 1); // CueTrack
+        ebml::uint(&mut pos, &[0xF1], cluster_pos); // CueClusterPosition
+        ebml::uint(&mut pos, &[0x53, 0x78], 1); // CueBlockNumber
+        ebml::write_element(&mut point, &[0xB7], &pos);
+        ebml::write_element(&mut cues_el, &[0xBB], &point);
+    }
+    ebml::write_element(&mut out, &[0x1C, 0x53, 0xBB, 0x6B], &cues_el);
 
     // Patch segment size
     let seg_payload_len = out.len() - seg_payload_start;
@@ -129,4 +121,25 @@ pub fn write_mka(
     out.splice(seg_pos + 4..seg_pos + 4 + size_len, b.iter().copied());
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codec_name_is_embedded() {
+        let cp = vec![0u8; 40];
+        let blocks = vec![
+            SenaBlock { t_ns: 0, data: vec![0, 3, 1, b'x'] },
+            SenaBlock { t_ns: 20_000_000, data: vec![0, 2, 1, b'y'] },
+        ];
+        let name = "Sena xAAC-Opus@600-Opus@15600";
+        let file = write_sena(&cp, &blocks, name, 1000, 40_000_000);
+        let needle = b"Sena xAAC-Opus@600-Opus@15600";
+        assert!(
+            file.windows(needle.len()).any(|w| w == needle),
+            "CodecName not found in container"
+        );
+    }
 }

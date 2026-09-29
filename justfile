@@ -3,7 +3,7 @@
 # Recipe groups:
 #   general          doctor / check / test
 #   plugin (fb2k)    senadec-plugin-fb2k-*     (foo_input_sena; the Sena decoder)
-#   plugin (ffmpeg)  senadec-plugin-ffmpeg-*   (ffmpeg/LAV demuxer over dlopen'd core)
+#   plugin (ffmpeg)  senadec-plugin-ffmpeg-*   (ffmpeg/LAV decoder over dlopen'd core)
 #   senaenc          senaenc-*                 (encoder CLI release builds)
 #   senadec          senadec-bin-*             (decoder CLI release builds)
 #
@@ -112,7 +112,7 @@ senadec-plugin-fb2k-install:
     @python3 "{{script}}" install
 
 # ---------------------------------------------------------------------------
-# ffmpeg / LAV Filters demuxer (plugins/ffmpeg): a thin libavformat adapter
+# ffmpeg / LAV Filters decoder (plugins/ffmpeg): a thin libavcodec adapter
 # that dlopens the sena-dec core. See plugins/ffmpeg/README.md.
 #
 #   just senadec-plugin-ffmpeg-apply             # patch the ffmpeg tree (idempotent)

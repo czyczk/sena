@@ -1,5 +1,7 @@
 //! Sena shared constants: profiles, pads, delays, accounting.
 
+pub mod es;
+
 pub const SAMPLE_RATE: u32 = 48000;
 pub const LF_RATE: u32 = 16000;
 pub const PRE_GAIN: f64 = 0.631; // -4 dB

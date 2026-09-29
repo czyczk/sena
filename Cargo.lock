@@ -194,6 +194,7 @@ dependencies = [
  "sena-core",
  "sena-dsp",
  "sena-mux",
+ "sha2",
 ]
 
 [[package]]
@@ -223,6 +224,9 @@ dependencies = [
 [[package]]
 name = "sena-mux"
 version = "0.1.0"
+dependencies = [
+ "sena-core",
+]
 
 [[package]]
 name = "senadec"

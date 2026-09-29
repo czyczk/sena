@@ -3,10 +3,13 @@ fn main() {
     let path = std::env::args().nth(1).unwrap();
     let seek_frame: usize = std::env::args().nth(2).unwrap().parse().unwrap();
     let demux = Demuxed::parse(std::fs::read(path).unwrap()).unwrap();
-    let lf = demux.tracks.iter().find(|t| t.codec_id == "A_SENALF").unwrap();
-    let lf_rate = lf.sample_rate.round() as usize;
-    let asc = rxaac_dec_lib::asc::AudioSpecificConfig::parse(&lf.codec_private).unwrap();
-    let aus: Vec<&[u8]> = demux.frames.iter().filter(|f| f.track == lf.number).map(|f| f.data.as_slice()).collect();
+    let lf_rate = demux.init.lf_rate as usize;
+    let asc = rxaac_dec_lib::asc::AudioSpecificConfig::parse(&demux.init.lf_asc).unwrap();
+    let mut aus: Vec<&[u8]> = Vec::new();
+    for b in &demux.blocks {
+        let block = sena_core::es::decode_block(&b.data).unwrap();
+        aus.extend(block.lf);
+    }
     let target_core = seek_frame * lf_rate / 48_000;
     let au = target_core / 1024;
     let mut indep = au;

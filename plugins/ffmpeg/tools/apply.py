@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
-"""Install the Sena demuxer into an FFmpeg source tree (idempotent).
+"""Install the Sena decoder into an FFmpeg source tree (idempotent).
 
 usage: apply.py <ffmpeg-src> [--check | --uninstall]
 
 What it does:
-  1. copies the Sena plugin sources into <ffmpeg-src>/libavformat/
-     (senadec.c, sena_dec_dl.c, sena_dec_dl.h, sena_dec.h, sena_probe.h)
-  2. registers ff_sena_demuxer in libavformat/allformats.c (sorted position)
-  3. adds the objects to libavformat/Makefile (CONFIG_SENA_DEMUXER)
-  4. patches matroskadec's probe to defer Sena files to the sena demuxer
-     (a .sena extension or a visible SENA_PROFILE tag => score 0 there)
+  1. copies the Sena plugin sources into <ffmpeg-src>/libavcodec/
+     (senadec.c, sena_dec_dl.c, sena_dec_dl.h, sena_dec.h)
+  2. adds AV_CODEC_ID_SENA to libavcodec/codec_id.h (after APPLE_APAC)
+  3. adds the codec descriptor to libavcodec/codec_desc.c
+  4. registers ff_sena_decoder in libavcodec/allcodecs.c (sorted position)
+  5. adds the objects to libavcodec/Makefile (CONFIG_SENA_DECODER)
+  6. maps wFormatTag 0x534E to AV_CODEC_ID_SENA in libavformat/riff.c
+     (ff_codec_wav_tags), which makes the Matroska `A_MS/ACM` path and WAV
+     resolve the codec automatically - no demuxer patches needed
 
-configure picks the new demuxer up automatically (it scans allformats.c);
-re-run ./configure with the previous arguments after applying, then make.
-With --uninstall every change is reverted and the copied files removed.
+configure picks the new decoder up automatically (it scans allcodecs.c and
+codec_id.h); re-run ./configure with the previous arguments after applying,
+then make. With --uninstall every change is reverted and the copied files
+removed.
 """
 import argparse
 import pathlib
@@ -22,31 +26,34 @@ import shutil
 import sys
 
 PLUGIN_DIR = pathlib.Path(__file__).resolve().parent.parent
-SRC_DIR = PLUGIN_DIR / "libavformat"
-COPIED_FILES = ["senadec.c", "sena_dec_dl.c", "sena_dec_dl.h", "sena_dec.h", "sena_probe.h"]
+SRC_DIR = PLUGIN_DIR / "libavcodec"
+COPIED_FILES = ["senadec.c", "sena_dec_dl.c", "sena_dec_dl.h", "sena_dec.h"]
 
-ALLFORMATS_LINE = "extern const FFInputFormat  ff_sena_demuxer;"
-MAKEFILE_LINE = "OBJS-$(CONFIG_SENA_DEMUXER)              += senadec.o sena_dec_dl.o"
+CODEC_ID_ANCHOR = "    AV_CODEC_ID_APPLE_APAC,\n"
+CODEC_ID_LINE = "    AV_CODEC_ID_SENA,\n"
 
-MKA_INCLUDE_ANCHOR = '#include "matroska.h"'
-MKA_INCLUDE_LINE = '#include "sena_probe.h"'
+CODEC_DESC_ANCHOR = """    {
+        .id        = AV_CODEC_ID_APPLE_APAC,
+        .type      = AVMEDIA_TYPE_AUDIO,
+        .name      = "apple_apac",
+        .long_name = NULL_IF_CONFIG_SMALL("Apple Positional Audio Codec"),
+        .props     = AV_CODEC_PROP_LOSSY,
+    },
+"""
+CODEC_DESC_LINE = """    {
+        .id        = AV_CODEC_ID_SENA,
+        .type      = AVMEDIA_TYPE_AUDIO,
+        .name      = "sena",
+        .long_name = NULL_IF_CONFIG_SMALL("Sena multilayer audio"),
+        .props     = AV_CODEC_PROP_LOSSY,
+    },
+"""
 
-# Exact upstream snippet in matroska_probe() that claims a file as
-# Matroska/WebM. FFmpeg 6.x-8.x all carry it verbatim; if a future FFmpeg
-# reformats it, applying fails loudly instead of patching the wrong spot.
-MKA_PROBE_OLD = """            if (!memcmp(p->buf + n, matroska_doctypes[i], probelen))
-                return AVPROBE_SCORE_MAX;"""
-MKA_PROBE_NEW = """            if (!memcmp(p->buf + n, matroska_doctypes[i], probelen)) {
-#if CONFIG_SENA_DEMUXER
-                /* A Sena file is Matroska carrying the mandatory SENA_PROFILE
-                 * tag; leave it to the sena demuxer, and never claim a .sena
-                 * file as plain Matroska. */
-                if (av_match_ext(p->filename, "sena") ||
-                    ff_sena_probe_match(p->buf, p->buf_size))
-                    return 0;
-#endif
-                return AVPROBE_SCORE_MAX;
-            }"""
+ALLCODECS_LINE = "extern const FFCodec ff_sena_decoder;"
+MAKEFILE_LINE = "OBJS-$(CONFIG_SENA_DECODER)              += senadec.o sena_dec_dl.o"
+
+RIFF_ANCHOR = "    { AV_CODEC_ID_FLAC,            0xF1AC },\n"
+RIFF_LINE = "    { AV_CODEC_ID_SENA,            0x534E },\n"
 
 
 def fail(msg):
@@ -54,96 +61,60 @@ def fail(msg):
     sys.exit(1)
 
 
-def insert_sorted(lines, new_line, key):
-    """Insert new_line before the first entry whose sort key is larger."""
-    for i, line in enumerate(lines):
-        if key(line) > key(new_line):
-            lines.insert(i, new_line + "\n")
-            return
-    lines.append(new_line + "\n")
+def insert_after(text, anchor, line):
+    if line in text:
+        return text, False
+    if anchor not in text:
+        return None, False
+    return text.replace(anchor, anchor + line, 1), True
 
 
-def patch_allformats(path, uninstall):
-    text = path.read_text()
-    lines = text.splitlines(keepends=True)
-    present = any(ALLFORMATS_LINE in l for l in lines)
-    if uninstall:
-        if present:
-            lines = [l for l in lines if ALLFORMATS_LINE not in l]
-            path.write_text("".join(lines))
-            return "removed ff_sena_demuxer registration"
-        return "not registered (skipped)"
-    if present:
-        return "already registered (skipped)"
-    demuxer_re = re.compile(r"^extern const FFInputFormat  ff_(\w+)_demuxer;\s*$")
-    for i, line in enumerate(lines):
-        m = demuxer_re.match(line)
-        if m and m.group(1) > "sena":
-            lines.insert(i, ALLFORMATS_LINE + "\n")
-            path.write_text("".join(lines))
-            return f"registered before ff_{m.group(1)}_demuxer"
-    fail(f"no demuxer registration point found in {path}")
-
-
-def patch_makefile(path, uninstall):
-    text = path.read_text()
-    lines = text.splitlines(keepends=True)
-    present = any("CONFIG_SENA_DEMUXER" in l for l in lines)
-    if uninstall:
-        if present:
-            lines = [l for l in lines if "CONFIG_SENA_DEMUXER" not in l]
-            path.write_text("".join(lines))
-            return "removed CONFIG_SENA_DEMUXER objects"
-        return "not in Makefile (skipped)"
-    if present:
-        return "already in Makefile (skipped)"
-    obj_re = re.compile(r"^OBJS-\$\(CONFIG_(\w+)_DEMUXER\)")
-    for i, line in enumerate(lines):
-        m = obj_re.match(line)
-        if m and m.group(1) > "SENA":
-            lines.insert(i, MAKEFILE_LINE + "\n")
-            path.write_text("".join(lines))
-            return f"added objects before CONFIG_{m.group(1)}_DEMUXER"
-    fail(f"no demuxer object list found in {path}")
-
-
-def patch_matroskadec(path, uninstall):
+def patch_file(path, anchor, line, uninstall, sort_regex=None):
+    """Insert `line` after `anchor` (or sorted by sort_regex), idempotent."""
     text = path.read_text()
     if uninstall:
-        changed = text.replace(MKA_PROBE_NEW, MKA_PROBE_OLD)
-        changed = changed.replace(MKA_INCLUDE_LINE + "\n", "")
-        if changed == text:
-            return "matroskadec.c untouched (skipped)"
-        path.write_text(changed)
-        return "reverted matroskadec.c"
-    if MKA_PROBE_NEW in text:
-        return "matroskadec.c already patched (skipped)"
-    if MKA_PROBE_OLD not in text:
-        fail(f"matroska_probe snippet not found in {path}; this FFmpeg version "
-             f"changed the probe - adjust MKA_PROBE_OLD in {__file__}")
-    if MKA_INCLUDE_ANCHOR not in text:
-        fail(f"{MKA_INCLUDE_ANCHOR} not found in {path}")
-    text = text.replace(MKA_PROBE_OLD, MKA_PROBE_NEW, 1)
-    text = text.replace(MKA_INCLUDE_ANCHOR, MKA_INCLUDE_ANCHOR + "\n" + MKA_INCLUDE_LINE, 1)
-    path.write_text(text)
-    return "patched matroskadec.c (defer Sena files)"
+        if line.strip() in text:
+            path.write_text(text.replace(line, "", 1))
+            return "reverted"
+        return "not present (skipped)"
+    if line.strip() in text:
+        return "already applied (skipped)"
+    if anchor is not None:
+        new, _ = insert_after(text, anchor, line)
+        if new is None:
+            fail(f"anchor not found in {path}:\n{anchor}")
+        path.write_text(new)
+        return "patched (after anchor)"
+    if sort_regex is not None:
+        key = re.compile(sort_regex)
+        target = "SENA_DECODER"
+        lines = text.splitlines(keepends=True)
+        for i, l in enumerate(lines):
+            m = key.match(l)
+            if m and m.group(1) > target:
+                lines.insert(i, line + "\n")
+                path.write_text("".join(lines))
+                return f"patched (before {m.group(1)})"
+        fail(f"no insertion point found in {path}")
+    fail("internal: no anchor and no sort regex")
 
 
 def check(tree):
     ok = True
     for name in COPIED_FILES:
-        if not (tree / "libavformat" / name).exists():
-            print(f"missing: libavformat/{name}")
+        if not (tree / "libavcodec" / name).exists():
+            print(f"missing: libavcodec/{name}")
             ok = False
-    if ALLFORMATS_LINE not in (tree / "libavformat" / "allformats.c").read_text():
-        print("missing: allformats.c registration")
-        ok = False
-    if "CONFIG_SENA_DEMUXER" not in (tree / "libavformat" / "Makefile").read_text():
-        print("missing: Makefile objects")
-        ok = False
-    if MKA_PROBE_NEW not in (tree / "libavformat" / "matroskadec.c").read_text():
-        print("missing: matroskadec.c deferral patch")
-        ok = False
+    for path, line, label in [
+        (tree / "libavcodec" / "codec_id.h", CODEC_ID_LINE, "codec_id.h"),
+        (tree / "libavcodec" / "codec_desc.c", 'AV_CODEC_ID_SENA', "codec_desc.c"),
+        (tree / "libavcodec" / "allcodecs.c", ALLCODECS_LINE, "allcodecs.c"),
+        (tree / "libavcodec" / "Makefile", "CONFIG_SENA_DECODER", "Makefile"),
+        (tree / "libavformat" / "riff.c", "0x534E", "riff.c wav tag"),
+    ]:
+        if line not in path.read_text():
+            print(f"missing: {label}")
+            ok = False
     print("check: all patches present" if ok else "check: incomplete - run apply")
     return ok
 
@@ -157,34 +128,36 @@ def main():
     args = ap.parse_args()
 
     tree = args.ffmpeg_src.resolve()
-    if not (tree / "libavformat" / "allformats.c").exists():
+    if not (tree / "libavcodec" / "allcodecs.c").exists():
         fail(f"{tree} does not look like an FFmpeg source tree")
 
-    if args.check:
-        sys.exit(0 if check(tree) else 1)
-
+    avcodec = tree / "libavcodec"
     avformat = tree / "libavformat"
     if args.uninstall:
         for name in COPIED_FILES:
-            target = avformat / name
+            target = avcodec / name
             if target.exists():
                 target.unlink()
-                print(f"removed libavformat/{name}")
+                print(f"removed libavcodec/{name}")
     else:
         for name in COPIED_FILES:
             src = SRC_DIR / name
             if not src.exists():
                 fail(f"missing plugin source {src}")
-            target = avformat / name
+            target = avcodec / name
             if target.exists() and target.read_bytes() == src.read_bytes():
-                print(f"libavformat/{name} up to date")
+                print(f"libavcodec/{name} up to date")
                 continue
-            shutil.copyfile(src, avformat / name)
-            print(f"installed libavformat/{name}")
+            shutil.copyfile(src, avcodec / name)
+            print(f"installed libavcodec/{name}")
 
-    print("allformats.c:", patch_allformats(avformat / "allformats.c", args.uninstall))
-    print("Makefile:    ", patch_makefile(avformat / "Makefile", args.uninstall))
-    print("matroskadec.c:", patch_matroskadec(avformat / "matroskadec.c", args.uninstall))
+    print("codec_id.h:  ", patch_file(avcodec / "codec_id.h", CODEC_ID_ANCHOR, CODEC_ID_LINE, args.uninstall))
+    print("codec_desc.c:", patch_file(avcodec / "codec_desc.c", CODEC_DESC_ANCHOR, CODEC_DESC_LINE, args.uninstall))
+    print("allcodecs.c: ", patch_file(avcodec / "allcodecs.c", None, ALLCODECS_LINE, args.uninstall,
+                                      r"^extern const FFCodec\s+ff_(\w+)_decoder;\s*$"))
+    print("Makefile:    ", patch_file(avcodec / "Makefile", None, MAKEFILE_LINE, args.uninstall,
+                                      r"^OBJS-\$\(CONFIG_(\w+)_DECODER\)"))
+    print("riff.c:      ", patch_file(avformat / "riff.c", RIFF_ANCHOR, RIFF_LINE, args.uninstall))
     if not args.uninstall:
         print("done. Re-run ./configure in the FFmpeg tree, then make.")
 

@@ -1,6 +1,6 @@
-//! In-place Matroska user-tag rewriting (void old tail Tags, append new one,
-//! patch the Segment size). Immutable Sena tags stay in the first Tags
-//! element and are never modified.
+//! In-place Matroska user-tag rewriting (void old Tags, append new one,
+//! patch the Segment size). The Sena identification lives in the track
+//! CodecPrivate (SENA-INIT), which a tag rewrite never touches.
 //!
 //! The rewrite is planned as a handful of positioned writes
 //! ([`plan_user_tag_rewrite`]) computed from a bounded-memory
@@ -129,7 +129,6 @@ where
 
     let mut pos = segment.data_start as u64;
     let end = segment.data_end as u64;
-    let mut tag_index = 0usize;
     let mut entries = Vec::new();
     while pos < end {
         let (id, elem) = header_at(read_at, pos)?;
@@ -137,7 +136,7 @@ where
             return Err("top-level element overruns the Segment".into());
         }
         if id == TAGS_ID {
-            if tag_index > 0 {
+            {
                 let payload = read_at(elem.data_start as u64, elem.data_end - elem.data_start)?;
                 let local = crate::demux::Elem {
                     start: 0,
@@ -150,7 +149,6 @@ where
                     .map_err(|e| e.to_string())?;
                 entries.extend(parsed);
             }
-            tag_index += 1;
         }
         pos = elem.data_end as u64;
     }
@@ -173,19 +171,35 @@ fn sanitize_entries(entries: &[(String, String)]) -> Vec<(String, String)> {
 }
 
 /// Compute the positioned writes that replace the user tags of a scanned
-/// file with `entries`: void every Tags block after the immutable first one,
-/// append the replacement at the Segment tail, re-patch the Segment size.
+/// file with `entries`: void every Tags block, then insert the replacement
+/// at the head (right after the Tracks element), re-patch the Segment size.
+/// Head placement is what makes the tags visible to demuxers that never
+/// scan to EOF (matroskadec/LAV at probe time); a mid-file Insert op is
+/// only valid for the in-memory apply path, so the io-callback path must
+/// use the buffered whole-file rewrite for it.
 pub fn plan_user_tag_rewrite(
     scan: &IndexedFile,
     entries: &[(String, String)],
 ) -> Result<Vec<WriteOp>, String> {
     let entries = sanitize_entries(entries);
     let mut ops = Vec::new();
-    for &(start, end) in scan.tag_ranges.iter().skip(1) {
+    for &(start, end) in scan.tag_ranges.iter() {
         demux::push_void_ops(&mut ops, start, end)?;
     }
-    let appended = if entries.is_empty() { Vec::new() } else { build_user_tags(&entries) };
-    demux::push_append_ops(&mut ops, scan, appended)?;
+    if !entries.is_empty() {
+        let appended = build_user_tags(&entries);
+        let new_payload_len =
+            (scan.segment_payload_end - scan.segment_payload_start) + appended.len() as u64;
+        let patch = demux::encode_vint_exact(new_payload_len, scan.segment_size_len)?;
+        ops.push(WriteOp::Insert {
+            offset: scan.tracks_end,
+            data: appended,
+        });
+        ops.push(WriteOp::Bytes {
+            offset: scan.segment_size_pos,
+            data: patch,
+        });
+    }
     Ok(ops)
 }
 
@@ -201,14 +215,15 @@ pub fn rewrite_user_tags(original: &[u8], entries: &[(String, String)]) -> Resul
     let mut out = original.to_vec();
     demux::apply_write_ops_to_vec(&mut out, &ops);
 
-    // Verify the result still scans and the immutable Sena tags (including
-    // the encoded-audio stream hash) remain at the head.
+    // Verify the result still scans and the SENA-INIT track is intact.
     let check = demux::index_container(
         &mut |pos: u64, len: usize| demux::mem_read_at(&out, pos, len),
         false,
     )
     .map_err(|e| format!("rewritten file invalid: {e}"))?;
-    demux::check_immutable_survived(&scan, &check)?;
+    if check.init != scan.init {
+        return Err("SENA-INIT changed after rewrite".into());
+    }
     Ok(out)
 }
 
@@ -240,7 +255,6 @@ mod tests {
         let expected: Vec<(String, String)> = demux
             .tags
             .iter()
-            .skip(1)
             .flat_map(|t| t.entries.clone())
             .collect();
 
@@ -296,9 +310,9 @@ mod tests {
         ];
         let rewritten = rewrite_user_tags(&original, &entries).unwrap();
         let check = Demuxed::parse(rewritten.clone()).unwrap();
-        assert_eq!(check.immutable_tag("SENA_PROFILE"), Some("300"));
-        assert_eq!(check.immutable_tag("SENA_PLAYABLE_SAMPLES"), Some("960000"));
-        let user: Vec<(String, String)> = check.tags.iter().skip(1).flat_map(|t| t.entries.clone()).collect();
+        assert_eq!(check.init.playable_samples, 960000);
+        assert_eq!(check.init.profile, sena_core::Profile::At300);
+        let user: Vec<(String, String)> = check.tags.iter().flat_map(|t| t.entries.clone()).collect();
         assert_eq!(user, vec![("TITLE".to_string(), "ok".to_string())]);
         // read-back via the scan path too
         let mut served = 0usize;
@@ -315,7 +329,7 @@ mod tests {
     }
 
     #[test]
-    fn retag_preserves_clusters_and_immutable_tags() {
+    fn retag_preserves_clusters_and_init() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/e2e/01__p300__lfa__hf144.sena");
         let original = std::fs::read(path).unwrap();
         let cluster_positions: Vec<usize> = crate::demux::read_cluster_starts(&original).unwrap();
@@ -325,18 +339,27 @@ mod tests {
             &[("TITLE".to_string(), "first".to_string()), ("ARTIST".to_string(), "zenas".to_string())],
         ).unwrap();
         let check1 = Demuxed::parse(once.clone()).unwrap();
-        assert_eq!(check1.immutable_tag("SENA_PROFILE"), Some("300"));
-        assert_eq!(check1.immutable_tag("SENA_PLAYABLE_SAMPLES"), Some("960000"));
+        assert_eq!(check1.init.playable_samples, 960000);
         assert_eq!(check1.tags.last().unwrap().get("TITLE"), Some("first"));
         assert_eq!(check1.tags.last().unwrap().get("ARTIST"), Some("zenas"));
-        assert_eq!(crate::demux::read_cluster_starts(&once).unwrap(), cluster_positions);
+        // Head-positioned Tags shift the clusters as a block by exactly the
+        // inserted element's length; their bytes and order are untouched.
+        let shift1 = once.len() - original.len();
+        let want: Vec<usize> = cluster_positions.iter().map(|p| p + shift1).collect();
+        assert_eq!(crate::demux::read_cluster_starts(&once).unwrap(), want);
+        // The user Tags sit at the head, before the first cluster (visible
+        // to demuxers at probe time).
+        let first_cluster = crate::demux::read_cluster_starts(&once).unwrap()[0];
+        assert!(check1.tags.last().unwrap().elem.data_end <= first_cluster);
 
         let twice = rewrite_user_tags(&once, &[("TITLE".to_string(), "second".to_string())]).unwrap();
         let check2 = Demuxed::parse(twice.clone()).unwrap();
-        assert_eq!(check2.immutable_tag("SENA_PROFILE"), Some("300"));
+        assert_eq!(check2.init.playable_samples, 960000);
         assert_eq!(check2.tags.last().unwrap().get("TITLE"), Some("second"));
         assert!(check2.tags.last().unwrap().get("ARTIST").is_none());
-        assert_eq!(crate::demux::read_cluster_starts(&twice).unwrap(), cluster_positions);
+        let shift2 = twice.len() - once.len();
+        let want2: Vec<usize> = want.iter().map(|p| p + shift2).collect();
+        assert_eq!(crate::demux::read_cluster_starts(&twice).unwrap(), want2);
 
         // The second file must still decode to the same playable length.
         let dec = Decoder::open(&check2).unwrap();

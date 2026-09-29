@@ -42,10 +42,18 @@ fn malformed_lf_aus_never_panic() {
     );
     let bytes = std::fs::read(asset).unwrap();
     let demux = Demuxed::parse(bytes).unwrap();
-    let lf = demux.track("A_SENALF").unwrap();
-    let asc = AudioSpecificConfig::parse(&lf.codec_private).expect("asset ASC parses");
-    let frames: Vec<_> = demux.frames_for(lf.number).take(8).cloned().collect();
-    let good: Vec<Vec<u8>> = frames.iter().map(|f| f.data.clone()).collect();
+    let asc = AudioSpecificConfig::parse(&demux.init.lf_asc).expect("asset ASC parses");
+    let mut good: Vec<Vec<u8>> = Vec::new();
+    for b in &demux.blocks {
+        let block = sena_core::es::decode_block(&b.data).unwrap();
+        for au in block.lf {
+            good.push(au.to_vec());
+        }
+        if good.len() >= 8 {
+            break;
+        }
+    }
+    good.truncate(8);
 
     let mut calls = 0usize;
     let mut panics: Vec<String> = Vec::new();
@@ -61,10 +69,10 @@ fn malformed_lf_aus_never_panic() {
     };
 
     // Byte substitutions across every AU byte.
-    for (idx, f) in frames.iter().enumerate() {
-        for pos in 0..f.data.len() {
+    for (idx, f) in good.iter().enumerate() {
+        for pos in 0..f.len() {
             for val in [0x00u8, 0x01, 0x02, 0x21, 0x7f, 0x80, 0xfe, 0xff] {
-                let mut v = f.data.clone();
+                let mut v = f.clone();
                 v[pos] = val;
                 run(idx, &format!("set[{pos}]={val:#04x}"), &v, false);
             }
@@ -72,10 +80,10 @@ fn malformed_lf_aus_never_panic() {
     }
 
     // Single-bit flips across the AU head (where parser headers live).
-    for (idx, f) in frames.iter().enumerate() {
-        for pos in 0..f.data.len().min(48) {
+    for (idx, f) in good.iter().enumerate() {
+        for pos in 0..f.len().min(48) {
             for bit in 0..8u8 {
-                let mut v = f.data.clone();
+                let mut v = f.clone();
                 v[pos] ^= 1u8 << bit;
                 run(idx, &format!("flip[{pos}]^{bit}"), &v, false);
             }
@@ -83,29 +91,29 @@ fn malformed_lf_aus_never_panic() {
     }
 
     // Truncations, leading bytes and boundary shifts.
-    for (idx, f) in frames.iter().enumerate() {
-        for cut in [0usize, 1, 2, 3, 4, 5, f.data.len() / 2, f.data.len() - 1] {
-            run(idx, &format!("truncate@{cut}"), &f.data[..cut], false);
+    for (idx, f) in good.iter().enumerate() {
+        for cut in [0usize, 1, 2, 3, 4, 5, f.len() / 2, f.len() - 1] {
+            run(idx, &format!("truncate@{cut}"), &f[..cut], false);
         }
         for lead in [0x00u8, 0xff] {
             let mut v = vec![lead];
-            v.extend_from_slice(&f.data);
+            v.extend_from_slice(f);
             run(idx, &format!("lead{lead:#04x}"), &v, false);
         }
     }
-    for start_idx in 0..frames.len().min(3) {
+    for start_idx in 0..good.len().min(3) {
         let mut stream = Vec::new();
-        for f in frames.iter().skip(start_idx).take(6) {
-            stream.extend_from_slice(&f.data);
+        for f in good.iter().skip(start_idx).take(6) {
+            stream.extend_from_slice(f);
         }
         for lead in [0x00u8, 0x01, 0xff] {
             let mut s = vec![lead];
             s.extend_from_slice(&stream);
             let mut off = 0usize;
-            for (j, f) in frames.iter().skip(start_idx).take(6).enumerate() {
-                let end = (off + f.data.len()).min(s.len());
+            for (j, f) in good.iter().skip(start_idx).take(6).enumerate() {
+                let end = (off + f.len()).min(s.len());
                 run(start_idx + j, &format!("shift{lead:#04x}"), &s[off..end], false);
-                off += f.data.len();
+                off += f.len();
             }
         }
     }
@@ -116,8 +124,8 @@ fn malformed_lf_aus_never_panic() {
         state = state
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
-        let idx = (state as usize >> 17) % frames.len();
-        let au = &frames[idx].data;
+        let idx = (state as usize >> 17) % good.len();
+        let au = &good[idx];
         let mut v = au.to_vec();
         let nops = 1 + ((state >> 32) % 8) as usize;
         for _ in 0..nops {

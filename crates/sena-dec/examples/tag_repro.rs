@@ -23,8 +23,8 @@ fn main() {
 
     let rewritten = rewrite_user_tags(&original, &entries).unwrap();
     let demux = Demuxed::parse(rewritten.clone()).unwrap();
-    assert_eq!(demux.immutable_tag("SENA_PROFILE"), Some("300"));
-    let (info, _w) = sena_dec::pipeline::probe(&demux).unwrap();
+    assert_eq!(demux.init.profile, sena_core::Profile::At300);
+    let (info, _w) = sena_dec::pipeline::probe_params(&demux.init, demux.audio_span_bytes).unwrap();
     eprintln!("after rewrite: probe OK playable={}", info.playable_frames);
     let mut served = 0usize;
     let bytes = rewritten.clone();

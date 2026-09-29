@@ -1,3 +1,3 @@
-//! Matroska/EBML writer for Sena files (two tracks, interleaved clusters).
+//! Matroska/EBML writer for Sena files (single composite track + cues).
 pub mod ebml;
 pub mod mka;

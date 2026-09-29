@@ -18,11 +18,12 @@
 extern "C" {
 #endif
 
-#define SENA_DEC_ABI_VERSION 2
+#define SENA_DEC_ABI_VERSION 3
 
 typedef struct SenaDec SenaDec;
 typedef struct SenaTags SenaTags;
 typedef struct SenaArtHandle SenaArtHandle;
+typedef struct SenaEs SenaEs;
 
 typedef struct {
     void    *user_data;
@@ -46,13 +47,13 @@ typedef struct {
     uint32_t channels;
     uint64_t playable_frames;
     uint32_t profile;
-    uint32_t sena_version;
-    char audio_sha256[65]; /* SENA_AUDIO_SHA256, 64 hex + NUL; empty if absent */
+    uint32_t sena_version; /* ES format version (SENA-INIT), 2 for v2 files */
+    char audio_sha256[65]; /* SENA-INIT content hash, 64 hex + NUL */
     /* Encoded size of all Cluster elements (codec payloads plus block
        framing). Tags, Attachments (cover art) and Void filler are excluded:
        average-bitrate displays must use this, not the raw file size. */
     uint64_t audio_span_bytes;
-    uint32_t three_track; /* ABI 2: nonzero = A_OPUSHF (15.6 kHz+) track present */
+    uint32_t three_track; /* nonzero = three-layer layout (15.6 kHz+ top band) */
 } SenaDecInfo;
 
 typedef struct {
@@ -60,6 +61,13 @@ typedef struct {
     uint64_t frames;
     uint64_t payload_bits;
 } SenaDecReadInfo;
+
+typedef struct {
+    uint64_t lf_bytes;
+    uint64_t mid_bytes;
+    uint64_t hf_bytes;
+    uint64_t blocks_decoded;
+} SenaEsStats;
 
 typedef struct {
     const char *key;
@@ -81,6 +89,9 @@ typedef struct {
 #define SENA_DEC_ERR_INVALID (-5)
 #define SENA_DEC_EOF (-6)
 
+/* ------------------------------------------------------- container API
+   Whole-file decoding for hosts without their own Matroska demuxer
+   (foobar2000 plugin, senadec CLI). */
 int  sena_dec_open(const SenaDecIo *io, SenaDec **out, char *err, size_t err_len);
 void sena_dec_close(SenaDec *dec);
 int  sena_dec_get_info(SenaDec *dec, SenaDecInfo *info);
@@ -109,6 +120,31 @@ SENA_DEC_API size_t sena_art_data_len(const SenaArtHandle *handle, uint32_t inde
 SENA_DEC_API void sena_art_close(SenaArtHandle *handle);
 /* Replaces the full attachment set (empty list removes all attachments). */
 SENA_DEC_API int  sena_file_art_write(const SenaFileIo *io, const SenaArtInput *entries, uint32_t count, char *err, size_t err_len);
+
+/* ------------------------------------------------------- ES push API
+   Elementary-stream decoding for hosts that demux Matroska themselves
+   (the ffmpeg decoder plugin, a DirectShow transform filter): open from
+   the SENA-INIT blob (ffmpeg extradata), push composite blocks in timeline
+   order with their 20 ms-grid timestamps, pull mixed PCM. */
+int  sena_es_open(const uint8_t *init_blob, size_t init_blob_len, SenaEs **out, char *err, size_t err_len);
+int  sena_es_push(SenaEs *es, const uint8_t *block, size_t block_len, uint64_t ts_ns);
+/* SENA_DEC_OK with frames produced; SENA_DEC_OK + *out_frames == 0 when
+   starved (push more blocks); SENA_DEC_EOF at end of stream. */
+int  sena_es_pull(SenaEs *es, float *interleaved, uint64_t frames, uint64_t *out_frames);
+/* No more blocks will be pushed (drain). */
+void sena_es_finish(SenaEs *es);
+/* Flush/reset; the next push re-anchors the timeline from its timestamp. */
+void sena_es_reset(SenaEs *es);
+/* Discard output before this absolute frame on subsequent pulls (a demuxer
+   delivers from a cue point earlier than the seek target). */
+void sena_es_set_output_start(SenaEs *es, uint64_t frame);
+/* Warm up a seek from a shadow copy of the same file (full container-seek
+   quality); fails on non-local/unreadable paths -> cold-start ramp. */
+int  sena_es_warmup_seek(SenaEs *es, const char *path, uint64_t target_frame);
+int  sena_es_get_info(SenaEs *es, SenaDecInfo *info);
+int  sena_es_get_read_info(SenaEs *es, SenaDecReadInfo *info);
+int  sena_es_get_stats(SenaEs *es, SenaEsStats *stats);
+void sena_es_close(SenaEs *es);
 
 #ifdef __cplusplus
 }

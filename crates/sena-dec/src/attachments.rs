@@ -10,7 +10,7 @@ use sena_mux::ebml;
 use crate::demux::{self, Demuxed, Elem, IndexedFile, WriteOp};
 
 const ATTACHED_FILE_ID: &[u8] = &[0x61, 0xA7];
-const FILE_NAME_ID: &[u8] = &[0x45, 0xE0];
+const FILE_NAME_ID: &[u8] = &[0x46, 0x6E];
 const FILE_MIME_ID: &[u8] = &[0x46, 0x60];
 const FILE_DATA_ID: &[u8] = &[0x46, 0x5C];
 const FILE_UID_ID: &[u8] = &[0x46, 0xAE];
@@ -107,8 +107,12 @@ pub fn encode_attachments(attachments: &[Attachment]) -> Vec<u8> {
 }
 
 /// Compute the positioned writes that replace the full attachment set of a
-/// scanned file: void every existing Attachments element, append the
-/// replacement at the Segment tail, re-patch the Segment size.
+/// scanned file: void every existing Attachments element, insert the
+/// replacement at the head (right after the Tracks element), re-patch the
+/// Segment size. Head placement makes cover art visible as attached_pic
+/// streams at probe time; a mid-file Insert op is only valid for the
+/// in-memory apply path, so the io-callback path must use the buffered
+/// whole-file rewrite for it.
 pub fn plan_attachment_rewrite(
     scan: &IndexedFile,
     attachments: &[Attachment],
@@ -117,8 +121,20 @@ pub fn plan_attachment_rewrite(
     for &(start, _, end) in &scan.attachment_ranges {
         demux::push_void_ops(&mut ops, start, end)?;
     }
-    let appended = if attachments.is_empty() { Vec::new() } else { encode_attachments(attachments) };
-    demux::push_append_ops(&mut ops, scan, appended)?;
+    if !attachments.is_empty() {
+        let appended = encode_attachments(attachments);
+        let new_payload_len =
+            (scan.segment_payload_end - scan.segment_payload_start) + appended.len() as u64;
+        let patch = demux::encode_vint_exact(new_payload_len, scan.segment_size_len)?;
+        ops.push(WriteOp::Insert {
+            offset: scan.tracks_end,
+            data: appended,
+        });
+        ops.push(WriteOp::Bytes {
+            offset: scan.segment_size_pos,
+            data: patch,
+        });
+    }
     Ok(ops)
 }
 
@@ -133,14 +149,15 @@ pub fn rewrite_attachments(original: &[u8], attachments: &[Attachment]) -> Resul
     let mut out = original.to_vec();
     demux::apply_write_ops_to_vec(&mut out, &ops);
 
-    // Verify the result still scans and the immutable Sena tags (including
-    // the encoded-audio stream hash) survive.
+    // Verify the result still scans and the SENA-INIT track is intact.
     let check = demux::index_container(
         &mut |pos: u64, len: usize| demux::mem_read_at(&out, pos, len),
         false,
     )
     .map_err(|e| format!("rewritten file invalid: {e}"))?;
-    demux::check_immutable_survived(&scan, &check)?;
+    if check.init != scan.init {
+        return Err("SENA-INIT changed after rewrite".into());
+    }
     Ok(out)
 }
 
@@ -175,19 +192,33 @@ mod tests {
         let art = vec![Attachment::new("cover_front.jpg", "image/jpeg", vec![0xff, 0xd8, 0xff, 0xe0, 1, 2, 3])];
         let rewritten = rewrite_attachments(&original, &art).unwrap();
         let check = Demuxed::parse(rewritten.clone()).unwrap();
-        assert_eq!(check.immutable_tag("SENA_PROFILE"), Some("300"));
+        assert_eq!(check.init.playable_samples, 960000);
         let parsed = parse_attachments(&check);
         assert_eq!(parsed, art);
 
         // remove again (empty list voids the element)
         let removed = rewrite_attachments(&rewritten, &[]).unwrap();
-        let check2 = Demuxed::parse(removed).unwrap();
+        let check2 = Demuxed::parse(removed.clone()).unwrap();
         assert!(parse_attachments(&check2).is_empty());
-        assert_eq!(check2.immutable_tag("SENA_PROFILE"), Some("300"));
-        // clusters unchanged by both rewrites
+        assert_eq!(check2.init.playable_samples, 960000);
+        // Head-positioned Attachments shift the clusters as a block by the
+        // inserted element's length; the removal (void, no insert) leaves
+        // the shift in place, and the file still decodes.
+        let shift = rewritten.len() - original.len();
+        let want: Vec<usize> = crate::demux::read_cluster_starts(&original)
+            .unwrap()
+            .iter()
+            .map(|p| p + shift)
+            .collect();
         assert_eq!(
             crate::demux::read_cluster_starts(&rewritten).unwrap(),
-            crate::demux::read_cluster_starts(&original).unwrap()
+            want
         );
+        assert_eq!(
+            crate::demux::read_cluster_starts(&removed).unwrap(),
+            want
+        );
+        let dec = crate::pipeline::Decoder::open(&check2).unwrap();
+        assert_eq!(dec.info().playable_frames, 960000);
     }
 }

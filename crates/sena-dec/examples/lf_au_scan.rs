@@ -5,9 +5,12 @@ use sena_dec::demux::Demuxed;
 fn main() {
     let path = std::env::args().nth(1).expect("file.sena");
     let demux = Demuxed::parse(std::fs::read(&path).unwrap()).unwrap();
-    let lf = demux.tracks.iter().find(|t| t.codec_id == "A_SENALF").unwrap();
-    let asc = rxaac_dec_lib::asc::AudioSpecificConfig::parse(&lf.codec_private).unwrap();
-    let aus: Vec<&[u8]> = demux.frames.iter().filter(|f| f.track == lf.number).map(|f| f.data.as_slice()).collect();
+    let asc = rxaac_dec_lib::asc::AudioSpecificConfig::parse(&demux.init.lf_asc).unwrap();
+    let mut aus: Vec<&[u8]> = Vec::new();
+    for b in &demux.blocks {
+        let block = sena_core::es::decode_block(&b.data).unwrap();
+        aus.extend(block.lf);
+    }
     let mut dec = rxaac_dec_lib::usac::UsacDecoder::new(&asc).unwrap();
     let mut odd = 0usize;
     let mut indep_run = 0usize;

@@ -20,10 +20,18 @@ fn one_byte_shifted_lf_au_stream_never_panics() {
     );
     let bytes = std::fs::read(asset).unwrap();
     let demux = Demuxed::parse(bytes).unwrap();
-    let lf = demux.track("A_SENALF").unwrap();
-    let asc = AudioSpecificConfig::parse(&lf.codec_private).expect("asset ASC parses");
+    let asc = AudioSpecificConfig::parse(&demux.init.lf_asc).expect("asset ASC parses");
 
-    let frames: Vec<_> = demux.frames_for(lf.number).take(16).cloned().collect();
+    let mut frames: Vec<Vec<u8>> = Vec::new();
+    for b in &demux.blocks {
+        let block = sena_core::es::decode_block(&b.data).unwrap();
+        for au in block.lf {
+            frames.push(au.to_vec());
+        }
+        if frames.len() >= 16 {
+            break;
+        }
+    }
     assert!(frames.len() >= 3);
 
     // Rebuild the contiguous original AU stream, then prepend the historical
@@ -31,7 +39,7 @@ fn one_byte_shifted_lf_au_stream_never_panics() {
     // the old `find_aus` bug exactly: every AU starts one byte late.
     let mut original = Vec::new();
     for f in &frames {
-        original.extend_from_slice(&f.data);
+        original.extend_from_slice(f);
     }
     let mut shifted_stream = vec![0x00u8];
     shifted_stream.extend_from_slice(&original);
@@ -39,8 +47,8 @@ fn one_byte_shifted_lf_au_stream_never_panics() {
     let mut shifted_aus = Vec::new();
     let mut off = 0usize;
     for f in &frames {
-        shifted_aus.push(shifted_stream[off..off + f.data.len()].to_vec());
-        off += f.data.len();
+        shifted_aus.push(shifted_stream[off..off + f.len()].to_vec());
+        off += f.len();
     }
 
     // Exercise both fresh decoders (no valid state yet) and stateful decoders
@@ -59,7 +67,7 @@ fn one_byte_shifted_lf_au_stream_never_panics() {
         let mut stateful = UsacDecoder::new(&asc).expect("stateful decoder");
         let mut pcm = Vec::new();
         for good in &frames[..3] {
-            let _ = stateful.decode_au(&good.data, &mut pcm);
+            let _ = stateful.decode_au(good, &mut pcm);
             pcm.clear();
         }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -87,60 +95,45 @@ fn malformed_preroll_config_is_contained_by_sena_decode() {
     );
     let bytes = std::fs::read(asset).unwrap();
     let demux = Demuxed::parse(bytes).unwrap();
-    let lf = demux.track("A_SENALF").unwrap();
-    let hf = demux.track("A_OPUS").unwrap();
-    let lf_frames: Vec<_> = demux.frames_for(lf.number).take(3).cloned().collect();
-    let hf_frames: Vec<_> = demux.frames_for(hf.number).take(3).cloned().collect();
 
-    let tracks = vec![
-        sena_mux::mka::Track {
-            codec_id: "A_OPUS".into(),
-            codec_private: hf.codec_private.clone(),
-            sample_rate: 48000.0,
-            channels: 2,
-            codec_delay_ns: hf.codec_delay_ns.unwrap_or(0),
-            bit_depth: Some(32),
-        },
-        sena_mux::mka::Track {
-            codec_id: "A_SENALF".into(),
-            codec_private: lf.codec_private.clone(),
-            sample_rate: lf.sample_rate,
-            channels: 2,
-            codec_delay_ns: lf.codec_delay_ns.unwrap_or(0),
-            bit_depth: None,
-        },
-    ];
-    let mut frames = Vec::new();
-    for (i, f) in hf_frames.iter().enumerate() {
-        frames.push(sena_mux::mka::Frame {
-            track: 0,
-            t_ns: i as u64 * 20_000_000,
-            data: f.data.clone(),
+    // Four blocks cover LF AU 0 (warmup, block 0) and AU 1 (block 3, by-end
+    // placement): playable [0, 1024) core = 3072 frames at 48 kHz.
+    let mut blocks: Vec<Vec<u8>> = demux.blocks[..4].iter().map(|b| b.data.clone()).collect();
+    {
+        let parsed = sena_core::es::decode_block(&blocks[0]).unwrap();
+        let mut au0 = parsed.lf[0].to_vec();
+        assert!(au0.len() > 3);
+        au0[3] = au0[3].wrapping_sub(1); // 0x22 -> 0x21 triggers the preroll reinit
+        let aus: Vec<&[u8]> = vec![&au0];
+        blocks[0] = sena_core::es::encode_block(&sena_core::es::BlockParts {
+            mid: parsed.mid,
+            lf: (parsed.lf_au_index.unwrap(), &aus),
+            hf: &parsed.hf,
         });
     }
-    for (i, f) in lf_frames.iter().enumerate() {
-        let mut data = f.data.clone();
-        if i == 0 {
-            assert!(data.len() > 3);
-            data[3] = data[3].wrapping_sub(1); // 0x22 -> 0x21 triggers the preroll reinit
-        }
-        frames.push(sena_mux::mka::Frame {
-            track: 1,
-            t_ns: i as u64 * 64_000_000,
+    let mut init = demux.init.clone();
+    init.playable_samples = 3072;
+    init.audio_sha256 = [0; 32];
+    let cp = sena_core::es::build_codec_private(&init, demux.avg_bytes_per_sec);
+    let sb: Vec<sena_mux::mka::SenaBlock> = blocks
+        .into_iter()
+        .enumerate()
+        .map(|(i, data)| sena_mux::mka::SenaBlock {
+            t_ns: i as u64 * sena_core::es::BLOCK_NS,
             data,
-        });
-    }
-    let tags = [
-        ("SENA_PROFILE", "300"),
-        ("SENA_VERSION", "1"),
-        ("SENA_PLAYABLE_SAMPLES", "2568"),
-    ];
-    let playable_ns = 2568u64 * 1_000_000_000 / 48_000;
-    let file = sena_mux::mka::write_mka(&tracks, frames, &tags, 1000, playable_ns);
+        })
+        .collect();
+    let file = sena_mux::mka::write_sena(
+        &cp,
+        &sb,
+        &sena_core::es::codec_name(init.profile, init.three_track),
+        1000,
+        3072 * 1_000_000_000 / 48_000,
+    );
     let small = Demuxed::parse(file).unwrap();
 
     let decoded = sena_dec::pipeline::decode(&small).unwrap();
-    assert_eq!(decoded.info().playable_frames, 2568);
+    assert_eq!(decoded.info().playable_frames, 3072);
     assert!(
         decoded
             .warnings()

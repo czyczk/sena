@@ -4,7 +4,8 @@
 //!
 //! usage: decode_dump_lazy <file.sena> [block_frames] [--seek <frame>]
 use std::io::Write;
-use sena_dec::stream::{FrameStore, StreamingDecoder};
+use sena_dec::es::BlockStore;
+use sena_dec::stream::StreamingDecoder;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -29,9 +30,10 @@ fn main() {
         true,
     )
     .unwrap();
-    let frames = std::mem::take(&mut indexed.frames);
+    let blocks = std::mem::take(&mut indexed.blocks);
     let read_at = Box::new(move |pos: u64, len: usize| sena_dec::demux::mem_read_at(&bytes, pos, len));
-    let store = FrameStore::Lazy { frames, read_at, window: (0, Vec::new()) };
+    let store = BlockStore::Lazy {
+            blocks, read_at, window: (0, Vec::new()) };
     let mut dec = StreamingDecoder::open_indexed(indexed, store).unwrap();
     if pread > 0 {
         let mut scratch = vec![0.0f32; pread as usize * 2];

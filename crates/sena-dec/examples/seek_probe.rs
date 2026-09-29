@@ -7,13 +7,14 @@ fn main() {
     let path = std::env::args().nth(1).expect("usage: seek_probe <file.sena>");
     let bytes = std::fs::read(&path).unwrap();
     let demux = Demuxed::parse(bytes).unwrap();
-    let playable: u64 = demux.tag("SENA_PLAYABLE_SAMPLES").unwrap().parse().unwrap();
-    eprintln!(
-        "lf AUs={} hf packets={} lf_rate={}",
-        demux.frames_for(demux.track("A_SENALF").unwrap().number).count(),
-        demux.frames_for(demux.track("A_OPUS").unwrap().number).count(),
-        demux.track("A_SENALF").unwrap().sample_rate
-    );
+    let playable: u64 = demux.init.playable_samples;
+    let (mut n_lf, mut n_mid) = (0usize, 0usize);
+    for b in &demux.blocks {
+        let block = sena_core::es::decode_block(&b.data).unwrap();
+        n_lf += block.lf.len();
+        n_mid += 1;
+    }
+    eprintln!("lf AUs={n_lf} mid packets={n_mid} lf_rate={}", demux.init.lf_rate);
 
     // full reference decode (batch)
     let mut ref_dec = sena_dec::pipeline::Decoder::open(&demux).unwrap();

@@ -1,6 +1,9 @@
-//! Minimal Matroska/EBML reader for the Sena container subset.
+//! Minimal Matroska/EBML reader for the Sena v2 container subset:
+//! exactly one `A_MS/ACM` audio track carrying composite ES blocks.
 
 use std::fmt;
+
+use sena_core::es;
 
 pub const SEGMENT_ID: &[u8] = &[0x18, 0x53, 0x80, 0x67];
 const INFO_ID: &[u8] = &[0x15, 0x49, 0xA9, 0x66];
@@ -12,7 +15,6 @@ const TRACK_NUMBER_ID: &[u8] = &[0xD7];
 const TRACK_TYPE_ID: &[u8] = &[0x83];
 const CODEC_ID_ID: &[u8] = &[0x86];
 const CODEC_PRIVATE_ID: &[u8] = &[0x63, 0xA2];
-const CODEC_DELAY_ID: &[u8] = &[0x56, 0xAA];
 const AUDIO_ID: &[u8] = &[0xE1];
 const SAMPLING_FREQ_ID: &[u8] = &[0xB5];
 const CHANNELS_ID: &[u8] = &[0x9F];
@@ -20,7 +22,7 @@ const TAG_ID: &[u8] = &[0x73, 0x73];
 const SIMPLE_TAG_ID: &[u8] = &[0x67, 0xC8];
 const TAG_NAME_ID: &[u8] = &[0x45, 0xA3];
 const TAG_STRING_ID: &[u8] = &[0x44, 0x87];
-const CLUSTER_TIMESTAMP_ID: &[u8] = &[0x07, 0xE7];
+const CLUSTER_TIMESTAMP_ID: &[u8] = &[0xE7];
 const SIMPLE_BLOCK_ID: &[u8] = &[0xA3];
 pub(crate) const ATTACHMENTS_ID: &[u8] = &[0x19, 0x41, 0xA4, 0x69];
 const TIMECODE_SCALE_NS: u64 = 1_000_000;
@@ -50,7 +52,9 @@ pub struct Track {
     pub codec_private: Vec<u8>,
     pub sample_rate: f64,
     pub channels: u64,
-    pub codec_delay_ns: Option<u64>,
+    /// TrackType (1 = video, 2 = audio, ...); non-audio tracks are ignored
+    /// by the Sena reader (a remuxed video MKV stays readable).
+    pub track_type: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -68,9 +72,10 @@ impl TagBlock {
     }
 }
 
+/// One composite ES block (see sena_core::es) with its playable-timeline
+/// timestamp.
 #[derive(Debug, Clone)]
-pub struct Frame {
-    pub track: u64,
+pub struct Block {
     pub t_ns: u64,
     pub data: Vec<u8>,
 }
@@ -86,9 +91,12 @@ pub struct SegmentInfo {
 pub struct Demuxed {
     bytes: Vec<u8>,
     pub segment: SegmentInfo,
-    pub tracks: Vec<Track>,
+    /// Validated SENA-INIT blob from the track's CodecPrivate.
+    pub init: es::Init,
+    /// Declared nAvgBytesPerSec of the WAVEFORMATEX wrapper.
+    pub avg_bytes_per_sec: u32,
     pub tags: Vec<TagBlock>,
-    pub frames: Vec<Frame>,
+    pub blocks: Vec<Block>,
     /// Encoded size of all Cluster elements (codec payloads plus block
     /// framing); the audio-only size an average-bitrate display should use.
     pub audio_span_bytes: u64,
@@ -107,7 +115,7 @@ impl fmt::Display for DemuxError {
         match self {
             DemuxError::Truncated { context } => write!(f, "truncated EBML: {context}"),
             DemuxError::Malformed(s) => write!(f, "malformed container: {s}"),
-            DemuxError::Unsupported(s) => write!(f, "unsupported container feature: {s}"),
+            DemuxError::Unsupported(s) => write!(f, "unsupported: {s}"),
         }
     }
 }
@@ -280,23 +288,18 @@ pub(crate) fn parse_tags_payload(
 
 fn parse_track(data: &[u8], elem: Elem) -> Result<Track, DemuxError> {
     let mut number = 0u64;
+    let mut track_type = 0u64;
     let mut codec_id = String::new();
     let mut codec_private = Vec::new();
     let mut sample_rate = 0.0f64;
     let mut channels = 0u64;
-    let mut codec_delay_ns = None;
     for_each_child(data, elem, |id, child| {
         match id {
             TRACK_NUMBER_ID => {
                 number = read_uint(data.get(child.payload()).unwrap_or(&[]), "track number")?
             }
             TRACK_TYPE_ID => {
-                let t = read_uint(data.get(child.payload()).unwrap_or(&[]), "track type")?;
-                if t != 2 {
-                    return Err(DemuxError::Unsupported(format!(
-                        "track type {t}, expected audio"
-                    )));
-                }
+                track_type = read_uint(data.get(child.payload()).unwrap_or(&[]), "track type")?;
             }
             CODEC_ID_ID => {
                 codec_id =
@@ -304,12 +307,6 @@ fn parse_track(data: &[u8], elem: Elem) -> Result<Track, DemuxError> {
             }
             CODEC_PRIVATE_ID => {
                 codec_private = data.get(child.payload()).unwrap_or(&[]).to_vec();
-            }
-            CODEC_DELAY_ID => {
-                codec_delay_ns = Some(read_uint(
-                    data.get(child.payload()).unwrap_or(&[]),
-                    "CodecDelay",
-                )?);
             }
             AUDIO_ID => {
                 for_each_child(data, child, |aid, achild| {
@@ -326,7 +323,7 @@ fn parse_track(data: &[u8], elem: Elem) -> Result<Track, DemuxError> {
         }
         Ok(())
     })?;
-    if number == 0 || codec_id.is_empty() || sample_rate <= 0.0 || channels == 0 {
+    if number == 0 || codec_id.is_empty() {
         return Err(DemuxError::Malformed("incomplete track entry".into()));
     }
     Ok(Track {
@@ -335,7 +332,7 @@ fn parse_track(data: &[u8], elem: Elem) -> Result<Track, DemuxError> {
         codec_private,
         sample_rate,
         channels,
-        codec_delay_ns,
+        track_type,
     })
 }
 
@@ -403,20 +400,39 @@ pub fn read_cluster_starts(data: &[u8]) -> Result<Vec<usize>, DemuxError> {
     Ok(out)
 }
 
-/// Track-count layout warnings shared by [`Demuxed::parse`] and
-/// [`index_container`] (both in-memory and bounded scans see the same tracks).
-fn layout_warnings(tracks: &[Track]) -> Vec<String> {
-    let mut warnings = Vec::new();
-    if tracks.iter().filter(|t| t.codec_id == "A_OPUS").count() != 1 {
-        warnings.push("expected exactly one A_OPUS track".into());
+/// Validate the track layout of a Sena v2 file: exactly one `A_MS/ACM`
+/// audio track whose CodecPrivate holds a valid SENA-INIT blob. v1
+/// multi-track files are recognized and rejected with a clear error.
+/// Returns the INIT blob and the declared nAvgBytesPerSec.
+fn sena_track_init(tracks: &[Track]) -> Result<(es::Init, u32, u64), DemuxError> {
+    if tracks
+        .iter()
+        .any(|t| matches!(t.codec_id.as_str(), "A_OPUS" | "A_SENALF" | "A_OPUSHF"))
+    {
+        return Err(DemuxError::Unsupported(
+            "v1 multi-track Sena file; re-encode to the v2 single-track format".into(),
+        ));
     }
-    if tracks.iter().filter(|t| t.codec_id == "A_SENALF").count() != 1 {
-        warnings.push("expected exactly one A_SENALF track".into());
+    let sena: Vec<&Track> = tracks
+        .iter()
+        .filter(|t| t.track_type == 2 && t.codec_id == es::SENA_CODEC_ID)
+        .collect();
+    if sena.len() != 1 {
+        return Err(DemuxError::Unsupported(format!(
+            "expected exactly one {} audio track, found {}",
+            es::SENA_CODEC_ID,
+            sena.len()
+        )));
     }
-    if tracks.iter().filter(|t| t.codec_id == "A_OPUSHF").count() > 1 {
-        warnings.push("more than one A_OPUSHF track".into());
+    let t = sena[0];
+    let (init, avg) =
+        es::parse_codec_private(&t.codec_private).map_err(|e| DemuxError::Unsupported(format!("SENA-INIT: {e}")))?;
+    if t.sample_rate.round() as u32 != sena_core::SAMPLE_RATE || t.channels != 2 {
+        return Err(DemuxError::Unsupported(
+            "Sena track rate/channels do not match 48000 Hz stereo".into(),
+        ));
     }
-    warnings
+    Ok((init, avg, t.number))
 }
 
 impl Demuxed {
@@ -445,7 +461,7 @@ impl Demuxed {
         let payload_end = segment.data_end;
         let mut tracks = Vec::new();
         let mut tags = Vec::new();
-        let mut frames = Vec::new();
+        let mut blocks = Vec::new();
         let mut audio_span_bytes = 0u64;
         for_each_child(&bytes, segment, |id, child| {
             if id == TRACKS_ID {
@@ -469,10 +485,15 @@ impl Demuxed {
                         cluster_t = read_uint(&bytes[cchild.payload()], "cluster timestamp")?;
                     } else if cid == SIMPLE_BLOCK_ID {
                         let (track, rel, data) = parse_simple_block(&bytes, cchild.payload())?;
+                        if track != 1 {
+                            return Err(DemuxError::Malformed(format!(
+                                "SimpleBlock for track {track} in a single-track Sena file"
+                            )));
+                        }
                         let t_ns = cluster_t
                             .saturating_mul(TIMECODE_SCALE_NS)
                             .saturating_add(rel.saturating_mul(TIMECODE_SCALE_NS));
-                        frames.push(Frame { track, t_ns, data });
+                        blocks.push(Block { t_ns, data });
                     }
                     Ok(())
                 })?;
@@ -482,28 +503,23 @@ impl Demuxed {
             Ok(())
         })?;
         // Cluster/block order is authoritative for whole-file decode: the
-        // muxer packs frames in presentation order, while 16-bit relative
-        // timestamps can wrap negative inside a 1 s cluster.
-        // `t_ns` remains available for diagnostics and bitrate mapping.
-        let mut out = Self {
+        // muxer packs blocks in presentation order. `t_ns` remains available
+        // for diagnostics and bitrate mapping.
+        let (init, avg_bytes_per_sec, _track_number) = sena_track_init(&tracks)?;
+        Ok(Self {
             bytes,
             segment: SegmentInfo {
                 elem: segment,
                 payload_start,
                 payload_end,
             },
-            tracks,
+            init,
+            avg_bytes_per_sec,
             tags,
-            frames,
+            blocks,
             audio_span_bytes,
             warnings: Vec::new(),
-        };
-        out.validate_layout();
-        Ok(out)
-    }
-
-    fn validate_layout(&mut self) {
-        self.warnings.extend(layout_warnings(&self.tracks));
+        })
     }
 
     pub fn bytes(&self) -> &[u8] {
@@ -517,134 +533,78 @@ impl Demuxed {
     pub fn tag(&self, key: &str) -> Option<&str> {
         self.tags.iter().find_map(|t| t.get(key))
     }
-
-    pub fn immutable_tag(&self, key: &str) -> Option<&str> {
-        self.tags.first().and_then(|t| t.get(key))
-    }
-
-    pub fn track(&self, codec_id: &str) -> Option<&Track> {
-        self.tracks.iter().find(|t| t.codec_id == codec_id)
-    }
-
-    pub fn frames_for(&self, track_number: u64) -> impl Iterator<Item = &Frame> {
-        self.frames.iter().filter(move |f| f.track == track_number)
-    }
 }
 
 /* ------------------------------------------------------------ indexed scan
    Bounded-memory container view: the walker below reads only EBML element
    headers plus the small head payloads (Tracks/Tags), skipping cluster
-   payloads via the positioned-read callback. Audio frames enter as index
-   entries (absolute byte range + first payload byte for the USAC
-   independency flag), never as payload copies. This keeps every plugin
-   instance at O(index) memory regardless of file size, which matters on
-   32-bit hosts (foobar2000 x86: 2 GiB address space) where the previous
-   slurp-and-copy design needed >= 2x the file size per decoder and OOM
-   aborts were a real risk under concurrent ReplayGain scans.
+   payloads via the positioned-read callback. Blocks enter as index entries
+   (absolute byte range + ES-level metadata for the seek scan), never as
+   payload copies. This keeps every plugin instance at O(index) memory
+   regardless of file size, which matters on 32-bit hosts (foobar2000 x86:
+   2 GiB address space) where the previous slurp-and-copy design needed
+   >= 2x the file size per decoder and OOM aborts were a real risk under
+   concurrent ReplayGain scans.
 */
 
-/// One audio frame is a few KiB; anything beyond this is container corruption.
+/// One composite block is a few KiB; anything beyond this is container
+/// corruption.
 pub const MAX_FRAME_BYTES: u64 = 16 * 1024 * 1024;
-/// ~66 codec frames/s worst case: 2M entries cover a 9 h file. Beyond this the
-/// file is treated as corrupt (a hostile file could otherwise grow the index
+/// 50 blocks/s: 5M entries cover a 27 h file. Beyond this the file is
+/// treated as corrupt (a hostile file could otherwise grow the index
 /// without bound).
-pub const MAX_INDEX_FRAMES: usize = 2_000_000;
+pub const MAX_INDEX_FRAMES: usize = 5_000_000;
 /// Master-element payloads (Tracks/Tags) we read fully are small in practice.
 const MAX_MASTER_PAYLOAD: u64 = 16 * 1024 * 1024;
 /// Window size for the sequential header walk; a refill starts at the next
 /// requested header, so skipped payloads are never read at all.
 const INDEX_WINDOW: usize = 256 * 1024;
 
-/// Absolute byte range of one SimpleBlock payload in the file, plus the
-/// metadata the streaming decoder needs without reading the payload.
+/// Absolute byte range of one composite block payload in the file, plus the
+/// ES metadata the seek path needs without reading the full payload.
 #[derive(Debug, Clone, Copy)]
-pub struct FrameRef {
-    pub track: u64,
+pub struct BlockRef {
     pub t_ns: u64,
     pub offset: u64,
     pub len: u32,
-    /// First payload byte (the USAC independency flag lives in its bit 7).
-    pub first: u8,
+    /// Absolute LF AU index of the first AU in the block (None when the
+    /// block carries no LF section).
+    pub au_index: Option<u32>,
+    /// Number of LF AUs in the block (0..=4).
+    pub lf_count: u8,
+    /// First payload byte of each LF AU (the USAC independency flag lives
+    /// in bit 7); the first `lf_count` entries are valid.
+    pub lf_first: [u8; 4],
 }
 
-/// Container metadata + frame index produced by [`index_container`].
+/// Container metadata + block index produced by [`index_container`].
 #[derive(Debug)]
 pub struct IndexedFile {
-    pub tracks: Vec<Track>,
-    /// All top-level Tags blocks in file order; `[0]` is the immutable block.
+    /// Validated SENA-INIT blob.
+    pub init: es::Init,
+    /// Declared nAvgBytesPerSec of the WAVEFORMATEX wrapper.
+    pub avg_bytes_per_sec: u32,
+    /// All top-level Tags blocks in file order.
     pub tags: Vec<Vec<(String, String)>>,
     /// Absolute byte ranges (element start..end) of the Tags blocks.
     pub tag_ranges: Vec<(u64, u64)>,
     /// Absolute ranges of Attachments elements: (element start, payload
     /// start, element end).
     pub attachment_ranges: Vec<(u64, u64, u64)>,
-    pub frames: Vec<FrameRef>,
+    pub blocks: Vec<BlockRef>,
     pub warnings: Vec<String>,
     /// Encoded size of all Cluster elements (codec payloads plus block
     /// framing); the audio-only size an average-bitrate display should use.
-    /// Accumulated from the top-level headers alone, so it is available in
-    /// both the head-only scan and the full frame index - and it excludes
-    /// Tags/Attachments/Void, which tag and cover rewrites shuffle around.
     pub audio_span_bytes: u64,
     pub segment_payload_start: u64,
     /// Absolute offset one past the Segment payload (= file end in practice).
     pub segment_payload_end: u64,
+    /// Absolute offset one past the Tracks element (the insertion point
+    /// for head-positioned Tags/Attachments).
+    pub tracks_end: u64,
     /// Absolute offset of the Segment size vint.
     pub segment_size_pos: u64,
     pub segment_size_len: usize,
-}
-
-impl IndexedFile {
-    pub fn immutable_tag(&self, key: &str) -> Option<&str> {
-        self.tags
-            .first()?
-            .iter()
-            .find(|(k, _)| k == key)
-            .map(|(_, v)| v.as_str())
-    }
-
-    pub fn track(&self, codec_id: &str) -> Option<&Track> {
-        self.tracks.iter().find(|t| t.codec_id == codec_id)
-    }
-}
-
-/// The container metadata `pipeline::probe` needs, shared by `Demuxed`
-/// (in-memory) and `IndexedFile` (bounded-memory scan).
-pub trait ContainerMeta {
-    fn meta_immutable_tag(&self, key: &str) -> Option<&str>;
-    fn meta_track(&self, codec_id: &str) -> Option<&Track>;
-    fn meta_warnings(&self) -> &[String];
-    fn meta_audio_span_bytes(&self) -> u64;
-}
-
-impl ContainerMeta for Demuxed {
-    fn meta_immutable_tag(&self, key: &str) -> Option<&str> {
-        self.tags.first().and_then(|t| t.get(key))
-    }
-    fn meta_track(&self, codec_id: &str) -> Option<&Track> {
-        self.tracks.iter().find(|t| t.codec_id == codec_id)
-    }
-    fn meta_warnings(&self) -> &[String] {
-        &self.warnings
-    }
-    fn meta_audio_span_bytes(&self) -> u64 {
-        self.audio_span_bytes
-    }
-}
-
-impl ContainerMeta for IndexedFile {
-    fn meta_immutable_tag(&self, key: &str) -> Option<&str> {
-        self.immutable_tag(key)
-    }
-    fn meta_track(&self, codec_id: &str) -> Option<&Track> {
-        self.track(codec_id)
-    }
-    fn meta_warnings(&self) -> &[String] {
-        &self.warnings
-    }
-    fn meta_audio_span_bytes(&self) -> u64 {
-        self.audio_span_bytes
-    }
 }
 
 struct Window<'a, R: FnMut(u64, usize) -> Result<Vec<u8>, String>> {
@@ -723,10 +683,66 @@ fn read_elem_w<R: FnMut(u64, usize) -> Result<Vec<u8>, String>>(
     })
 }
 
+/// ES block header metadata for the index: read the composite block header
+/// just far enough to locate the LF section, without copying payload bodies.
+/// `get` reads at absolute file offsets. Layout: flags(1) mid_len(2) mid,
+/// lf_count(1) au_index(3), then per AU: len(3) + payload.
+fn es_block_meta<R: FnMut(u64, usize) -> Result<Vec<u8>, String>>(
+    get: &mut R,
+    offset: u64,
+    len: u64,
+) -> Result<(Option<u32>, u8, [u8; 4]), String> {
+    let head = get(offset, len.min(3) as usize)?;
+    if head.len() < 3 {
+        return Err("malformed container: composite block header truncated".into());
+    }
+    let mid_len = u16::from_le_bytes(head[1..3].try_into().unwrap()) as u64;
+    if 3 + mid_len + 1 > len {
+        return Err("malformed container: mid section overruns its block".into());
+    }
+    let lf_off = offset + 3 + mid_len;
+    let avail = len - 3 - mid_len;
+    let head1 = get(lf_off, avail.min(1) as usize)?;
+    if head1.is_empty() {
+        return Err("malformed container: LF count truncated".into());
+    }
+    let lf_count = head1[0];
+    if lf_count == 0 {
+        return Ok((None, 0, [0; 4]));
+    }
+    if lf_count > 4 {
+        return Err("malformed container: LF AU count exceeds sanity bound".into());
+    }
+    let idx = get(lf_off + 1, 3)?;
+    if idx.len() < 3 {
+        return Err("malformed container: LF au_index truncated".into());
+    }
+    let mut i3 = [0u8; 4];
+    i3[..3].copy_from_slice(&idx);
+    let au_index = u32::from_le_bytes(i3);
+    let mut first = [0u8; 4];
+    let mut rel = 4u64; // past count + au_index
+    for i in 0..lf_count as usize {
+        let h = get(lf_off + rel, 4u64.min(avail.saturating_sub(rel)) as usize)?;
+        if h.len() < 4 {
+            return Err("malformed container: LF AU header truncated".into());
+        }
+        let mut l3 = [0u8; 4];
+        l3[..3].copy_from_slice(&h[..3]);
+        let au_len = u32::from_le_bytes(l3) as u64;
+        first[i] = h[3];
+        rel += 3 + au_len;
+        if rel > avail {
+            return Err("malformed container: LF AU overruns its block".into());
+        }
+    }
+    Ok((Some(au_index), lf_count, first))
+}
+
 fn walk_cluster_w<R: FnMut(u64, usize) -> Result<Vec<u8>, String>>(
     w: &mut Window<R>,
     cluster: &RawElem,
-    frames: &mut Vec<FrameRef>,
+    blocks: &mut Vec<BlockRef>,
 ) -> Result<(), String> {
     let mut cluster_t = 0u64;
     let mut p = cluster.data_start;
@@ -747,6 +763,11 @@ fn walk_cluster_w<R: FnMut(u64, usize) -> Result<Vec<u8>, String>>(
             let head = w.get(e.data_start, head_len)?;
             let (track, rel, header_len) =
                 parse_simple_block_header(&head, 0..head_len).map_err(|e| e.to_string())?;
+            if track != 1 {
+                return Err(format!(
+                    "malformed container: SimpleBlock for track {track} in a single-track Sena file"
+                ));
+            }
             if (header_len as u64) > plen {
                 return Err("malformed container: SimpleBlock header overruns payload".into());
             }
@@ -756,26 +777,23 @@ fn walk_cluster_w<R: FnMut(u64, usize) -> Result<Vec<u8>, String>>(
                     "malformed container: SimpleBlock payload {body_len} bytes exceeds the {MAX_FRAME_BYTES}-byte sanity cap"
                 ));
             }
-            let first = if header_len < head_len {
-                head[header_len]
-            } else if body_len > 0 {
-                w.get(e.data_start + header_len as u64, 1)?[0]
-            } else {
-                0
-            };
+            let payload_off = e.data_start + header_len as u64;
+            let (au_index, lf_count, lf_first) =
+                es_block_meta(&mut |pos, len| w.get(pos, len), payload_off, body_len)?;
             // Sign-extending cast (see parse_simple_block).
             let rel = rel as u64;
             let t_ns = cluster_t
                 .saturating_mul(TIMECODE_SCALE_NS)
                 .saturating_add(rel.saturating_mul(TIMECODE_SCALE_NS));
-            frames.push(FrameRef {
-                track,
+            blocks.push(BlockRef {
                 t_ns,
-                offset: e.data_start + header_len as u64,
+                offset: payload_off,
                 len: body_len as u32,
-                first,
+                au_index,
+                lf_count,
+                lf_first,
             });
-            if frames.len() > MAX_INDEX_FRAMES {
+            if blocks.len() > MAX_INDEX_FRAMES {
                 return Err(format!(
                     "malformed container: more than {MAX_INDEX_FRAMES} blocks (unrealistic)"
                 ));
@@ -788,12 +806,12 @@ fn walk_cluster_w<R: FnMut(u64, usize) -> Result<Vec<u8>, String>>(
 
 /// Scan a Sena file through a positioned-read callback, keeping memory
 /// bounded: head elements (Tracks/Tags) are parsed, cluster payloads are
-/// skipped. With `want_frames` the cluster SimpleBlocks are indexed (by
-/// offset, length and first payload byte) for lazy decode; without it
+/// skipped. With `want_blocks` the cluster SimpleBlocks are indexed (by
+/// offset, length and ES header metadata) for lazy decode; without it
 /// cluster contents are skipped entirely (probe/tag-edit paths).
 pub fn index_container<R: FnMut(u64, usize) -> Result<Vec<u8>, String>>(
     read_at: &mut R,
-    want_frames: bool,
+    want_blocks: bool,
 ) -> Result<IndexedFile, String> {
     let mut w = Window {
         read_at,
@@ -820,7 +838,8 @@ pub fn index_container<R: FnMut(u64, usize) -> Result<Vec<u8>, String>>(
     let mut tags = Vec::new();
     let mut tag_ranges = Vec::new();
     let mut attachment_ranges = Vec::new();
-    let mut frames = Vec::new();
+    let mut blocks = Vec::new();
+    let mut tracks_end = 0u64;
     let mut audio_span_bytes = 0u64;
     let mut p = segment.data_start;
     while p < segment.data_end {
@@ -832,6 +851,7 @@ pub fn index_container<R: FnMut(u64, usize) -> Result<Vec<u8>, String>>(
             if e.size > MAX_MASTER_PAYLOAD {
                 return Err("malformed container: Tracks element exceeds the sanity cap".into());
             }
+            tracks_end = e.data_end;
             let payload = w.get(e.data_start, e.size as usize)?;
             let local = Elem {
                 start: 0,
@@ -864,8 +884,8 @@ pub fn index_container<R: FnMut(u64, usize) -> Result<Vec<u8>, String>>(
             tag_ranges.push((e.start, e.data_end));
         } else if e.id == CLUSTER_ID {
             audio_span_bytes += e.data_end - e.start;
-            if want_frames {
-                walk_cluster_w(&mut w, &e, &mut frames)?;
+            if want_blocks {
+                walk_cluster_w(&mut w, &e, &mut blocks)?;
             }
         } else if e.id == ATTACHMENTS_ID {
             attachment_ranges.push((e.start, e.data_start, e.data_end));
@@ -873,17 +893,19 @@ pub fn index_container<R: FnMut(u64, usize) -> Result<Vec<u8>, String>>(
         p = e.data_end;
     }
 
-    let warnings = layout_warnings(&tracks);
+    let (init, avg_bytes_per_sec, _track_number) = sena_track_init(&tracks).map_err(|e| e.to_string())?;
     Ok(IndexedFile {
-        tracks,
+        init,
+        avg_bytes_per_sec,
         tags,
         tag_ranges,
         attachment_ranges,
-        frames,
-        warnings,
+        blocks,
+        warnings: Vec::new(),
         audio_span_bytes,
         segment_payload_start: segment.data_start,
         segment_payload_end: segment.data_end,
+        tracks_end,
         segment_size_pos: segment.start + segment.id.len() as u64,
         segment_size_len: segment.size_len,
     })
@@ -975,31 +997,6 @@ pub(crate) fn push_void_ops(ops: &mut Vec<WriteOp>, start: u64, end: u64) -> Res
     Ok(())
 }
 
-/// Segment tail-append op + size re-patch, shared by the tag and attachment
-/// rewrite planners. No-op when `appended` is empty (payload length and size
-/// vint stay as they are).
-pub(crate) fn push_append_ops(
-    ops: &mut Vec<WriteOp>,
-    scan: &IndexedFile,
-    appended: Vec<u8>,
-) -> Result<(), String> {
-    if appended.is_empty() {
-        return Ok(());
-    }
-    let new_payload_len =
-        (scan.segment_payload_end - scan.segment_payload_start) + appended.len() as u64;
-    let patch = encode_vint_exact(new_payload_len, scan.segment_size_len)?;
-    ops.push(WriteOp::Insert {
-        offset: scan.segment_payload_end,
-        data: appended,
-    });
-    ops.push(WriteOp::Bytes {
-        offset: scan.segment_size_pos,
-        data: patch,
-    });
-    Ok(())
-}
-
 /// Apply a rewrite plan to an in-memory file buffer.
 pub fn apply_write_ops_to_vec(out: &mut Vec<u8>, ops: &[WriteOp]) {
     for op in ops {
@@ -1020,29 +1017,6 @@ pub fn apply_write_ops_to_vec(out: &mut Vec<u8>, ops: &[WriteOp]) {
             }
         }
     }
-}
-
-/// Immutable Sena tags that must survive a rewrite (checked by the FFI and
-/// the in-buffer rewrite helpers after applying the plan).
-pub(crate) const IMMUTABLE_KEYS: [&str; 4] = [
-    "SENA_PROFILE",
-    "SENA_VERSION",
-    "SENA_PLAYABLE_SAMPLES",
-    "SENA_AUDIO_SHA256",
-];
-
-pub(crate) fn check_immutable_survived(
-    before: &IndexedFile,
-    after: &IndexedFile,
-) -> Result<(), String> {
-    for key in IMMUTABLE_KEYS {
-        if let Some(v) = before.immutable_tag(key)
-            && after.immutable_tag(key) != Some(v)
-        {
-            return Err(format!("immutable tag {key} changed after rewrite"));
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1072,59 +1046,73 @@ mod tests {
         let demux = Demuxed::parse(bytes.clone()).unwrap();
         let indexed = index_container(&mut |pos, len| mem_read_at(&bytes, pos, len), true).unwrap();
 
-        // Same metadata view the probe consumes.
-        assert_eq!(
-            indexed.immutable_tag("SENA_PROFILE"),
-            demux.immutable_tag("SENA_PROFILE")
-        );
-        assert_eq!(
-            indexed.immutable_tag("SENA_PLAYABLE_SAMPLES"),
-            demux.immutable_tag("SENA_PLAYABLE_SAMPLES")
-        );
-        assert_eq!(
-            indexed.immutable_tag("SENA_AUDIO_SHA256"),
-            demux.immutable_tag("SENA_AUDIO_SHA256")
-        );
-        assert_eq!(
-            indexed.track("A_OPUS").unwrap().number,
-            demux.track("A_OPUS").unwrap().number
-        );
-        assert_eq!(
-            indexed.track("A_SENALF").unwrap().number,
-            demux.track("A_SENALF").unwrap().number
-        );
+        assert_eq!(indexed.init, demux.init);
+        assert_eq!(indexed.avg_bytes_per_sec, demux.avg_bytes_per_sec);
         assert_eq!(
             indexed.segment_payload_end,
             demux.segment.elem.data_end as u64
         );
         assert_eq!(indexed.warnings, demux.warnings);
 
-        // Every indexed frame points at the same payload bytes the full
+        // Every indexed block points at the same payload bytes the full
         // parse copied, in the same order.
-        assert_eq!(indexed.frames.len(), demux.frames.len());
-        for (fr, f) in indexed.frames.iter().zip(demux.frames.iter()) {
-            assert_eq!(fr.track, f.track);
-            assert_eq!(fr.t_ns, f.t_ns);
-            let start = fr.offset as usize;
-            assert_eq!(&bytes[start..start + fr.len as usize], f.data.as_slice());
-            assert_eq!(fr.first, f.data.first().copied().unwrap_or(0));
+        assert_eq!(indexed.blocks.len(), demux.blocks.len());
+        for (br, b) in indexed.blocks.iter().zip(demux.blocks.iter()) {
+            assert_eq!(br.t_ns, b.t_ns);
+            let start = br.offset as usize;
+            assert_eq!(&bytes[start..start + br.len as usize], b.data.as_slice());
+            // The ES header metadata matches the parsed block.
+            let parsed = es::decode_block(&b.data).unwrap();
+            match (br.au_index, parsed.lf_au_index) {
+                (Some(ai), Some(p_ai)) => {
+                    assert_eq!(ai, p_ai);
+                    assert_eq!(br.lf_count as usize, parsed.lf.len());
+                    for (i, au) in parsed.lf.iter().enumerate() {
+                        assert_eq!(br.lf_first[i], au.first().copied().unwrap_or(0));
+                    }
+                }
+                (None, None) => assert_eq!(br.lf_count, 0),
+                other => panic!("au_index mismatch: {other:?}"),
+            }
         }
     }
 
     #[test]
-    fn head_scan_skips_cluster_contents() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../assets/e2e/01__p300__lfa__hf144.sena"
-        );
-        let bytes = std::fs::read(path).unwrap();
-        let indexed =
-            index_container(&mut |pos, len| mem_read_at(&bytes, pos, len), false).unwrap();
-        assert!(indexed.frames.is_empty());
-        assert_eq!(indexed.immutable_tag("SENA_PROFILE"), Some("300"));
-        assert_eq!(
-            indexed.immutable_tag("SENA_PLAYABLE_SAMPLES"),
-            Some("960000")
-        );
+    fn v1_file_rejected() {
+        // A v1 layout (A_OPUS + A_SENALF track ids, no A_MS/ACM track) must
+        // fail with a clear unsupported error.
+        let mut tracks = Vec::new();
+        for (i, id) in ["A_OPUS", "A_SENALF"].iter().enumerate() {
+            let mut te = vec![];
+            // reuse the mux crate's EBML writer for a minimal Tracks element
+            sena_mux::ebml::uint(&mut te, &[0xD7], (i + 1) as u64);
+            sena_mux::ebml::uint(&mut te, &[0x83], 2);
+            sena_mux::ebml::str(&mut te, &[0x86], id);
+            let mut audio = vec![];
+            sena_mux::ebml::float(&mut audio, &[0xB5], 48000.0);
+            sena_mux::ebml::uint(&mut audio, &[0x9F], 2);
+            sena_mux::ebml::write_element(&mut te, &[0xE1], &audio);
+            sena_mux::ebml::write_element(&mut tracks, &[0xAE], &te);
+        }
+        let mut file = vec![];
+        file.extend_from_slice(b"\x1A\x45\xDF\xA3");
+        // minimal: not a full EBML header, but Demuxed::parse only needs the
+        // magic and a Segment; build them.
+        let mut file2 = vec![];
+        sena_mux::ebml::str(&mut file2, &[0x42, 0x82], "matroska");
+        let mut hdr = vec![];
+        hdr.extend_from_slice(&file2);
+        let mut out = vec![];
+        sena_mux::ebml::write_element(&mut out, &[0x1A, 0x45, 0xDF, 0xA3], &hdr);
+        let mut seg = vec![];
+        let mut tracks_el = vec![];
+        tracks_el.extend_from_slice(&tracks);
+        sena_mux::ebml::write_element(&mut seg, &[0x16, 0x54, 0xAE, 0x6B], &tracks_el);
+        sena_mux::ebml::write_element(&mut out, &[0x18, 0x53, 0x80, 0x67], &seg);
+        let _ = file;
+        match Demuxed::parse(out) {
+            Err(DemuxError::Unsupported(e)) => assert!(e.contains("v1"), "{e}"),
+            other => panic!("expected v1 rejection, got {other:?}"),
+        }
     }
 }

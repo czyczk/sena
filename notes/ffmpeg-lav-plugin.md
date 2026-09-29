@@ -1,4 +1,10 @@
-# ffmpeg / LAV Filters plugin notes (libsena_dec via runtime loading)
+# Sena ffmpeg/LAV demuxer plugin (SUPERSEDED)
+
+> **Superseded by the v2 single-track redesign — see `notes/single-track-es.md`.**
+> This document describes the v1 two/three-track MKA and the libavformat
+> demuxer + matroska_probe deferral, all of which were removed in v2.
+> Kept for history and for the seek/LF inexactness analysis in §4.
+
 
 Verdict first: ffmpeg support is a single **libavformat demuxer** named
 `sena` that drives the shared `sena-dec` C ABI and emits the decoded 48 kHz
