@@ -7,7 +7,9 @@ use rustfft::FftPlanner;
 use rustfft::num_complex::Complex64;
 
 /// Reference FIR for a split point. 300/600 are the profile crossovers;
-/// 12000 is the three-track b19 split (cutoff 11880, stopband at 12000).
+/// 12000 is the three-track b19 split (cutoff 12120: passband through the
+/// 12000 carrier so the top branch is empty below it - SSB shift-down folds
+/// any below-carrier top content, phase-flipped, onto 12.0-12.24 kHz).
 pub(crate) fn fir_for(fc: f64) -> &'static [f64] {
     if (fc - 300.0).abs() < 1.0 {
         &fir_tables::FIR_300
@@ -1513,9 +1515,10 @@ mod tests {
         }
     }
 
-    /// The three-track b19 split: the low (mid-band) output must have no
-    /// measurable energy at or above 12000 Hz (-6 dB cutoff 11880, 240 Hz
-    /// transition), and low+high must reconstruct the input exactly.
+    /// The three-track b19 split: the low (mid-band) output passes through
+    /// 12000 Hz (-6 dB cutoff 12120, 240 Hz transition above the carrier),
+    /// low+high reconstructs the input exactly, and the high (top branch)
+    /// must be empty below the 12000 Hz SSB carrier.
     #[test]
     fn crossover_12000_stopband_and_complement() {
         // Two tones straddling the split + broadband noise, 2 s stereo.
@@ -1569,12 +1572,33 @@ mod tests {
             buf[k0..k1].iter().map(|c| c.norm_sqr()).sum::<f64>()
         };
         let pass = band_energy(2000.0, 11000.0);
-        let stop = band_energy(12100.0, 24000.0);
+        let stop = band_energy(12300.0, 24000.0);
         assert!(
             stop / pass < 1e-12,
             "stopband leak {} vs pass {}",
             stop,
             pass
+        );
+        // The top branch must be empty below the 12000 Hz SSB carrier:
+        // measure the high output's sub-12k energy against its own passband.
+        let m2 = 1 << 16;
+        let mut re2 = vec![0.0f64; m2];
+        for (k, i) in (skip..skip + m2).enumerate() {
+            let w = 0.5 - 0.5 * (2.0 * std::f64::consts::PI * k as f64 / m2 as f64).cos();
+            re2[k] = high[i * 2] * w;
+        }
+        let mut buf2: Vec<C> = re2.iter().map(|&r| C::new(r, 0.0)).collect();
+        fft.process(&mut buf2);
+        let band_energy2 = |f0: f64, f1: f64| -> f64 {
+            let k0 = (f0 / 48000.0 * m2 as f64) as usize;
+            let k1 = (f1 / 48000.0 * m2 as f64) as usize;
+            buf2[k0..k1].iter().map(|c| c.norm_sqr()).sum::<f64>()
+        };
+        let below = band_energy2(1000.0, 11900.0);
+        let above = band_energy2(13000.0, 20000.0);
+        assert!(
+            below / above < 1e-8,
+            "top branch below-carrier leak {below} vs passband {above}"
         );
     }
 
@@ -1726,6 +1750,45 @@ mod tests {
         let image = mag(2.0 * fc - f);
         assert!(main > 0.8, "edge tone amplitude collapsed: {main}");
         assert!(image < 0.2 * main, "edge image {image} vs main {main}");
+    }
+
+    /// Regression: with the split FIR transition straddling the 12 kHz
+    /// carrier (cutoff 11880), top-branch content at 11.76-12 kHz landed at
+    /// negative baseband frequencies under the SSB shift-down and real()
+    /// folded it, phase-flipped, onto 12.0-12.24 kHz while its true place
+    /// kept only the mid branch's half amplitude. The split FIR puts its
+    /// transition entirely above the carrier (cutoff 12120): tones at and
+    /// below the carrier rejoin at full amplitude with no mirror at 24k-f.
+    #[test]
+    fn crossover_12000_no_ssb_foldover() {
+        let n = 48_000usize * 2;
+        let skip = HILBERT_DELAY + 2400;
+        let m = 1 << 16;
+        let mag = |y: &[f64], f: f64| -> f64 {
+            // Quadrature correlation: exact at any f (no FFT scalloping).
+            let w0 = 2.0 * std::f64::consts::PI * f / 48000.0;
+            let mut re = 0.0;
+            let mut im = 0.0;
+            for k in 0..m {
+                re += y[skip + k] * (w0 * k as f64).cos();
+                im -= y[skip + k] * (w0 * k as f64).sin();
+            }
+            2.0 * (re * re + im * im).sqrt() / m as f64
+        };
+        for f in [11800.0f64, 11880.0, 11900.0, 12000.0] {
+            let x = sine(f, 48000, n);
+            let (low, top) = split(&x, 1, 12000.0);
+            let back = shift_up(&shift_down(&top, 1, 12000.0, 48000), 1, 12000.0, 48000);
+            let rejoin: Vec<f64> = (0..n).map(|i| low[i] + back[i]).collect();
+            let main = mag(&rejoin, f);
+            let mirror = mag(&rejoin, 24000.0 - f);
+            let top_leak = mag(&top, f);
+            assert!(main > 0.95, "f={f}: rejoin amplitude collapsed: {main}");
+            if (24000.0 - f - f).abs() > 1.0 {
+                assert!(mirror < 0.02, "f={f}: mirror junk {mirror} vs main {main}");
+            }
+            assert!(top_leak < 0.02, "f={f}: top branch below carrier {top_leak}");
+        }
     }
 
     /// Chunk-fed ShiftStream must equal the batch shift_down.

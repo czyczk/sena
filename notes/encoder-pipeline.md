@@ -35,7 +35,11 @@ stdin/file WAV --WavStream--> [normalize any rate -> 48 kHz]
   over 600 Hz..Nyquist at `total - deduct`.
 - Three-track layout (nominal total >= 288 kbit/s, `SENA_PROFILE`
   `<lf>@12000`): the 600 Hz-high band splits again at the Opus b19/b20
-  boundary (12000 Hz; FIR_12000, 2001 taps, cutoff 11880, 240 Hz transition
+  boundary (12000 Hz; FIR_12000, 2001 taps, cutoff 12120 - the 240 Hz
+  transition sits entirely above the 12 kHz carrier (passband edge 12000),
+  because the SSB shift-down folds any top-branch content below the carrier,
+  phase-flipped, onto 12.0-12.24 kHz while halving its true place; pre-fix
+  (cutoff 11880) the 11.76-12 kHz band lost ~6 dB and spawned a mirror there
   -> >= ~95 dB at 12000). The mid track (`A_OPUS`) codes 600 Hz..12 kHz at
   `total - deduct - rail`. The top band is not coded directly: an Opus track
   whose content sits only above 12 kHz starves under the codec's
