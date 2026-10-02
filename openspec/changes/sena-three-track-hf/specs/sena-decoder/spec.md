@@ -7,8 +7,8 @@ For three-track files the decoder SHALL decode all three tracks and mix
 `lf48 + mid + top` (each restored by 1/PRE_GAIN) after applying each
 track's leading trim (LF 1024-core warmup; per-track Opus pre-skip). The
 `A_OPUSHF` track is decoded at 16 kHz, upsampled back to 48 kHz with the
-zero-phase rational resampler, and shifted back up to the 15.6 kHz+ band
-(analytic signal times exp(+j*2*pi*15600*t), real part) with the carrier
+zero-phase rational resampler, and shifted back up to the 12 kHz+ band
+(analytic signal times exp(+j*2*pi*12000*t), real part) with the carrier
 phase locked to the playable timeline (phase 0 at playable frame 0); the
 pre-skip trim is applied on the 48 kHz timeline (the OpusHead pre-skip
 counts 48 kHz units per RFC 7845). The streaming decoder SHALL consume all

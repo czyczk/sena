@@ -1,3 +1,7 @@
+> 2026-10-02 更新：三轨分频点已由 15600 Hz 下移到 12000 Hz（b19/b20 同上轨），
+> HF 轨码率由固定 64k 改为按总量分档（<320k -> 96k，>=320k -> 128k），三轨起始
+> 总量 256k -> 288k。本提案正文保留原设计数字作为历史记录；现行规范见 specs/。
+
 # Change: Three-track HF layout (>=256k) and SenaV topband-stereo defaults
 
 ## Why

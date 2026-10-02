@@ -137,9 +137,9 @@ mod tests {
             SenaBlock { t_ns: 0, data: vec![0, 3, 1, b'x'] },
             SenaBlock { t_ns: 20_000_000, data: vec![0, 2, 1, b'y'] },
         ];
-        let name = "Sena xAAC-Opus@600-Opus@15600";
+        let name = "Sena xAAC-Opus@600-Opus@12000";
         let file = write_sena(&cp, &blocks, name, 1000, 40_000_000);
-        let needle = b"Sena xAAC-Opus@600-Opus@15600";
+        let needle = b"Sena xAAC-Opus@600-Opus@12000";
         assert!(
             file.windows(needle.len()).any(|w| w == needle),
             "CodecName not found in container"

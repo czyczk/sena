@@ -54,7 +54,7 @@ unchanged by this change; only the packaging differs.
 
 The track `CodecName` SHALL be the layout's display name:
 `Sena xAAC-Opus@300` / `Sena xAAC-Opus@600` (two-layer) or
-`Sena xAAC-Opus@300-Opus@15600` / `Sena xAAC-Opus@600-Opus@15600`
+`Sena xAAC-Opus@300-Opus@12000` / `Sena xAAC-Opus@600-Opus@12000`
 (three-layer).
 
 #### Scenario: Same layers

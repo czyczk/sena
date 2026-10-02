@@ -60,7 +60,7 @@ pub struct SenaDecInfo {
     /// so hosts derive the average bitrate from this, not the file size.
     pub audio_span_bytes: u64,
     /// Non-zero when the file carries a third track (A_OPUSHF, the
-    /// 15.6 kHz..Nyquist opus track). ABI 2 field; hosts compiled against
+    /// 12 kHz..20 kHz opus track). ABI 2 field; hosts compiled against
     /// ABI 1 headers must be rebuilt (struct size changed).
     pub three_track: u32,
 }

@@ -36,12 +36,12 @@ pub struct EncoderConfig<'a> {
     pub total_kbps: u32,
     pub use_senav: bool,
     /// Three-track layout: split the 600 Hz-high band again at the Opus
-    /// b19 edge (15600 Hz) and encode the top band as a second opus track
-    /// (`A_OPUSHF`, fixed 64 kbit/s nominal). The top band is shifted down
-    /// to baseband (analytic-signal SSB shift by 15600 Hz) and carried at
-    /// 16 kHz: a directly coded top-octave-only track starves under Opus's
-    /// content-blind band allocation, while shifted baseband content is
-    /// served normally.
+    /// b19/b20 boundary (12000 Hz) and encode the top band as a second opus
+    /// track (`A_OPUSHF`, tiered nominal: 96 kbit/s, 128 kbit/s at totals
+    /// >= 320k). The top band is shifted down to baseband (analytic-signal
+    /// SSB shift by 12000 Hz) and carried at 16 kHz: a directly coded
+    /// top-octave-only track starves under Opus's content-blind band
+    /// allocation, while shifted baseband content is served normally.
     pub three_track: bool,
     /// Value passed through to the opusenc-senav mid encode as
     /// `AUDIFF_TOPBAND_STEREO` (kbps, unmodified). None = knob off.
@@ -63,7 +63,7 @@ pub struct Encoded {
     pub hf_preskip: u16,
     pub lf_aus: Vec<Vec<u8>>,
     pub lf_asc: Vec<u8>,
-    /// A_OPUSHF track (the 15600 Hz+ band, shifted to baseband and carried
+    /// A_OPUSHF track (the 12 kHz+ band, shifted to baseband and carried
     /// at 16 kHz); empty in the two-track layout.
     pub hf2_packets: Vec<Vec<u8>>,
     pub hf2_head: Vec<u8>,
@@ -120,6 +120,38 @@ fn run_parallel(cmds: &mut [(&str, &mut Command)]) -> Option<Error> {
         }
     }
     err
+}
+
+/// Minimum accepted SenaV milestone in the opusenc-senav version string.
+pub const SENAV_MIN_MILESTONE: u32 = 3;
+
+/// SenaV build check: the `--version` output must carry a
+/// `Opus SenaV m<N>` marker with N >= [`SENAV_MIN_MILESTONE`] (older builds
+/// lack the knob semantics Sena relies on). The trailing `@<commit>` id is
+/// informational only and never enforced.
+pub fn check_senav_version(path: &str) -> Result<(), Error> {
+    let out = Command::new(path)
+        .arg("--version")
+        .output()
+        .map_err(Error::Io)?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    if !out.status.success() && text.is_empty() {
+        return Err(Error::Subprocess("opusenc-senav --version failed".into()));
+    }
+    let Some(pos) = text.find("Opus SenaV m") else {
+        return Err(Error::Subprocess(format!(
+            "opusenc-senav lacks a \"Opus SenaV m<N>\" marker (need m{SENAV_MIN_MILESTONE}+): {text}"
+        )));
+    };
+    let rest = &text[pos + "Opus SenaV m".len()..];
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let n: u32 = digits.parse().unwrap_or(0);
+    if n < SENAV_MIN_MILESTONE {
+        return Err(Error::Subprocess(format!(
+            "opusenc-senav is SenaV m{n}, need m{SENAV_MIN_MILESTONE} or newer: {text}"
+        )));
+    }
+    Ok(())
 }
 
 pub fn check_version(path: &str, marker: Option<&str>, what: &str) -> Result<(), Error> {
@@ -308,7 +340,7 @@ pub fn encode_stream<R: std::io::Read>(
     let mut ws = wav::WavStream::new();
     let mut norm: Option<StreamResampler> = None;
     let mut split_s: Option<CrossoverStream> = None;
-    // Second split (three-track layout): 15600 Hz on the 600 Hz-high band,
+    // Second split (three-track layout): 12000 Hz on the 600 Hz-high band,
     // then the top band is SSB-shifted down to baseband and resampled to
     // 16 kHz for the A_OPUSHF encode.
     let mut split_hf: Option<CrossoverStream> = None;
@@ -448,7 +480,7 @@ pub fn encode_stream<R: std::io::Read>(
         lf_wr.push(&lf16b)?;
         let high_in: Vec<f64> = high_a.iter().chain(high_b.iter()).cloned().collect();
         if let Some(split_hf) = split_hf.as_mut() {
-            // Three-track tail: split the high band at 15600 Hz, tilt and
+            // Three-track tail: split the high band at 12000 Hz, tilt and
             // pad the mid band; shift the top band to baseband, resample
             // to 16 kHz and pad.
             st.begin();
@@ -591,7 +623,7 @@ fn end_tick(tick: &mut Option<std::time::Instant>, acc: &mut f64) {
 
 /// One chunk through normalize -> split -> pad -> LF downsample -> writers.
 /// In the three-track layout the LF branch (downsample + LF write) and the
-/// HF branch (15600 Hz split + tilt + mid write + top-band shift/downsample/
+/// HF branch (12000 Hz split + tilt + mid write + top-band shift/downsample/
 /// write) are independent and run concurrently; their stage timers overlap,
 /// so the SENAENC_TIME sum can exceed the wall time.
 #[allow(clippy::too_many_arguments)]
@@ -694,7 +726,7 @@ fn lf_branch(
     r
 }
 
-/// Three-track HF branch: 15600 Hz split (the tilt, if any, shapes the mid
+/// Three-track HF branch: 12000 Hz split (the tilt, if any, shapes the mid
 /// band only) -> PRE_GAIN -> mid write; the top band is SSB-shifted down to
 /// baseband and resampled to 16 kHz before its (PRE_GAIN) write. Returns
 /// its (split, write) elapsed times through `t`.
@@ -762,7 +794,7 @@ fn run_codecs(
     let ck_err: Option<Error> = check_exhale(cfg.exhale)
         .and_then(|_| {
             if cfg.use_senav {
-                check_version(cfg.opusenc, Some("Opus SenaV"), "opusenc-senav")
+                check_senav_version(cfg.opusenc)
             } else {
                 check_version(cfg.opusenc, None, "opusenc")
             }
@@ -777,9 +809,9 @@ fn run_codecs(
     // The codec passes are independent (separate input files, separate
     // output files) and each is single-threaded, so run them concurrently.
     // Two-track: opusenc codes hf.wav (600 Hz..Nyquist at 48 kHz).
-    // Three-track: it codes mid.wav (600 Hz..15600 Hz at 48 kHz) and a
-    // second opusenc codes hf.wav (the 15600 Hz+ band shifted to baseband,
-    // 16 kHz) at a fixed 64k nominal.
+    // Three-track: it codes mid.wav (600 Hz..12 kHz at 48 kHz) and a
+    // second opusenc codes hf.wav (the 12 kHz+ band shifted to baseband,
+    // 16 kHz) at the tiered hf nominal (96k below a 320k total, else 128k).
     let lf_m4a = wd.join("lf.m4a");
     let hf_ogg = wd.join("hf.opus");
     let mid_ogg = wd.join("mid.opus");
@@ -787,13 +819,14 @@ fn run_codecs(
     ex.arg(cfg.profile.xhe_preset().to_string())
         .arg(&lf_wav)
         .arg(&lf_m4a);
-    let (_, mid_kbps) = if cfg.three_track {
-        let (_, mid, _) = sena_core::account3(cfg.total_kbps, cfg.profile)
+    let (mid_kbps, rail_kbps) = if cfg.three_track {
+        let (_, mid, hf) = sena_core::account3(cfg.total_kbps, cfg.profile)
             .ok_or_else(|| Error::Format("total bitrate below the three-track minimum".into()))?;
-        (0, mid)
+        (mid, hf)
     } else {
-        sena_core::account(cfg.total_kbps, cfg.profile)
-            .ok_or_else(|| Error::Format("total bitrate below Sena minimum".into()))?
+        let (_, mid) = sena_core::account(cfg.total_kbps, cfg.profile)
+            .ok_or_else(|| Error::Format("total bitrate below Sena minimum".into()))?;
+        (mid, 0)
     };
     let mut op = Command::new(cfg.opusenc);
     op.arg("--quiet")
@@ -809,13 +842,13 @@ fn run_codecs(
         apply_senav_env(&mut op, cfg.topband_kbps);
     }
     let mut cmds: Vec<(&str, &mut Command)> = vec![("exhale", &mut ex), ("opusenc(mid)", &mut op)];
-    // Three-track top-band encode (A_OPUSHF): fixed 64k nominal, the
-    // topband-stereo knob is never armed for it.
+    // Three-track top-band encode (A_OPUSHF): the tiered hf nominal
+    // (96k/128k); the topband-stereo knob is never armed for it.
     let mut op2 = Command::new(cfg.opusenc);
     if cfg.three_track {
         op2.arg("--quiet")
             .arg("--bitrate")
-            .arg(sena_core::HF_TRACK_KBPS.to_string())
+            .arg(rail_kbps.to_string())
             .arg("--vbr")
             .arg(&hf_wav)
             .arg(&hf_ogg);
@@ -980,9 +1013,9 @@ fn run_codecs(
 fn apply_senav_env(op: &mut Command, topband_kbps: Option<u32>) {
     for (k, v) in [
         ("AUDIFF_ADAPT_INTENSITY", "1000"),
-        ("AUDIFF_VBR_TBOOST", "25"),
+        ("AUDIFF_VBR_TBOOST", "40"),
         ("AUDIFF_TBOOST_SUSTAIN_GATE", "1"),
-        ("AUDIFF_TBOOST_SUSTAIN_RATIO", "40"),
+        ("AUDIFF_TBOOST_SUSTAIN_RATIO", "80"),
         ("AUDIFF_VBR_TDECAY", "0"),
     ] {
         op.env(k, v);
@@ -1690,8 +1723,8 @@ mod tests {
     }
 
     /// Three-track streaming DSP: mid.wav must equal the batch reference
-    /// (split@600 -> split@15600 low -> PRE_GAIN) and hf.wav the shifted +
-    /// downsampled top band (split@15600 high -> shift_down -> 48k->16k ->
+    /// (split@600 -> split@12000 low -> PRE_GAIN) and hf.wav the shifted +
+    /// downsampled top band (split@12000 high -> shift_down -> 48k->16k ->
     /// PRE_GAIN). Decoding the top track (16k->48k -> shift_up) and adding
     /// the mid band must reconstruct the 600 Hz-high band.
     #[test]

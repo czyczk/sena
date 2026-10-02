@@ -89,26 +89,29 @@ not reliably converge. Sena e2e streams carry AudioPreroll only in AU 0
 access. See `examples/lf_preroll_probe.rs` and
 `notes/ffmpeg-lav-plugin.md` section 4.2.
 
-## Three-track layout asset (2026-09-25)
+## Three-track layout asset (2026-10-02: 12 kHz split, tiered rail)
 
-`assets/e2e/01__p600__3t__hf160+64.sena` is the first three-track e2e asset
-(`--opus-senav 256`, profile @600: exhale 32k + mid senav 160k over
-600 Hz..15.6 kHz + top senav 64k over the 15.6 kHz+ band shifted to
-baseband, 16 kHz stream). Produced with the local `bin/` toolchain
-(`opusenc-senav` from `opus-custom`), ffmpeg wav extract of `01__src.flac`
-at 48 kHz f32. (2026-09-26: asset regenerated after the top track moved
-from direct 48 kHz coding to the shifted-baseband layout; old 48 kHz
-A_OPUSHF files are rejected cleanly at probe.)
+`assets/e2e/01__p600__3t__hf160+96.sena` is the three-track e2e asset
+(`--opus-senav 288`, profile @600: exhale 32k + mid senav 160k over
+600 Hz..12 kHz + top senav 96k over the 12 kHz+ band shifted to baseband,
+16 kHz stream). Produced with the local `bin/` toolchain
+(`opusenc-senav` from `opus-custom`, SenaV m3). History: the layout began
+as a 256k total with a 15.6 kHz split + fixed 64k rail (2026-09-25), moved
+from direct 48 kHz top-band coding to the shifted baseband (2026-09-26),
+and moved to the 12 kHz split with the 96/128k tiered rail at a >= 288k
+total (2026-10-02); files of the old designs are not compatible.
 
-- `senaenc` accounting print: `600@15600`, mid 160 + top 64 confirmed.
+- `senaenc` accounting print: `600@12000`, mid 160 + top 96 confirmed.
 - `senadec --info`: profile=600, playable 960000 (exact), audio-sha256
   recorded (v2 domain, 3 streams).
 - decode vs source (ffmpeg f32): lag 0, correlation 0.999846, RMS 0.0038 -
-  same class as the two-track rows above. No archived `-ref16`/`-ref32`
-  reference exists for this layout (no external reference pipeline covers
-  the 15600 Hz split + shift); the acceptance gates are the
+  same class as the two-track rows above (measured on the 15.6 kHz-era
+  asset). No archived `-ref16`/`-ref32` reference exists for this layout;
+  the acceptance gates are the
   `stream::tests::streaming_matches_whole_file_pipeline` equality (the
   asset is in its list) and `pipeline::tests::three_track_layout`.
+  `tests/golden/run.sh <wav> 600 288` additionally covers the reference
+  decode of the shifted 12 kHz top band.
 - Layout mismatch regression (A_OPUSHF without / with wrong
   `SENA_PROFILE`) covered by `pipeline::tests::three_track_layout`.
 

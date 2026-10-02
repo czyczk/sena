@@ -7,14 +7,14 @@ use rustfft::FftPlanner;
 use rustfft::num_complex::Complex64;
 
 /// Reference FIR for a split point. 300/600 are the profile crossovers;
-/// 15600 is the three-track b19 split (cutoff 15480, stopband at 15600).
+/// 12000 is the three-track b19 split (cutoff 11880, stopband at 12000).
 pub(crate) fn fir_for(fc: f64) -> &'static [f64] {
     if (fc - 300.0).abs() < 1.0 {
         &fir_tables::FIR_300
     } else if (fc - 600.0).abs() < 1.0 {
         &fir_tables::FIR_600
-    } else if (fc - 15600.0).abs() < 1.0 {
-        &fir_tables::FIR_15600
+    } else if (fc - 12000.0).abs() < 1.0 {
+        &fir_tables::FIR_12000
     } else {
         panic!("no reference FIR for split at {fc} Hz");
     }
@@ -1483,7 +1483,7 @@ mod tests {
             .iter()
             .flat_map(|&v| [v, v * 0.5])
             .collect();
-        for fc in [300.0, 600.0, 15600.0] {
+        for fc in [300.0, 600.0, 12000.0] {
             let (blow, bhigh) = split(&x, 2, fc);
             let mut s = CrossoverStream::new(fc);
             let mut low = Vec::new();
@@ -1514,10 +1514,10 @@ mod tests {
     }
 
     /// The three-track b19 split: the low (mid-band) output must have no
-    /// measurable energy at or above 15600 Hz (-6 dB cutoff 15480, 240 Hz
+    /// measurable energy at or above 12000 Hz (-6 dB cutoff 11880, 240 Hz
     /// transition), and low+high must reconstruct the input exactly.
     #[test]
-    fn crossover_15600_stopband_and_complement() {
+    fn crossover_12000_stopband_and_complement() {
         // Two tones straddling the split + broadband noise, 2 s stereo.
         let n = 48_000 * 2;
         let mut x = Vec::with_capacity(n * 2);
@@ -1536,7 +1536,7 @@ mod tests {
             x.push(v);
             x.push(v * 0.7);
         }
-        let (low, high) = split(&x, 2, 15600.0);
+        let (low, high) = split(&x, 2, 12000.0);
         // Complementarity (minus the edge regions of the convolution).
         let skip = 2100;
         for i in skip..n - skip {
@@ -1568,8 +1568,8 @@ mod tests {
             let k1 = (f1 / 48000.0 * m as f64) as usize;
             buf[k0..k1].iter().map(|c| c.norm_sqr()).sum::<f64>()
         };
-        let pass = band_energy(2000.0, 14000.0);
-        let stop = band_energy(15700.0, 24000.0);
+        let pass = band_energy(2000.0, 11000.0);
+        let stop = band_energy(12100.0, 24000.0);
         assert!(
             stop / pass < 1e-12,
             "stopband leak {} vs pass {}",
@@ -1642,13 +1642,13 @@ mod tests {
     #[test]
     fn shift_down_places_band_at_baseband() {
         let n = 48_000usize;
-        let fc = 15600.0;
+        let fc = 12000.0;
         // tone at fc + 2000 Hz plus one at fc + 7000 Hz
         let mut x = vec![0.0; n];
         for i in 0..n {
             let t = i as f64 / 48000.0;
-            x[i] = 0.5 * (2.0 * std::f64::consts::PI * 17600.0 * t).cos()
-                + 0.3 * (2.0 * std::f64::consts::PI * 22600.0 * t).cos();
+            x[i] = 0.5 * (2.0 * std::f64::consts::PI * 14000.0 * t).cos()
+                + 0.3 * (2.0 * std::f64::consts::PI * 19000.0 * t).cos();
         }
         let y = shift_down(&x, 1, fc, 48000);
         // FFT of the settled region; expect peaks at 2000 and 7000 Hz only.
@@ -1669,8 +1669,8 @@ mod tests {
         assert!(p_hi > 0.4 * 0.3 * m as f64, "7 kHz peak too small: {p_hi}");
         // images: 2*fc - band content would appear as mirrored junk; check a
         // few bins that must be empty (e.g. 4800 Hz = image of nothing, and
-        // 13600 = 15600-2000 is below-carrier mirror of the shifted band).
-        for f in [4800.0, 13600.0, 11600.0] {
+        // 10000 = 12000-2000 is below-carrier mirror of the shifted band).
+        for f in [4800.0, 10000.0, 5000.0] {
             let p = peak_at(f);
             assert!(p < 1e-3 * p_lo, "image at {f} Hz: {p} vs {p_lo}");
         }
@@ -1682,9 +1682,9 @@ mod tests {
     #[test]
     fn shift_roundtrip_recovers_band() {
         let n = 48_000usize;
-        let fc = 15600.0;
+        let fc = 12000.0;
         let mut x = vec![0.0; n];
-        for (f, a) in [(16000.0, 0.4), (17500.0, 0.3), (19000.0, 0.2), (22500.0, 0.2)] {
+        for (f, a) in [(12500.0, 0.4), (15000.0, 0.3), (18000.0, 0.2), (22000.0, 0.2)] {
             for (i, v) in x.iter_mut().enumerate() {
                 *v += a * (2.0 * std::f64::consts::PI * f * i as f64 / 48000.0).cos();
             }
@@ -1705,8 +1705,8 @@ mod tests {
     #[test]
     fn shift_roundtrip_carrier_edge() {
         let n = 48_000usize * 2;
-        let fc = 15600.0;
-        let f = 15650.0;
+        let fc = 12000.0;
+        let f = 12050.0;
         let x = sine(f, 48000, n);
         let back = shift_up(&shift_down(&x, 1, fc, 48000), 1, fc, 48000);
         let skip = HILBERT_DELAY + 200;
@@ -1732,12 +1732,12 @@ mod tests {
     #[test]
     fn shift_stream_matches_batch() {
         let n = 48_000 * 3;
-        let x: Vec<f64> = sine(18_100.0, 48000, n)
+        let x: Vec<f64> = sine(13_100.0, 48000, n)
             .iter()
             .flat_map(|&v| [v, v * 0.5])
             .collect();
-        let batch = shift_down(&x, 2, 15600.0, 48000);
-        let mut s = ShiftStream::down(15600.0, 48000);
+        let batch = shift_down(&x, 2, 12000.0, 48000);
+        let mut s = ShiftStream::down(12000.0, 48000);
         let mut streamed = Vec::new();
         for chunk in x.chunks(48_000) {
             streamed.extend(s.push(chunk, 2));
@@ -1758,9 +1758,9 @@ mod tests {
     #[test]
     fn top_band_channel_roundtrip() {
         let n = 48_000usize * 2;
-        let fc = 15600.0;
+        let fc = 12000.0;
         let mut x = vec![0.0; n * 2];
-        for (f, a) in [(16100.0, 0.3), (18000.0, 0.3), (21000.0, 0.2), (22400.0, 0.15)] {
+        for (f, a) in [(12400.0, 0.3), (15000.0, 0.3), (17500.0, 0.2), (19400.0, 0.15)] {
             for i in 0..n {
                 let v = a * (2.0 * std::f64::consts::PI * f * i as f64 / 48000.0).cos();
                 x[i * 2] += v;

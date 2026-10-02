@@ -57,7 +57,7 @@ pub struct DecodedInfo {
     pub playable_frames: u64,
     /// LF profile number (300 or 600); the HF split is reported separately.
     pub profile: u32,
-    /// Three-track layout: a top layer carrying the 15.6 kHz+ band
+    /// Three-track layout: a top layer carrying the 12 kHz+ band
     /// (SSB-shifted to baseband, 16 kHz stream) rides along; it is shifted
     /// back up and mixed into the output.
     pub three_track: bool,
@@ -94,7 +94,7 @@ pub struct Decoded {
     pcm: Vec<f64>,
     lf_track_pcm: Vec<f64>,
     hf_track_pcm: Vec<f64>,
-    /// A_OPUSHF (15.6 kHz+ band, restored from the shifted 16 kHz stream)
+    /// A_OPUSHF (12 kHz+ band, restored from the shifted 16 kHz stream)
     /// track, upmixed by 1/PRE_GAIN; empty in the two-track layout.
     hf2_track_pcm: Vec<f64>,
     bits_total: Vec<f64>,
@@ -446,7 +446,7 @@ pub fn decode(demux: &Demuxed) -> Result<Decoded, DecodeError> {
                             decode_opus(&tf_frames, head, sena_core::HF_TRACK_RATE)?;
                         // The top stream decodes at 16 kHz: upsample back to
                         // 48 kHz (zero-phase, grid-exact x3), shift the
-                        // baseband content back up to the 15.6 kHz+ band,
+                        // baseband content back up to the 12 kHz+ band,
                         // then drop the pre-skip (48 kHz units).
                         let hf2_skip = head.pre_skip as usize;
                         let raw: Vec<f64> = raw16.iter().map(|&s| f64::from(s)).collect();
@@ -557,7 +557,7 @@ impl Decoded {
     pub fn hf_track_pcm(&self) -> &[f64] {
         &self.hf_track_pcm
     }
-    /// A_OPUSHF (15.6 kHz+ band) track PCM; empty slice in the two-track
+    /// A_OPUSHF (12 kHz+ band) track PCM; empty slice in the two-track
     /// layout.
     pub fn hf2_track_pcm(&self) -> &[f64] {
         &self.hf2_track_pcm
@@ -692,7 +692,7 @@ mod tests {
     /// band, and the mix is exactly lf+mid+top.
     #[test]
     fn three_track_layout() {
-        let demux = Demuxed::parse(asset("01__p600__3t__hf160+64")).unwrap();
+        let demux = Demuxed::parse(asset("01__p600__3t__hf160+96")).unwrap();
 
         let (info, warnings) = probe_params(&demux.init, demux.audio_span_bytes).unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");

@@ -17,9 +17,9 @@ stdin/file WAV --WavStream--> [normalize any rate -> 48 kHz]
                                      |                \ high
                                      v                  v
                               LF downsample       (two-track: 600 Hz..24 kHz -> hf.wav)
-                              48k -> 16k/32k       (three-track, total >= 256k:
-                                     |              CrossoverStream @15600 -> mid.wav
-                                     |              + ShiftStream down 15.6 kHz -> baseband
+                              48k -> 16k/32k       (three-track, total >= 288k:
+                                     |              CrossoverStream @12000 -> mid.wav
+                                     |              + ShiftStream down 12 kHz -> baseband
                                      |              + 48k->16k -> hf.wav)
                                      v                           |
                                  lf.wav (s16, streaming)         v
@@ -33,25 +33,29 @@ stdin/file WAV --WavStream--> [normalize any rate -> 48 kHz]
 
 - Two-track layout (`SENA_PROFILE` `300`/`600`): exhale LF + one opus track
   over 600 Hz..Nyquist at `total - deduct`.
-- Three-track layout (nominal total >= 256 kbit/s, `SENA_PROFILE`
-  `<lf>@15600`): the 600 Hz-high band splits again at the Opus b19 edge
-  (15600 Hz; FIR_15600, 2001 taps, cutoff 15480, 240 Hz transition ->
-  >= ~95 dB at 15600). The mid track (`A_OPUS`) codes 600 Hz..15.6 kHz at
-  `total - deduct - 64`. The top band is not coded directly: an Opus track
-  whose content sits only above 15.6 kHz starves under the codec's
+- Three-track layout (nominal total >= 288 kbit/s, `SENA_PROFILE`
+  `<lf>@12000`): the 600 Hz-high band splits again at the Opus b19/b20
+  boundary (12000 Hz; FIR_12000, 2001 taps, cutoff 11880, 240 Hz transition
+  -> >= ~95 dB at 12000). The mid track (`A_OPUS`) codes 600 Hz..12 kHz at
+  `total - deduct - rail`. The top band is not coded directly: an Opus track
+  whose content sits only above 12 kHz starves under the codec's
   content-blind band allocation (the empty low bands keep their share), so
   the top band is SSB-shifted down to baseband (analytic signal via an
-  8001-tap Hilbert FIR, Kaiser beta 9; carrier = the 15600 Hz split) and
-  resampled 48k -> 16k; the top track (`A_OPUSHF`) codes that 16 kHz
-  baseband at a fixed 64k nominal. Decoding reverses it: decode at 16 kHz,
+  8001-tap Hilbert FIR, Kaiser beta 9; carrier = the 12000 Hz split) and
+  resampled 48k -> 16k (baseband 0..8 kHz = the original 12..20 kHz; content
+  above 20 kHz is dropped, matching Opus's own ceiling); the top track
+  (`A_OPUSHF`) codes that 16 kHz baseband at a tiered nominal: 96k, or 128k
+  at totals >= 320k. Decoding reverses it: decode at 16 kHz,
   zero-phase upsample back to 48 kHz, shift back up (carrier phase locked
   to the playable timeline), mix. Both opus tracks use whichever opusenc
   build the mode selected (`--opus-senav` / `--opus-original`); the three
   codec processes run concurrently. `--hf-tilt`, when enabled, shapes the
   mid band only.
-- opus-senav topband-stereo: `AUDIFF_TOPBAND_STEREO` is armed for the mid
-  encode only - by default at the Opus budget when the total is in
-  [192, 256) kbit/s with senav, or verbatim via
+- opus-senav topband-stereo: `AUDIFF_TOPBAND_STEREO` is armed for the
+  two-track mid encode only - by default at the Opus budget when the total
+  is in [192, 288) kbit/s with senav (the knob floors exit frames below a
+  192k budget and deficit-senses the top bands at/above it), or verbatim
+  via
   `--opus-topband-stereo <1-500>` (straight passthrough, no Sena-side
   arithmetic; warned+ignored under `--opus-original`; never on `A_OPUSHF`).
 
@@ -104,7 +108,7 @@ What runs concurrently, end to end:
   shift batch channels and the ShiftStream emit fill; threshold
   16K frames/channels).
 - Three-track chunks run the LF branch (downsample + LF write) and the HF
-  branch (15600 Hz split + tilt + mid write + top-band shift/downsample/
+  branch (12000 Hz split + tilt + mid write + top-band shift/downsample/
   write) on two scoped threads - the p600 LF downsample no longer
   serializes behind the second crossover. Inside the HF branch the mid
   lane stays serial with the top lane (audit 2026-09-26: the mid lane is

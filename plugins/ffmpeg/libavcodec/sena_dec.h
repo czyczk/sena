@@ -53,7 +53,7 @@ typedef struct {
        framing). Tags, Attachments (cover art) and Void filler are excluded:
        average-bitrate displays must use this, not the raw file size. */
     uint64_t audio_span_bytes;
-    uint32_t three_track; /* nonzero = three-layer layout (15.6 kHz+ top band) */
+    uint32_t three_track; /* nonzero = three-layer layout (12 kHz+ top band) */
 } SenaDecInfo;
 
 typedef struct {

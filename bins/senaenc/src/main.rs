@@ -4,7 +4,7 @@ use sena_core::{
     Profile, RECOMMENDED_MIN_TOTAL_KBPS, SENAV_THRESHOLD_KBPS, THREE_TRACK_MIN_KBPS,
     TOPBAND_DEFAULT_RANGE, account, account3, three_track_tag,
 };
-use sena_enc::{EncoderConfig, check_version, exhale_version, opusenc_version, version_ge};
+use sena_enc::{EncoderConfig, exhale_version, opusenc_version, version_ge};
 use std::path::{Path, PathBuf};
 
 fn usage() -> ! {
@@ -19,8 +19,8 @@ fn usage() -> ! {
          --hf-tilt <pct>: optional gentle high-frequency tilt on the Opus band (percent of the \
          reference curve; 0 = off; default off)\n\
          totals >= {THREE_TRACK_MIN_KBPS}k use the three-track layout: exhale LF + \
-         Opus mid (600 Hz..15.6 kHz) + Opus top (15.6 kHz+ band shifted to baseband, \
-         16 kHz stream, fixed 64k)\n\
+         Opus mid (600 Hz..12 kHz) + Opus top (12 kHz+ band shifted to baseband, \
+         16 kHz stream; 96k nominal, 128k at totals >= 320k)\n\
          senaenc doctor                              check required encoder tools\n\
          minimum bitrate: {}k (@600) / {}k (@300); below {RECOMMENDED_MIN_TOTAL_KBPS}k plain Opus\n\
          is recommended and senaenc refuses unless --bypass-recommendations is given\n\
@@ -156,10 +156,10 @@ fn doctor() -> i32 {
         }
     }
 
-    // opusenc-senav: optional
+    // opusenc-senav: optional; must carry the SenaV m>=3 marker to be usable
     match finder.find("opusenc-senav") {
         Some((p, src)) => {
-            match check_version(&p.to_string_lossy(), Some("Opus SenaV"), "opusenc-senav") {
+            match sena_enc::check_senav_version(&p.to_string_lossy()) {
                 Ok(()) => {
                     eprintln!(
                         "  [ok] opusenc-senav (SenaV build) ({}, {src})",
@@ -337,12 +337,12 @@ fn main() {
     }
     if three_track {
         eprintln!(
-            "senaenc: profile @{}  total {}k -> xHE-AAC {}k (deducted) + Opus mid {}k (600 Hz..15.6 kHz) + Opus top {}k (15.6 kHz+, {}) [{}]{}",
+            "senaenc: profile @{}  total {}k -> xHE-AAC {}k (deducted) + Opus mid {}k (600 Hz..12 kHz) + Opus top {}k (12 kHz+, {}) [{}]{}",
             profile.crossover_hz(),
             kbps,
             xhe_k,
             mid_k,
-            sena_core::HF_TRACK_KBPS,
+            sena_core::hf_track_kbps(kbps),
             if use_senav {
                 "opusenc-senav"
             } else {

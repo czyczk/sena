@@ -814,7 +814,7 @@ impl EsDecoder {
                 .map(|&s| f64::from(s))
                 .collect();
             // Top band: upsample the whole pending 16 kHz window to 48 kHz
-            // and shift the baseband content back up to the 15.6 kHz+ band.
+            // and shift the baseband content back up to the 12 kHz+ band.
             // The carrier phase is locked to the playable timeline.
             let tf_out = if has_tf {
                 let rs = st.tf_resampler.as_ref().unwrap();
@@ -1535,7 +1535,7 @@ mod tests {
     /// bit-for-bit.
     #[test]
     fn push_matches_container_decode() {
-        for asset in ["01__p300__lfa__hf144", "01__p600__3t__hf160+64"] {
+        for asset in ["01__p300__lfa__hf144", "01__p600__3t__hf160+96"] {
             let bytes = asset_bytes(asset);
             let reference = decode_all(&mut store_decoder(&bytes));
             let pushed = decode_all(&mut push_decoder(&bytes));
@@ -1548,7 +1548,7 @@ mod tests {
     /// bit-for-bit (it *is* the same decode, just fed differently).
     #[test]
     fn warmup_seek_matches_container_seek() {
-        let bytes = asset_bytes("01__p600__3t__hf160+64");
+        let bytes = asset_bytes("01__p600__3t__hf160+96");
         for target in [123_456u64, 640_000, 959_900] {
             let reference = {
                 let mut d = store_decoder(&bytes);
@@ -1618,7 +1618,7 @@ mod tests {
         for asset in [
             "01__p300__lfa__hf144",
             "01__p600__lfd__hf136",
-            "01__p600__3t__hf160+64",
+            "01__p600__3t__hf160+96",
             "05__p300__lfa__hf144",
             "09__p600__lfd__hf136",
         ] {
@@ -1643,7 +1643,7 @@ mod tests {
     /// keep exact length within the documented LF inexactness class.
     #[test]
     fn three_track_seek() {
-        let bytes = asset_bytes("01__p600__3t__hf160+64");
+        let bytes = asset_bytes("01__p600__3t__hf160+96");
         let whole = crate::pipeline::decode(&Demuxed::parse(bytes.clone()).unwrap()).unwrap();
         let whole_pcm: Vec<f32> = whole.pcm_f64().iter().map(|&v| v as f32).collect();
         let playable = whole.info().playable_frames as usize;
@@ -1719,7 +1719,7 @@ mod tests {
     /// 448 KiB; debug builds need more headroom for the same code.
     #[test]
     fn decode_fits_small_host_stack() {
-        for asset in ["01__p300__lfa__hf144", "01__p600__3t__hf160+64"] {
+        for asset in ["01__p300__lfa__hf144", "01__p600__3t__hf160+96"] {
             let bytes = asset_bytes(asset);
             let handle = std::thread::Builder::new()
                 .stack_size(if cfg!(debug_assertions) { 512 * 1024 } else { 448 * 1024 })

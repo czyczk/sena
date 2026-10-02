@@ -12,8 +12,8 @@ The container SHALL contain exactly one audio track ("the Sena track"):
 - `TrackType` = 2 (audio)
 - `CodecID` = `A_MS/ACM`
 - `CodecName` = the layout's display name: `Sena xAAC-Opus@300` /
-  `Sena xAAC-Opus@600` (two-layer), `Sena xAAC-Opus@300-Opus@15600` /
-  `Sena xAAC-Opus@600-Opus@15600` (three-layer)
+  `Sena xAAC-Opus@600` (two-layer), `Sena xAAC-Opus@300-Opus@12000` /
+  `Sena xAAC-Opus@600-Opus@12000` (three-layer)
 - `CodecPrivate` = the WAVEFORMATEX wrapper defined below
 - `Audio.SamplingFrequency` = 48000, `Audio.Channels` = 2
 - `CodecDelay` = 0 (all leading trims are internal to the elementary
@@ -22,7 +22,7 @@ The container SHALL contain exactly one audio track ("the Sena track"):
 - `SeekPreRoll` = informational hint for foreign demuxers (SHALL be
   written; SHOULD be 500 ms in ticks)
 
-The two-layer (@300/@600) and three-layer (@300@15600/@600@15600) profiles
+The two-layer (@300/@600) and three-layer (@300@12000/@600@12000) profiles
 are unchanged in content; the layers SHALL be packed into the single
 composite elementary stream defined here. A Sena file SHALL NOT contain
 `A_SENALF` or `A_OPUSHF` tracks.

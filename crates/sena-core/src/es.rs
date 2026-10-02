@@ -13,12 +13,13 @@ pub const WAVE_FORMAT_SENA: u16 = 0x534E;
 pub const SENA_CODEC_ID: &str = "A_MS/ACM";
 
 /// Display/codec name of the format: `Sena xAAC-Opus@<lf crossover>` for the
-/// two-layer layout, `Sena xAAC-Opus@<lf crossover>-Opus@15600` when the
+/// two-layer layout, `Sena xAAC-Opus@<lf crossover>-Opus@12000` when the
 /// top-band Opus layer (three-layer layout) rides along.
 pub fn codec_name(profile: crate::Profile, three_track: bool) -> String {
     let lf = profile.crossover_hz() as u32;
     if three_track {
-        format!("Sena xAAC-Opus@{lf}-Opus@15600")
+        let hf = crate::HF_SPLIT_HZ as u32;
+        format!("Sena xAAC-Opus@{lf}-Opus@{hf}")
     } else {
         format!("Sena xAAC-Opus@{lf}")
     }

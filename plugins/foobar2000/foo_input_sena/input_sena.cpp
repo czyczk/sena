@@ -94,7 +94,7 @@ void input_sena::get_info(file_info &info, abort_callback &abort) {
         const char *base = di.profile == 300 ? "xAAC-Opus@300" : "xAAC-Opus@600";
         if (di.three_track) {
             pfc::string8 prof(base);
-            prof += "+HF@15600";
+            prof += "+HF@12000";
             info.info_set("codec_profile", prof);
         } else {
             info.info_set("codec_profile", base);

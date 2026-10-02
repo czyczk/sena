@@ -88,37 +88,46 @@ pub fn account(total_kbps: u32, profile: Profile) -> Option<(u32, u32)> {
     Some((d, total_kbps - d))
 }
 
-/// Second split point of the three-track layout: the Opus b19 edge at
-/// 48 kHz / 20 ms frames (bands 19+20 = 15.6 kHz..Nyquist). The top band is
+/// Second split point of the three-track layout: the Opus b19/b20 boundary
+/// at 48 kHz / 20 ms frames (bands 19+20 = 12 kHz..20 kHz). The top band is
 /// shifted down by this same frequency (analytic-signal SSB shift) so the
-/// top track codes it as baseband content.
-pub const HF_SPLIT_HZ: f64 = 15600.0;
+/// top track codes it as baseband content; at 16 kHz stream rate the 12 kHz
+/// shift exactly fills the 0..8 kHz baseband, and content above 20 kHz is
+/// dropped (Opus itself stops at 20 kHz).
+pub const HF_SPLIT_HZ: f64 = 12000.0;
 
-/// Fixed nominal rate of the A_OPUSHF (top band) opus track.
-pub const HF_TRACK_KBPS: u32 = 64;
+/// Nominal rate of the A_OPUSHF (top band) opus track as a function of the
+/// nominal total: 96 kbit/s for three-track totals below 320 kbit/s, 128
+/// kbit/s at and above.
+pub fn hf_track_kbps(total_kbps: u32) -> u32 {
+    if total_kbps >= 320 { 128 } else { 96 }
+}
 
-/// Stream rate of the A_OPUSHF track: the top band (15600 Hz..Nyquist) is
-/// shifted down to baseband (0..8.4 kHz) and carried at 16 kHz.
+/// Stream rate of the A_OPUSHF track: the top band (12000 Hz..20 kHz) is
+/// shifted down to baseband (0..8 kHz) and carried at 16 kHz.
 pub const HF_TRACK_RATE: u32 = 16000;
 
 /// Nominal totals at (and above) which the encoder uses the three-track
 /// layout; below it the top bands stay in the single A_OPUS track.
-pub const THREE_TRACK_MIN_KBPS: u32 = 256;
+pub const THREE_TRACK_MIN_KBPS: u32 = 288;
 
-/// Topband-stereo default tier: opus-senav with a nominal total inside
-/// [SENAV_THRESHOLD_KBPS, THREE_TRACK_MIN_KBPS) floors the intensity-exit
-/// frames at the opus budget by default.
+/// Topband-stereo default tier: opus-senav two-track with a nominal total in
+/// [SENAV_THRESHOLD_KBPS, THREE_TRACK_MIN_KBPS) arms AUDIFF_TOPBAND_STEREO at
+/// the Opus budget by default (below a 192k budget this is the exit-frame
+/// floor; at/above it the deficit self-sensing - the knob switches semantics
+/// inside the encoder at 192k).
 pub const TOPBAND_DEFAULT_RANGE: std::ops::Range<u32> = SENAV_THRESHOLD_KBPS..THREE_TRACK_MIN_KBPS;
 
 /// Three-track bitrate accounting. Returns (xhe_kbps, mid_kbps, hf_kbps);
-/// `hf` is fixed at [`HF_TRACK_KBPS`] and the remainder goes to the mid
+/// `hf` follows [`hf_track_kbps`] and the remainder goes to the mid
 /// track, which keeps the two-track [`OPUS_MIN_KBPS`] floor.
 pub fn account3(total_kbps: u32, profile: Profile) -> Option<(u32, u32, u32)> {
-    if total_kbps < profile.min_total_kbps() + HF_TRACK_KBPS {
+    let hf = hf_track_kbps(total_kbps);
+    if total_kbps < profile.min_total_kbps() + hf {
         return None;
     }
     let d = profile.deduct_kbps();
-    Some((d, total_kbps - d - HF_TRACK_KBPS, HF_TRACK_KBPS))
+    Some((d, total_kbps - d - hf, hf))
 }
 
 /// `SENA_PROFILE` tag value for the two-track layout ("300"/"600").
@@ -172,34 +181,35 @@ mod tests {
     }
     #[test]
     fn accounting3() {
-        assert_eq!(account3(256, Profile::At600), Some((32, 160, 64)));
-        assert_eq!(account3(256, Profile::At300), Some((24, 168, 64)));
-        assert_eq!(account3(320, Profile::At600), Some((32, 224, 64)));
-        assert_eq!(account3(128, Profile::At600), Some((32, 32, 64)));
-        assert_eq!(account3(127, Profile::At600), None);
+        assert_eq!(account3(288, Profile::At600), Some((32, 160, 96)));
+        assert_eq!(account3(288, Profile::At300), Some((24, 168, 96)));
+        assert_eq!(account3(320, Profile::At600), Some((32, 160, 128)));
+        assert_eq!(account3(352, Profile::At600), Some((32, 192, 128)));
+        assert_eq!(account3(159, Profile::At600), None);
+        assert_eq!(account3(160, Profile::At600), Some((32, 32, 96)));
     }
     #[test]
     fn profile_tags() {
         assert_eq!(profile_tag(Profile::At600), "600");
-        assert_eq!(three_track_tag(Profile::At300), "300@15600");
+        assert_eq!(three_track_tag(Profile::At300), "300@12000");
         assert_eq!(parse_profile_tag("600"), Some((Profile::At600, None)));
         assert_eq!(
-            parse_profile_tag("300@15600"),
+            parse_profile_tag("300@12000"),
             Some((Profile::At300, Some(HF_SPLIT_HZ)))
         );
         assert_eq!(
-            parse_profile_tag("600@15600"),
+            parse_profile_tag("600@12000"),
             Some((Profile::At600, Some(HF_SPLIT_HZ)))
         );
-        assert_eq!(parse_profile_tag("600@14400"), None);
+        assert_eq!(parse_profile_tag("600@15600"), None);
         assert_eq!(parse_profile_tag("1200"), None);
         assert_eq!(parse_profile_tag(""), None);
     }
     #[test]
     fn topband_default_tier() {
         assert!(TOPBAND_DEFAULT_RANGE.contains(&192));
-        assert!(TOPBAND_DEFAULT_RANGE.contains(&255));
-        assert!(!TOPBAND_DEFAULT_RANGE.contains(&256));
+        assert!(TOPBAND_DEFAULT_RANGE.contains(&287));
+        assert!(!TOPBAND_DEFAULT_RANGE.contains(&288));
         assert!(!TOPBAND_DEFAULT_RANGE.contains(&191));
     }
     #[test]

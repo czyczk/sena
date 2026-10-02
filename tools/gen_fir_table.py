@@ -9,8 +9,8 @@ subtractive complement taken in the DSP code. The table is frozen source
 Designs:
   FIR_300   8001 taps, cutoff 300 Hz   (transition 0.2*fc = 60 Hz)
   FIR_600   4001 taps, cutoff 600 Hz   (transition 0.2*fc = 120 Hz)
-  FIR_15600 2001 taps, cutoff 15480 Hz (transition 240 Hz, stopband at the
-            Opus b19 edge 15600 Hz, >= ~95 dB there)
+  FIR_12000 2001 taps, cutoff 11880 Hz (transition 240 Hz, stopband at the
+            Opus b19 edge 12000 Hz, >= ~95 dB there)
 
 Usage:
   gen_fir_table.py <name>            print the `pub static` table
@@ -29,7 +29,7 @@ FS = 48000.0
 TABLES = {
     "FIR_300": (8001, 300.0),
     "FIR_600": (4001, 600.0),
-    "FIR_15600": (2001, 15480.0),
+    "FIR_12000": (2001, 11880.0),
 }
 RS_PATH = "crates/sena-dsp/src/fir_tables.rs"
 
