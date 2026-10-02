@@ -89,7 +89,11 @@ pub fn account(total_kbps: u32, profile: Profile) -> Option<(u32, u32)> {
 }
 
 /// Second split point of the three-track layout: the Opus b19/b20 boundary
-/// at 48 kHz / 20 ms frames (bands 19+20 = 12 kHz..20 kHz). The top band is
+/// at 48 kHz / 20 ms frames (bands 19+20 = 12 kHz..20 kHz). This is the
+/// profile number (@12000) AND the SSB carrier - the boundary the decoder
+/// cares about; the FIR cutoff (12120, placing the transition above the
+/// carrier) is an internal design detail and must never leak into the
+/// profile name. The top band is
 /// shifted down by this same frequency (analytic-signal SSB shift) so the
 /// top track codes it as baseband content; at 16 kHz stream rate the 12 kHz
 /// shift exactly fills the 0..8 kHz baseband, and content above 20 kHz is
