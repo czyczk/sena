@@ -24,7 +24,7 @@ fn one_byte_shifted_lf_au_stream_never_panics() {
 
     let mut frames: Vec<Vec<u8>> = Vec::new();
     for b in &demux.blocks {
-        let block = sena_core::es::decode_block(&b.data).unwrap();
+        let block = sena_core::es::decode_block(&b.data, sena_core::MidCodec::Opus).unwrap();
         for au in block.lf {
             frames.push(au.to_vec());
         }
@@ -100,7 +100,7 @@ fn malformed_preroll_config_is_contained_by_sena_decode() {
     // placement): playable [0, 1024) core = 3072 frames at 48 kHz.
     let mut blocks: Vec<Vec<u8>> = demux.blocks[..4].iter().map(|b| b.data.clone()).collect();
     {
-        let parsed = sena_core::es::decode_block(&blocks[0]).unwrap();
+        let parsed = sena_core::es::decode_block(&blocks[0], sena_core::MidCodec::Opus).unwrap();
         let mut au0 = parsed.lf[0].to_vec();
         assert!(au0.len() > 3);
         au0[3] = au0[3].wrapping_sub(1); // 0x22 -> 0x21 triggers the preroll reinit
@@ -126,7 +126,7 @@ fn malformed_preroll_config_is_contained_by_sena_decode() {
     let file = sena_mux::mka::write_sena(
         &cp,
         &sb,
-        &sena_core::es::codec_name(init.profile, init.three_track),
+        &sena_core::es::codec_name(init.profile, init.three_track, init.mid_codec),
         1000,
         3072 * 1_000_000_000 / 48_000,
     );

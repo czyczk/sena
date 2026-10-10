@@ -43,11 +43,18 @@ pub struct EncoderConfig<'a> {
     /// top-octave-only track starves under Opus's content-blind band
     /// allocation, while shifted baseband content is served normally.
     pub three_track: bool,
+    /// Mid-layer codec. `Xhe` = the "xfi" recipe (Fraunhofer IIS xHE-AAC
+    /// CBR 128k at 44.1 kHz via ezcd-cli, [`sena_core::XFI_MID_KBPS`]);
+    /// always three-track.
+    pub mid_codec: sena_core::MidCodec,
     /// Value passed through to the opusenc-senav mid encode as
     /// `AUDIFF_TOPBAND_STEREO` (kbps, unmodified). None = knob off.
     pub topband_kbps: Option<u32>,
     pub exhale: &'a str,
     pub opusenc: &'a str,
+    /// ezcd-cli executable (required when `mid_codec` is `Xhe`): probed as
+    /// `ezcd-cli` then `ezcd-cli-portable` next to senaenc, then on PATH.
+    pub ezcd_cli: Option<&'a str>,
     pub workdir: &'a Path,
     /// Optional gentle HF tilt on the Opus-bound band, percent of the
     /// reference curve (None/0 = off). In the three-track layout the tilt
@@ -248,6 +255,32 @@ pub fn version_ge(a: &str, b: &str) -> bool {
         }
     }
     true
+}
+
+/// ezcd-cli invocation: on WSL (Linux host, Windows .exe payload) file path
+/// arguments must be translated to Windows paths.
+fn cli_path(p: &Path, windows_host: bool) -> Result<String, Error> {
+    if !windows_host {
+        return Ok(p.to_string_lossy().into_owned());
+    }
+    let out = Command::new("wslpath")
+        .arg("-w")
+        .arg(p)
+        .output()
+        .map_err(Error::Io)?;
+    if !out.status.success() {
+        return Err(Error::Subprocess(format!(
+            "wslpath -w {} failed",
+            p.display()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// True when the given tool path is a Windows executable (`.exe`), i.e. on
+/// WSL it needs Windows-style path arguments.
+fn is_windows_exe(path: &str) -> bool {
+    cfg!(windows) || path.to_ascii_lowercase().ends_with(".exe")
 }
 
 /// Run exhale and return its version. `exhale -V` prints the version and
@@ -812,22 +845,77 @@ fn run_codecs(
     // Three-track: it codes mid.wav (600 Hz..12 kHz at 48 kHz) and a
     // second opusenc codes hf.wav (the 12 kHz+ band shifted to baseband,
     // 16 kHz) at the tiered hf nominal (96k below a 320k total, else 128k).
+    // xfi mid: mid.wav is resampled to 44.1 kHz and coded by ezcd-cli
+    // (Fraunhofer IIS xHE-AAC CBR 128k) instead of opusenc.
     let lf_m4a = wd.join("lf.m4a");
     let hf_ogg = wd.join("hf.opus");
     let mid_ogg = wd.join("mid.opus");
+    let mid_m4a = wd.join("mid.m4a");
+    let xhe_mid = cfg.mid_codec == sena_core::MidCodec::Xhe;
+    if xhe_mid && !cfg.three_track {
+        return Err(Error::Format("xhe mid requires the three-track layout".into()));
+    }
     let mut ex = Command::new(cfg.exhale);
     ex.arg(cfg.profile.xhe_preset().to_string())
         .arg(&lf_wav)
         .arg(&lf_m4a);
     let (mid_kbps, rail_kbps) = if cfg.three_track {
-        let (_, mid, hf) = sena_core::account3(cfg.total_kbps, cfg.profile)
-            .ok_or_else(|| Error::Format("total bitrate below the three-track minimum".into()))?;
-        (mid, hf)
+        if xhe_mid {
+            let (_, mid, hf) = sena_core::account3_xfi(cfg.total_kbps, cfg.profile)
+                .ok_or_else(|| Error::Format("total bitrate outside the xfi 256-288k range".into()))?;
+            (mid, hf)
+        } else {
+            let (_, mid, hf) = sena_core::account3(cfg.total_kbps, cfg.profile)
+                .ok_or_else(|| Error::Format("total bitrate below the three-track minimum".into()))?;
+            (mid, hf)
+        }
     } else {
         let (_, mid) = sena_core::account(cfg.total_kbps, cfg.profile)
             .ok_or_else(|| Error::Format("total bitrate below Sena minimum".into()))?;
         (mid, 0)
     };
+    let mut cmds: Vec<(&str, &mut Command)> = vec![("exhale", &mut ex)];
+    // xfi mid: resample the 48 kHz mid band WAV down to 44.1 kHz first
+    // (ezcd-cli is driven with --resample off: the SRC is ours).
+    let mut ezcd = None;
+    if xhe_mid {
+        let ezcd_path = cfg.ezcd_cli.ok_or_else(|| {
+            Error::Format("xfi profile requires ezcd-cli (next to senaenc or on PATH)".into())
+        })?;
+        let (x, ch, rate) = wav::read_f64(&mid_wav)?;
+        if rate != SAMPLE_RATE {
+            return Err(Error::Format(format!("mid.wav is {rate} Hz, expected {SAMPLE_RATE}")));
+        }
+        // Extend with 100 ms of zeros so the resampler tail rings out: the
+        // 1024-sample warmup trim must still leave >= playable coverage
+        // (the LF rail gets the same tail from StreamResampler::finish).
+        let mut xext = x;
+        xext.resize(xext.len() + 4800 * ch, 0.0);
+        let m44 = sena_dsp::Resampler::new(SAMPLE_RATE, sena_core::XFI_MID_RATE).process(&xext, ch);
+        let mid44 = wd.join("mid44.wav");
+        // s16 (like the LF rail): ezcd-cli's f32 WAV path mis-encodes at
+        // 44.1 kHz (ACDX_DeinitCompress rc=4); s16/s24 are fine.
+        wav::write_s16(&mid44, &m44, sena_core::XFI_MID_RATE)?;
+        let win_host = is_windows_exe(ezcd_path);
+        let mid44_arg = cli_path(&mid44, win_host)?;
+        let mid_m4a_arg = cli_path(&mid_m4a, win_host)?;
+        let mut c = Command::new(ezcd_path);
+        c.arg("encode")
+            .arg("--encoder")
+            .arg("xhe-aac-fhg-iis")
+            .arg("--mode")
+            .arg("cbr")
+            .arg("--bitrate")
+            .arg(sena_core::XFI_MID_KBPS.to_string())
+            .arg("--sample-rate")
+            .arg(sena_core::XFI_MID_RATE.to_string())
+            .arg("--resample")
+            .arg("off")
+            .arg("-o")
+            .arg(&mid_m4a_arg)
+            .arg(&mid44_arg);
+        ezcd = Some(c);
+    }
     let mut op = Command::new(cfg.opusenc);
     op.arg("--quiet")
         .arg("--bitrate")
@@ -841,7 +929,11 @@ fn run_codecs(
     if cfg.use_senav {
         apply_senav_env(&mut op, cfg.topband_kbps);
     }
-    let mut cmds: Vec<(&str, &mut Command)> = vec![("exhale", &mut ex), ("opusenc(mid)", &mut op)];
+    if let Some(e) = ezcd.as_mut() {
+        cmds.push(("ezcd-cli(mid)", e));
+    } else {
+        cmds.push(("opusenc(mid)", &mut op));
+    }
     // Three-track top-band encode (A_OPUSHF): the tiered hf nominal
     // (96k/128k); the topband-stereo knob is never armed for it.
     let mut op2 = Command::new(cfg.opusenc);
@@ -874,31 +966,40 @@ fn run_codecs(
     // --- extract packets ---
     st.begin();
     let extracted: Result<_, Error> = (|| {
-        let (hf_head, preskip, hf_packets, hf2_head, hf2_preskip, hf2_packets) = if cfg.three_track
-        {
-            let mid_bytes = std::fs::read(&mid_ogg)?;
-            let (mid_head, mid_preskip, mid_packets) = ogg::extract_opus(&mid_bytes)?;
+        let (mid_head, mid_aus, hf2_head, hf2_preskip, hf2_packets) = if cfg.three_track {
             let top_bytes = std::fs::read(&hf_ogg)?;
             let (top_head, top_preskip, top_packets) = ogg::extract_opus(&top_bytes)?;
-            (
-                mid_head,
-                mid_preskip,
-                mid_packets,
-                top_head,
-                top_preskip,
-                top_packets,
-            )
+            if xhe_mid {
+                let (asc, aus) = extract_m4a(&mid_m4a)?;
+                let rate = m4a_stream_rate(&mid_m4a)?;
+                if rate != sena_core::XFI_MID_RATE {
+                    return Err(Error::Format(format!(
+                        "ezcd-cli mid stream rate {rate}, expected {}",
+                        sena_core::XFI_MID_RATE
+                    )));
+                }
+                (asc, MidStream::Xhe(aus), top_head, top_preskip, top_packets)
+            } else {
+                let mid_bytes = std::fs::read(&mid_ogg)?;
+                let (mid_head, _mid_preskip, mid_packets) = ogg::extract_opus(&mid_bytes)?;
+                (
+                    mid_head,
+                    MidStream::Opus(mid_packets),
+                    top_head,
+                    top_preskip,
+                    top_packets,
+                )
+            }
         } else {
             let ogg_bytes = std::fs::read(&hf_ogg)?;
-            let (head, preskip, packets) = ogg::extract_opus(&ogg_bytes)?;
-            (head, preskip, packets, Vec::new(), 0, Vec::new())
+            let (head, _preskip, packets) = ogg::extract_opus(&ogg_bytes)?;
+            (head, MidStream::Opus(packets), Vec::new(), 0, Vec::new())
         };
         let (lf_asc, lf_aus) = extract_m4a(&lf_m4a)?;
         let lf_stream_rate = m4a_stream_rate(&lf_m4a)?;
         Ok((
-            hf_head,
-            preskip,
-            hf_packets,
+            mid_head,
+            mid_aus,
             hf2_head,
             hf2_preskip,
             hf2_packets,
@@ -909,23 +1010,28 @@ fn run_codecs(
     })();
     end_tick(&mut st.t, &mut st.mux);
     let (
-        hf_head,
-        _preskip,
-        hf_packets,
+        mid_head,
+        mid_stream,
         hf2_head,
-        _hf2_preskip,
+        hf2_preskip,
         hf2_packets,
         lf_asc,
         lf_aus,
         lf_stream_rate,
     ) = extracted?;
 
-    // --- assemble composite ES blocks on the 20 ms mid grid; the audio
+    // --- assemble composite ES blocks on the 20 ms grid; the audio
     // hash (v3) covers the zeroed-hash SENA-INIT blob plus the block
     // payloads. The remaining tail is tiny and measured with the
     // extraction stage (st.mux). ---
     let muxed = (|| {
-        let n_blocks = hf_packets.len() as u64;
+        // Grid length: the Opus mid packet count (Opus mid) or the block
+        // count covering pre-skip + playable (xHE mid, whose AUs do not
+        // align to the 20 ms grid and are placed by playable end like LF).
+        let n_blocks = match &mid_stream {
+            MidStream::Opus(packets) => packets.len() as u64,
+            MidStream::Xhe(_) => es::block_count(playable as u64, hf2_preskip as u32),
+        };
 
         // LF AU k lands in the block containing its last playable sample
         // (by-end placement, clamped to the final block at EOS).
@@ -936,6 +1042,17 @@ fn run_codecs(
                 .entry(es::lf_block(k as u64, lf_stream_rate, n_blocks))
                 .or_default()
                 .push((k as u32, au));
+        }
+        // xHE mid AUs land by the same by-end rule at 44.1 kHz.
+        let mut mid_by_block: std::collections::BTreeMap<u64, Vec<(u32, &[u8])>> =
+            Default::default();
+        if let MidStream::Xhe(aus) = &mid_stream {
+            for (k, au) in aus.iter().enumerate() {
+                mid_by_block
+                    .entry(es::xhe_block(k as u64, sena_core::XFI_MID_RATE, n_blocks))
+                    .or_default()
+                    .push((k as u32, au));
+            }
         }
         // Top-layer packet j lands in block j (clamped to the final block).
         let mut hf2_by_block: std::collections::BTreeMap<u64, Vec<&[u8]>> = Default::default();
@@ -956,24 +1073,38 @@ fn run_codecs(
                 None => (0, Vec::new()),
             };
             let hf: Vec<&[u8]> = hf2_by_block.remove(&i).unwrap_or_default();
+            let mid = match &mid_stream {
+                MidStream::Opus(packets) => es::MidSection::Opus(&packets[i as usize]),
+                MidStream::Xhe(_) => match mid_by_block.remove(&i) {
+                    Some(v) => es::MidSection::Xhe {
+                        au_index: v[0].0,
+                        aus: v.iter().map(|e| e.1).collect(),
+                    },
+                    None => es::MidSection::Xhe {
+                        au_index: 0,
+                        aus: Vec::new(),
+                    },
+                },
+            };
             payloads.push(es::encode_block(&es::BlockParts {
-                mid: &hf_packets[i as usize],
+                mid,
                 lf: (lf.0, &lf.1),
                 hf: &hf,
             }));
         }
-        if !lf_by_block.is_empty() || !hf2_by_block.is_empty() {
+        if !lf_by_block.is_empty() || !hf2_by_block.is_empty() || !mid_by_block.is_empty() {
             return Err(Error::Format("layer packet outside the mid grid".into()));
         }
 
         let mut init = es::Init {
             profile: cfg.profile,
             three_track: cfg.three_track,
+            mid_codec: cfg.mid_codec,
             lf_rate: lf_stream_rate,
             playable_samples: playable as u64,
             audio_sha256: [0; 32],
             lf_asc: lf_asc.clone(),
-            opus_head: hf_head.to_vec(),
+            mid_head: mid_head.to_vec(),
             hf_head: if cfg.three_track {
                 Some(hf2_head.clone())
             } else {
@@ -998,7 +1129,7 @@ fn run_codecs(
         let mka_bytes = mka::write_sena(
             &codec_private,
             &blocks,
-            &es::codec_name(cfg.profile, cfg.three_track),
+            &es::codec_name(cfg.profile, cfg.three_track, cfg.mid_codec),
             1000,
             playable_ns,
         );
@@ -1006,6 +1137,13 @@ fn run_codecs(
         Ok::<(), Error>(())
     })();
     muxed
+}
+
+/// Extracted mid-layer stream: Opus packets (the block grid) or xHE-AAC
+/// AUs (by-end placement at 44.1 kHz).
+enum MidStream {
+    Opus(Vec<Vec<u8>>),
+    Xhe(Vec<Vec<u8>>),
 }
 
 /// SenaV tuning knobs shared by every opusenc-senav invocation; the
@@ -1434,9 +1572,11 @@ mod tests {
             total_kbps: 160,
             use_senav: false,
             three_track: false,
+            mid_codec: sena_core::MidCodec::Opus,
             topband_kbps: None,
             exhale: "/nonexistent/exhale",
             opusenc: "/nonexistent/opusenc",
+            ezcd_cli: None,
             workdir: &wd,
             hf_tilt_pct: None,
         };
@@ -1492,9 +1632,11 @@ mod tests {
             total_kbps: 160,
             use_senav: false,
             three_track: false,
+            mid_codec: sena_core::MidCodec::Opus,
             topband_kbps: None,
             exhale: "/nonexistent/exhale",
             opusenc: "/nonexistent/opusenc",
+            ezcd_cli: None,
             workdir: &wd,
             hf_tilt_pct: Some(100.0),
         };
@@ -1737,9 +1879,11 @@ mod tests {
             total_kbps: 256,
             use_senav: false,
             three_track: true,
+            mid_codec: sena_core::MidCodec::Opus,
             topband_kbps: None,
             exhale: "/nonexistent/exhale",
             opusenc: "/nonexistent/opusenc",
+            ezcd_cli: None,
             workdir: &wd,
             hf_tilt_pct: None,
         };

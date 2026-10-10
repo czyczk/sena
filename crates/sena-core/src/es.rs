@@ -14,18 +14,27 @@ pub const SENA_CODEC_ID: &str = "A_MS/ACM";
 
 /// Display/codec name of the format: `Sena xAAC-Opus@<lf crossover>` for the
 /// two-layer layout, `Sena xAAC-Opus@<lf crossover>-Opus@12000` when the
-/// top-band Opus layer (three-layer layout) rides along.
-pub fn codec_name(profile: crate::Profile, three_track: bool) -> String {
+/// top-band Opus layer (three-layer layout) rides along; an xHE-AAC mid
+/// layer (v3) reads `xAAC-xAAC@...`.
+pub fn codec_name(profile: crate::Profile, three_track: bool, mid: crate::MidCodec) -> String {
     let lf = profile.crossover_hz() as u32;
+    let mid_name = match mid {
+        crate::MidCodec::Opus => "Opus",
+        crate::MidCodec::Xhe => "xAAC",
+    };
     if three_track {
         let hf = crate::HF_SPLIT_HZ as u32;
-        format!("Sena xAAC-Opus@{lf}-Opus@{hf}")
+        format!("Sena xAAC-{mid_name}@{lf}-Opus@{hf}")
     } else {
-        format!("Sena xAAC-Opus@{lf}")
+        format!("Sena xAAC-{mid_name}@{lf}")
     }
 }
 pub const ES_MAGIC: [u8; 4] = *b"SEN2";
-pub const ES_VERSION: u16 = 2;
+/// Current ES version: v3 adds the mid-codec byte to SENA-INIT and the
+/// counted-AU mid block section used by an xHE-AAC mid layer. v2 files
+/// (Opus mid implied) remain decodable.
+pub const ES_VERSION: u16 = 3;
+pub const ES_VERSION_MIN: u16 = 2;
 pub const CHANNELS: u16 = 2;
 pub const BITS_PER_SAMPLE: u16 = 32;
 
@@ -47,6 +56,7 @@ pub enum EsError {
     BadMagic,
     UnsupportedVersion(u16),
     BadProfile(u8),
+    BadMidCodec,
     LfRateMismatch,
     HeadMismatch,
     Truncated,
@@ -61,6 +71,7 @@ impl core::fmt::Display for EsError {
             EsError::BadMagic => write!(f, "bad SENA-INIT magic"),
             EsError::UnsupportedVersion(v) => write!(f, "unsupported ES version {v}"),
             EsError::BadProfile(p) => write!(f, "bad profile {p}"),
+            EsError::BadMidCodec => write!(f, "bad mid codec"),
             EsError::LfRateMismatch => write!(f, "lf_rate does not match profile"),
             EsError::HeadMismatch => write!(f, "three-track flag/head mismatch"),
             EsError::Truncated => write!(f, "truncated data"),
@@ -78,13 +89,16 @@ impl core::fmt::Display for EsError {
 pub struct Init {
     pub profile: Profile,
     pub three_track: bool,
+    /// Mid-layer codec (v3+; v2 files imply Opus).
+    pub mid_codec: crate::MidCodec,
     pub lf_rate: u32,
     pub playable_samples: u64,
     pub audio_sha256: [u8; 32],
-    /// xHE-AAC AudioSpecificConfig.
+    /// LF xHE-AAC AudioSpecificConfig.
     pub lf_asc: Vec<u8>,
-    /// Mid-layer OpusHead.
-    pub opus_head: Vec<u8>,
+    /// Mid-layer head: OpusHead (Opus mid) or xHE-AAC AudioSpecificConfig
+    /// (xHE mid).
+    pub mid_head: Vec<u8>,
     /// Top-layer OpusHead (three-track only).
     pub hf_head: Option<Vec<u8>>,
 }
@@ -99,11 +113,12 @@ impl Init {
             Profile::At600 => 1,
         });
         b.push(if self.three_track { 1 } else { 0 });
+        b.push(self.mid_codec.to_byte());
         b.extend_from_slice(&self.lf_rate.to_le_bytes());
         b.extend_from_slice(&self.playable_samples.to_le_bytes());
         b.extend_from_slice(&self.audio_sha256);
         push16(&mut b, &self.lf_asc);
-        push16(&mut b, &self.opus_head);
+        push16(&mut b, &self.mid_head);
         if let Some(hf) = &self.hf_head {
             push16(&mut b, hf);
         }
@@ -123,7 +138,7 @@ impl Init {
             return Err(EsError::BadMagic);
         }
         let version = u16::from_le_bytes(take(&mut b, 2)?.try_into().unwrap());
-        if version != ES_VERSION {
+        if !(ES_VERSION_MIN..=ES_VERSION).contains(&version) {
             return Err(EsError::UnsupportedVersion(version));
         }
         let profile = match take(&mut b, 1)?[0] {
@@ -132,6 +147,11 @@ impl Init {
             p => return Err(EsError::BadProfile(p)),
         };
         let three_track = take(&mut b, 1)?[0] & 1 != 0;
+        let mid_codec = if version >= 3 {
+            crate::MidCodec::from_byte(take(&mut b, 1)?[0]).ok_or(EsError::BadMidCodec)?
+        } else {
+            crate::MidCodec::Opus
+        };
         let lf_rate = u32::from_le_bytes(take(&mut b, 4)?.try_into().unwrap());
         if lf_rate != profile.lf_rate() {
             return Err(EsError::LfRateMismatch);
@@ -139,7 +159,7 @@ impl Init {
         let playable_samples = u64::from_le_bytes(take(&mut b, 8)?.try_into().unwrap());
         let audio_sha256: [u8; 32] = take(&mut b, 32)?.try_into().unwrap();
         let lf_asc = take16(&mut b)?.to_vec();
-        let opus_head = take16(&mut b)?.to_vec();
+        let mid_head = take16(&mut b)?.to_vec();
         let hf_head = if three_track {
             Some(take16(&mut b)?.to_vec())
         } else {
@@ -154,11 +174,12 @@ impl Init {
         Ok(Init {
             profile,
             three_track,
+            mid_codec,
             lf_rate,
             playable_samples,
             audio_sha256,
             lf_asc,
-            opus_head,
+            mid_head,
             hf_head,
         })
     }
@@ -223,6 +244,26 @@ pub fn lf_au_frames_48k(lf_rate: u32) -> u64 {
     1024 * SAMPLE_RATE as u64 / lf_rate as u64
 }
 
+/// 48 kHz frame index of the end of xHE-AAC AU `k`'s playable coverage
+/// (exact rational floor): AU k (k >= 1) covers playable [(k-1)*1024,
+/// k*1024) samples at `rate`. Unlike [`lf_au_frames_48k`] this is exact at
+/// any rate, including 44100 (which does not divide 48 kHz).
+pub fn xhe_au_end48(k: u64, rate: u32) -> u64 {
+    k * 1024 * SAMPLE_RATE as u64 / rate as u64
+}
+
+/// Composite block index carrying xHE-AAC AU `k` at any stream rate: by-end
+/// placement (the block containing the AU's last playable sample), AU 0
+/// (warmup) in block 0, clamped to the final block.
+pub fn xhe_block(k: u64, rate: u32, n_blocks: u64) -> u64 {
+    let b = if k == 0 {
+        0
+    } else {
+        (xhe_au_end48(k, rate) - 1) / BLOCK_FRAMES
+    };
+    b.min(n_blocks.saturating_sub(1))
+}
+
 /// Composite block index carrying LF AU `k` on a grid of `n_blocks`: the
 /// block containing the AU's last playable sample (AU 0 is warmup and maps
 /// to block 0), clamped to the final block. AU k >= 1 covers playable
@@ -230,12 +271,7 @@ pub fn lf_au_frames_48k(lf_rate: u32) -> u64 {
 /// covering any mid-stream block boundary inside that block, so a cold
 /// start there has no LF hole.
 pub fn lf_block(k: u64, lf_rate: u32, n_blocks: u64) -> u64 {
-    let b = if k == 0 {
-        0
-    } else {
-        (k * lf_au_frames_48k(lf_rate) - 1) / BLOCK_FRAMES
-    };
-    b.min(n_blocks.saturating_sub(1))
+    xhe_block(k, lf_rate, n_blocks)
 }
 
 /// Composite block index carrying top-layer packet `j`: by-end placement
@@ -251,19 +287,30 @@ pub fn block_count(playable_samples: u64, mid_pre_skip: u32) -> u64 {
     (playable_samples + mid_pre_skip as u64).div_ceil(BLOCK_FRAMES)
 }
 
+/// Mid-layer payload of one composite block. Opus mid: exactly one packet
+/// per block (the block grid IS the mid Opus packet grid). xHE mid (v3):
+/// a counted AU list with the absolute AU index of the first AU, placed by
+/// the same by-end rule as the LF layer (AUs are 23.22 ms at 44.1 kHz and
+/// do not align to the 20 ms block grid).
+#[derive(Debug, Clone)]
+pub enum MidSection<'a> {
+    Opus(&'a [u8]),
+    Xhe { au_index: u32, aus: Vec<&'a [u8]> },
+}
+
 /// Decoded view of one composite block.
 #[derive(Debug, Clone)]
 pub struct Block<'a> {
-    pub mid: &'a [u8],
+    pub mid: MidSection<'a>,
     /// Absolute AU index of the first LF AU (present iff lf is non-empty).
     pub lf_au_index: Option<u32>,
     pub lf: Vec<&'a [u8]>,
     pub hf: Vec<&'a [u8]>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct BlockParts<'a> {
-    pub mid: &'a [u8],
+    pub mid: MidSection<'a>,
     /// (au_index of the first, AUs in order); au_index is ignored when the
     /// AU list is empty.
     pub lf: (u32, &'a [&'a [u8]]),
@@ -273,8 +320,22 @@ pub struct BlockParts<'a> {
 pub fn encode_block(p: &BlockParts) -> Vec<u8> {
     let mut b = Vec::new();
     b.push(FLAG_RESERVED);
-    b.extend_from_slice(&(p.mid.len() as u16).to_le_bytes());
-    b.extend_from_slice(p.mid);
+    match &p.mid {
+        MidSection::Opus(pkt) => {
+            b.extend_from_slice(&(pkt.len() as u16).to_le_bytes());
+            b.extend_from_slice(pkt);
+        }
+        MidSection::Xhe { au_index, aus } => {
+            b.push(aus.len() as u8);
+            if !aus.is_empty() {
+                b.extend_from_slice(&au_index.to_le_bytes()[..3]);
+                for au in aus {
+                    b.extend_from_slice(&(au.len() as u32).to_le_bytes()[..3]);
+                    b.extend_from_slice(au);
+                }
+            }
+        }
+    }
     let (au_index, aus) = p.lf;
     b.push(aus.len() as u8);
     if !aus.is_empty() {
@@ -292,16 +353,39 @@ pub fn encode_block(p: &BlockParts) -> Vec<u8> {
     b
 }
 
-pub fn decode_block(mut b: &[u8]) -> Result<Block<'_>, EsError> {
+pub fn decode_block(mut b: &[u8], mid_codec: crate::MidCodec) -> Result<Block<'_>, EsError> {
     let flags = take(&mut b, 1)?[0];
     if flags != 0 {
         return Err(EsError::BadBlock("unknown flag bits"));
     }
-    let mid_len = u16::from_le_bytes(take(&mut b, 2)?.try_into().unwrap()) as usize;
-    let mid = take(&mut b, mid_len)?;
-    if mid.is_empty() {
-        return Err(EsError::BadBlock("empty mid frame"));
-    }
+    let mid = match mid_codec {
+        crate::MidCodec::Opus => {
+            let mid_len = u16::from_le_bytes(take(&mut b, 2)?.try_into().unwrap()) as usize;
+            let pkt = take(&mut b, mid_len)?;
+            if pkt.is_empty() {
+                return Err(EsError::BadBlock("empty mid frame"));
+            }
+            MidSection::Opus(pkt)
+        }
+        crate::MidCodec::Xhe => {
+            let count = take(&mut b, 1)?[0] as usize;
+            let au_index = if count > 0 {
+                let mut i3 = [0u8; 4];
+                i3[..3].copy_from_slice(take(&mut b, 3)?);
+                u32::from_le_bytes(i3)
+            } else {
+                0
+            };
+            let mut aus = Vec::with_capacity(count);
+            for _ in 0..count {
+                let mut l3 = [0u8; 4];
+                l3[..3].copy_from_slice(take(&mut b, 3)?);
+                let n = u32::from_le_bytes(l3) as usize;
+                aus.push(take(&mut b, n)?);
+            }
+            MidSection::Xhe { au_index, aus }
+        }
+    };
     let lf_count = take(&mut b, 1)?[0] as usize;
     let lf_au_index = if lf_count > 0 {
         let mut i3 = [0u8; 4];
@@ -348,11 +432,12 @@ mod tests {
         Init {
             profile: Profile::At600,
             three_track: three,
+            mid_codec: crate::MidCodec::Opus,
             lf_rate: 32000,
             playable_samples: 960_000,
             audio_sha256: [0xAB; 32],
             lf_asc: vec![1, 2, 3, 4, 5],
-            opus_head: b"OpusHead\x01\x02\x00\x38\x01\x00\x00\x00\x00".to_vec(),
+            mid_head: b"OpusHead\x01\x02\x00\x38\x01\x00\x00\x00\x00".to_vec(),
             hf_head: three.then(|| b"OpusHead\x01\x02\x00\x38\x01\x80\xBB\x00\x00".to_vec()),
         }
     }
@@ -379,13 +464,32 @@ mod tests {
         b[6] = 7;
         assert!(matches!(Init::decode(&b), Err(EsError::BadProfile(7))));
         let mut b = init.encode();
-        b[8..12].copy_from_slice(&16000u32.to_le_bytes());
+        b[8] = 9;
+        assert!(matches!(Init::decode(&b), Err(EsError::BadMidCodec)));
+        let mut b = init.encode();
+        b[9..13].copy_from_slice(&16000u32.to_le_bytes());
         assert!(matches!(Init::decode(&b), Err(EsError::LfRateMismatch)));
         let mut b = init.encode();
         b.push(0);
         assert!(matches!(Init::decode(&b), Err(EsError::Overlong)));
         let b = &init.encode()[..10];
         assert!(matches!(Init::decode(b), Err(EsError::Truncated)));
+    }
+
+    #[test]
+    fn init_v2_decodes_as_opus_mid() {
+        // Hand-encode a v2 INIT (no mid-codec byte): still accepted, mid
+        // codec implied Opus.
+        let i3 = sample_init(true).encode();
+        let mut v2 = Vec::new();
+        v2.extend_from_slice(&i3[..6]); // magic, version
+        v2[4] = 2;
+        v2.push(i3[6]); // profile
+        v2.push(i3[7]); // three_track
+        v2.extend_from_slice(&i3[9..]); // skip the v3 mid-codec byte
+        let d = Init::decode(&v2).unwrap();
+        assert_eq!(d.mid_codec, crate::MidCodec::Opus);
+        assert!(d.three_track);
     }
 
     #[test]
@@ -407,15 +511,31 @@ mod tests {
         let empty_lf: &[&[u8]] = &[];
         let empty_hf: &[&[u8]] = &[];
         let cases: Vec<BlockParts> = vec![
-            BlockParts { mid: b"mid", lf: (0, empty_lf), hf: empty_hf },
-            BlockParts { mid: b"mid", lf: (42, &[b"lfau"]), hf: empty_hf },
-            BlockParts { mid: b"mid", lf: (0, &[b"lf0", b"lf1"]), hf: &[b"h0", b"h1"] },
-            BlockParts { mid: b"mid", lf: (0, empty_lf), hf: &[b"hf"] },
+            BlockParts { mid: MidSection::Opus(b"mid"), lf: (0, empty_lf), hf: empty_hf },
+            BlockParts { mid: MidSection::Opus(b"mid"), lf: (42, &[b"lfau"]), hf: empty_hf },
+            BlockParts { mid: MidSection::Opus(b"mid"), lf: (0, &[b"lf0", b"lf1"]), hf: &[b"h0", b"h1"] },
+            BlockParts { mid: MidSection::Opus(b"mid"), lf: (0, empty_lf), hf: &[b"hf"] },
+            BlockParts { mid: MidSection::Xhe { au_index: 7, aus: vec![b"m0", b"m1"] }, lf: (0, empty_lf), hf: empty_hf },
+            BlockParts { mid: MidSection::Xhe { au_index: 0, aus: vec![] }, lf: (3, &[b"lf"]), hf: &[b"h"] },
         ];
         for p in cases {
+            let codec = match &p.mid {
+                MidSection::Opus(_) => crate::MidCodec::Opus,
+                MidSection::Xhe { .. } => crate::MidCodec::Xhe,
+            };
             let b = encode_block(&p);
-            let d = decode_block(&b).unwrap();
-            assert_eq!(d.mid, p.mid);
+            let d = decode_block(&b, codec).unwrap();
+            match (&d.mid, &p.mid) {
+                (MidSection::Opus(a), MidSection::Opus(b)) => assert_eq!(a, b),
+                (
+                    MidSection::Xhe { au_index: a1, aus: u1 },
+                    MidSection::Xhe { au_index: a2, aus: u2 },
+                ) => {
+                    assert_eq!(a1, a2);
+                    assert_eq!(u1, u2);
+                }
+                _ => panic!("mid section kind mismatch"),
+            }
             assert_eq!(d.lf, p.lf.1);
             assert_eq!(d.hf, p.hf);
             assert_eq!(
@@ -427,26 +547,28 @@ mod tests {
 
     #[test]
     fn block_rejects() {
-        assert!(decode_block(&[]).is_err());
+        assert!(decode_block(&[], crate::MidCodec::Opus).is_err());
         // unknown flag
         assert!(matches!(
-            decode_block(&[0x80, 1, 0, b'x', 0, 0]),
+            decode_block(&[0x80, 1, 0, b'x', 0, 0], crate::MidCodec::Opus),
             Err(EsError::BadBlock(_))
         ));
         // empty mid
         assert!(matches!(
-            decode_block(&[0, 0, 0, 0, 0]),
+            decode_block(&[0, 0, 0, 0, 0], crate::MidCodec::Opus),
             Err(EsError::BadBlock("empty mid frame"))
         ));
         // trailing byte
         assert!(matches!(
-            decode_block(&[0, 1, 0, b'x', 0, 0, 0]),
+            decode_block(&[0, 1, 0, b'x', 0, 0, 0], crate::MidCodec::Opus),
             Err(EsError::Overlong)
         ));
         // truncated mid
-        assert!(decode_block(&[0, 5, 0, b'x']).is_err());
+        assert!(decode_block(&[0, 5, 0, b'x'], crate::MidCodec::Opus).is_err());
         // lf section truncated
-        assert!(decode_block(&[0, 1, 0, b'x', 1, 0, 0]).is_err());
+        assert!(decode_block(&[0, 1, 0, b'x', 1, 0, 0], crate::MidCodec::Opus).is_err());
+        // xhe mid section truncated
+        assert!(decode_block(&[0, 1, 7, 0, 0], crate::MidCodec::Xhe).is_err());
     }
 
     #[test]

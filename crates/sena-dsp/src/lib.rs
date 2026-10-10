@@ -246,6 +246,13 @@ impl Resampler {
         (input_frames * self.n + self.m / 2) / self.m
     }
 
+    /// The interpolation factor n of the n/m ratio: a windowed consumer
+    /// keeping chunk sizes on this output grid preserves the whole-file
+    /// phase grid across window boundaries.
+    pub fn phases(&self) -> usize {
+        self.n
+    }
+
     /// The decimation factor m of the n/m ratio: a windowed consumer that
     /// drains consumed input frames must keep the window start on this grid
     /// (drain multiples of m), or later outputs shift by a fraction of a

@@ -146,6 +146,7 @@ fn run() -> Result<(), String> {
                 sena_core::Profile::from_crossover(info.profile as f64)
                     .expect("profile number"),
                 info.three_track,
+                info.mid_codec,
             ),
             info.sena_version,
             info.sample_rate,
@@ -169,6 +170,7 @@ fn run() -> Result<(), String> {
         sena_core::es::codec_name(
             sena_core::Profile::from_crossover(info.profile as f64).expect("profile number"),
             info.three_track,
+            info.mid_codec,
         ),
         info.sena_version,
         info.sample_rate,

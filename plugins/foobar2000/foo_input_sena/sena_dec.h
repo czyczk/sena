@@ -54,6 +54,7 @@ typedef struct {
        average-bitrate displays must use this, not the raw file size. */
     uint64_t audio_span_bytes;
     uint32_t three_track; /* nonzero = three-layer layout (12 kHz+ top band) */
+    uint32_t mid_codec;
 } SenaDecInfo;
 
 typedef struct {

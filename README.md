@@ -17,8 +17,15 @@ Workspace crates:
 ## senaenc command line
 
 ```text
-senaenc [--profile 300|600] [--opus-original|--opus-senav] [--bypass-recommendations] <bitrate_kbps> <in.wav|-> <out.sena>
+senaenc [--profile 300o|600o|300xfi|600xfi] [--opus-original|--opus-senav] [--bypass-recommendations] <bitrate_kbps> <in.wav|-> <out.sena>
 ```
+
+Profile names follow `<lf split Hz><mid codec>`: `300o`/`600o` = Opus mid
+(bare `300`/`600` still accepted); `300xfi`/`600xfi` = the "xfi" family:
+Fraunhofer-IIS xHE-AAC CBR 128k @ 44.1 kHz mid (via ezcd-cli), always the
+three-track layout, nominal totals 256-288k only (everything above 256k
+feeds the top band: 96k at 256k .. 128k at 288k). The LF rail (exhale) is
+identical in both families.
 
 - `<bitrate_kbps>`: total Sena bitrate. Hard minimum: 64k for @600, 56k for
   @300 (the xHE-AAC allotment plus a 32k Opus floor); lower requests are
@@ -41,6 +48,10 @@ senaenc [--profile 300|600] [--opus-original|--opus-senav] [--bypass-recommendat
   - `opusenc[.exe]` >= 1.6.1 (used for <= 192 kbit/s by default)
   - `opusenc-senav[.exe]` (used for > 192 kbit/s by default; version output
     contains `Opus SenaV`)
+  - `ezcd-cli[.exe]` or `ezcd-cli-portable[.exe]` (xfi profiles only;
+    provides the Fraunhofer IIS xHE-AAC encoder. Windows binary: on WSL it
+    runs through interop; file-path arguments are translated with
+    `wslpath`)
 
 `exhale[.exe]` / `opusenc[.exe]` must be named with the platform extension
 (`exhale.exe` on Windows); the lookup probes the directory of
@@ -87,15 +98,23 @@ encoder entry:
 |---|---|
 | Encoder file | full path to `senaenc.exe` |
 | Extension | `sena` |
-| Parameters | `--profile 300 --opus-original 160 - %d` |
+| Parameters | `--profile 300o --opus-original 160 - %d` |
 | Format is | lossy |
 | Highest BPS mode supported | 32 |
 
 For the 600 Hz profile:
 
 ```text
---profile 600 --opus-original 160 - %d
+--profile 600o --opus-original 160 - %d
 ```
+
+For an xfi (Fraunhofer-IIS mid) three-track preset:
+
+```text
+--profile 600xfi 256 - %d
+```
+
+
 
 Notes:
 

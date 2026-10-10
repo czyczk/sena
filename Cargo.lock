@@ -193,6 +193,7 @@ dependencies = [
  "rxaac-dec-lib",
  "sena-core",
  "sena-dsp",
+ "sena-enc",
  "sena-mux",
  "sha2",
 ]

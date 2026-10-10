@@ -575,6 +575,12 @@ pub struct BlockRef {
     /// First payload byte of each LF AU (the USAC independency flag lives
     /// in bit 7); the first `lf_count` entries are valid.
     pub lf_first: [u8; 4],
+    /// xHE mid (v3): absolute AU index of the first mid AU in the block.
+    pub mx_au_index: Option<u32>,
+    /// Number of mid AUs in the block (0..=8).
+    pub mx_count: u8,
+    /// First payload byte of each mid AU (independency flags).
+    pub mx_first: [u8; 4],
 }
 
 /// Container metadata + block index produced by [`index_container`].
@@ -686,63 +692,117 @@ fn read_elem_w<R: FnMut(u64, usize) -> Result<Vec<u8>, String>>(
 /// ES block header metadata for the index: read the composite block header
 /// just far enough to locate the LF section, without copying payload bodies.
 /// `get` reads at absolute file offsets. Layout: flags(1) mid_len(2) mid,
-/// lf_count(1) au_index(3), then per AU: len(3) + payload.
+/// lf_count(1) au_index(3), then per AU: len(3) + payload. xHE mid (v3):
+/// flags(1) count(1) au_index(3) [len(3) + payload]*, same as the LF form.
+#[allow(clippy::too_many_arguments)]
 fn es_block_meta<R: FnMut(u64, usize) -> Result<Vec<u8>, String>>(
     get: &mut R,
     offset: u64,
     len: u64,
-) -> Result<(Option<u32>, u8, [u8; 4]), String> {
+    xhe_mid: bool,
+) -> Result<BlockMeta, String> {
     let head = get(offset, len.min(3) as usize)?;
     if head.len() < 3 {
         return Err("malformed container: composite block header truncated".into());
     }
-    let mid_len = u16::from_le_bytes(head[1..3].try_into().unwrap()) as u64;
-    if 3 + mid_len + 1 > len {
-        return Err("malformed container: mid section overruns its block".into());
-    }
-    let lf_off = offset + 3 + mid_len;
-    let avail = len - 3 - mid_len;
+    let (lf_off, avail, mx_au_index, mx_count, mx_first) = if xhe_mid {
+        // mid section: flags(1) then count(1) au_index(3) [len(3) + payload]*
+        let (mx_au_index, mx_count, mx_first, rel) =
+            au_list_meta(get, offset + 1, len - 1, 8, "mid")?;
+        (offset + 1 + rel, len - 1 - rel, mx_au_index, mx_count, mx_first)
+    } else {
+        let mid_len = u16::from_le_bytes(head[1..3].try_into().unwrap()) as u64;
+        if 3 + mid_len + 1 > len {
+            return Err("malformed container: mid section overruns its block".into());
+        }
+        (offset + 3 + mid_len, len - 3 - mid_len, None, 0, [0; 4])
+    };
     let head1 = get(lf_off, avail.min(1) as usize)?;
     if head1.is_empty() {
         return Err("malformed container: LF count truncated".into());
     }
     let lf_count = head1[0];
-    if lf_count == 0 {
-        return Ok((None, 0, [0; 4]));
+    let (au_index, _, first, _) = if lf_count == 0 {
+        (None, 0, [0; 4], 1u64)
+    } else {
+        let (ai, c, f, rel) = au_list_meta(get, lf_off, avail, 4, "LF")?;
+        (ai, c, f, rel)
+    };
+    let _ = lf_count;
+    Ok(BlockMeta {
+        lf_au_index: au_index,
+        lf_count,
+        lf_first: first,
+        mx_au_index,
+        mx_count,
+        mx_first,
+    })
+}
+
+/// Index metadata of one block (see BlockRef).
+struct BlockMeta {
+    lf_au_index: Option<u32>,
+    lf_count: u8,
+    lf_first: [u8; 4],
+    mx_au_index: Option<u32>,
+    mx_count: u8,
+    mx_first: [u8; 4],
+}
+
+/// Parse a counted AU list section: count(1) au_index(3) [len(3) +
+/// payload]*. Returns (first au_index, count, first payload bytes (up to
+/// 4), section length in bytes). `max_count` is the sanity bound.
+fn au_list_meta<R: FnMut(u64, usize) -> Result<Vec<u8>, String>>(
+    get: &mut R,
+    off: u64,
+    avail: u64,
+    max_count: u8,
+    what: &str,
+) -> Result<(Option<u32>, u8, [u8; 4], u64), String> {
+    let head1 = get(off, avail.min(1) as usize)?;
+    if head1.is_empty() {
+        return Err(format!("malformed container: {what} count truncated"));
     }
-    if lf_count > 4 {
-        return Err("malformed container: LF AU count exceeds sanity bound".into());
+    let count = head1[0];
+    if count == 0 {
+        return Ok((None, 0, [0; 4], 1));
     }
-    let idx = get(lf_off + 1, 3)?;
+    if count > max_count {
+        return Err(format!("malformed container: {what} AU count exceeds sanity bound"));
+    }
+    let idx = get(off + 1, 3)?;
     if idx.len() < 3 {
-        return Err("malformed container: LF au_index truncated".into());
+        return Err(format!("malformed container: {what} au_index truncated"));
     }
     let mut i3 = [0u8; 4];
     i3[..3].copy_from_slice(&idx);
     let au_index = u32::from_le_bytes(i3);
     let mut first = [0u8; 4];
     let mut rel = 4u64; // past count + au_index
-    for i in 0..lf_count as usize {
-        let h = get(lf_off + rel, 4u64.min(avail.saturating_sub(rel)) as usize)?;
+    for i in 0..count as usize {
+        let h = get(off + rel, 4u64.min(avail.saturating_sub(rel)) as usize)?;
         if h.len() < 4 {
-            return Err("malformed container: LF AU header truncated".into());
+            return Err(format!("malformed container: {what} AU header truncated"));
         }
         let mut l3 = [0u8; 4];
         l3[..3].copy_from_slice(&h[..3]);
         let au_len = u32::from_le_bytes(l3) as u64;
-        first[i] = h[3];
+        if i < 4 {
+            first[i] = h[3];
+        }
         rel += 3 + au_len;
         if rel > avail {
-            return Err("malformed container: LF AU overruns its block".into());
+            return Err(format!("malformed container: {what} AU overruns its block"));
         }
     }
-    Ok((Some(au_index), lf_count, first))
+    Ok((Some(au_index), count, first, rel))
 }
 
 fn walk_cluster_w<R: FnMut(u64, usize) -> Result<Vec<u8>, String>>(
     w: &mut Window<R>,
     cluster: &RawElem,
     blocks: &mut Vec<BlockRef>,
+    xhe_mid: bool,
 ) -> Result<(), String> {
     let mut cluster_t = 0u64;
     let mut p = cluster.data_start;
@@ -778,8 +838,8 @@ fn walk_cluster_w<R: FnMut(u64, usize) -> Result<Vec<u8>, String>>(
                 ));
             }
             let payload_off = e.data_start + header_len as u64;
-            let (au_index, lf_count, lf_first) =
-                es_block_meta(&mut |pos, len| w.get(pos, len), payload_off, body_len)?;
+            let meta =
+                es_block_meta(&mut |pos, len| w.get(pos, len), payload_off, body_len, xhe_mid)?;
             // Sign-extending cast (see parse_simple_block).
             let rel = rel as u64;
             let t_ns = cluster_t
@@ -789,9 +849,12 @@ fn walk_cluster_w<R: FnMut(u64, usize) -> Result<Vec<u8>, String>>(
                 t_ns,
                 offset: payload_off,
                 len: body_len as u32,
-                au_index,
-                lf_count,
-                lf_first,
+                au_index: meta.lf_au_index,
+                lf_count: meta.lf_count,
+                lf_first: meta.lf_first,
+                mx_au_index: meta.mx_au_index,
+                mx_count: meta.mx_count,
+                mx_first: meta.mx_first,
             });
             if blocks.len() > MAX_INDEX_FRAMES {
                 return Err(format!(
@@ -841,6 +904,9 @@ pub fn index_container<R: FnMut(u64, usize) -> Result<Vec<u8>, String>>(
     let mut blocks = Vec::new();
     let mut tracks_end = 0u64;
     let mut audio_span_bytes = 0u64;
+    // xHE mid (ES v3) flips the block header layout; known once Tracks has
+    // been parsed (Tracks always precedes Clusters in our writer).
+    let mut xhe_mid = false;
     let mut p = segment.data_start;
     while p < segment.data_end {
         let e = read_elem_w(&mut w, p)?;
@@ -885,7 +951,11 @@ pub fn index_container<R: FnMut(u64, usize) -> Result<Vec<u8>, String>>(
         } else if e.id == CLUSTER_ID {
             audio_span_bytes += e.data_end - e.start;
             if want_blocks {
-                walk_cluster_w(&mut w, &e, &mut blocks)?;
+                if !tracks.is_empty() && !xhe_mid {
+                    let (init, _, _) = sena_track_init(&tracks).map_err(|e| e.to_string())?;
+                    xhe_mid = init.mid_codec == sena_core::MidCodec::Xhe;
+                }
+                walk_cluster_w(&mut w, &e, &mut blocks, xhe_mid)?;
             }
         } else if e.id == ATTACHMENTS_ID {
             attachment_ranges.push((e.start, e.data_start, e.data_end));
@@ -1062,7 +1132,7 @@ mod tests {
             let start = br.offset as usize;
             assert_eq!(&bytes[start..start + br.len as usize], b.data.as_slice());
             // The ES header metadata matches the parsed block.
-            let parsed = es::decode_block(&b.data).unwrap();
+            let parsed = es::decode_block(&b.data, sena_core::MidCodec::Opus).unwrap();
             match (br.au_index, parsed.lf_au_index) {
                 (Some(ai), Some(p_ai)) => {
                     assert_eq!(ai, p_ai);

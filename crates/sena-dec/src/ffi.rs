@@ -63,6 +63,9 @@ pub struct SenaDecInfo {
     /// 12 kHz..20 kHz opus track). ABI 2 field; hosts compiled against
     /// ABI 1 headers must be rebuilt (struct size changed).
     pub three_track: u32,
+    /// Mid-layer codec: 0 = Opus, 1 = xHE-AAC (the encoder identity behind
+    /// an xHE mid is an encode-side detail and not exposed).
+    pub mid_codec: u32,
 }
 
 #[repr(C)]
@@ -703,6 +706,7 @@ pub unsafe extern "C" fn sena_dec_get_info(dec: *mut SenaDecHandle, info: *mut S
                 audio_sha256: sha,
                 audio_span_bytes: i.audio_span_bytes,
                 three_track: i.three_track as u32,
+                mid_codec: i.mid_codec as u32,
             }
         };
         Ok(SENA_DEC_OK)
@@ -1053,6 +1057,7 @@ pub unsafe extern "C" fn sena_es_get_info(es: *mut SenaEsHandle, info: *mut Sena
                 audio_sha256: sha,
                 audio_span_bytes: i.audio_span_bytes,
                 three_track: i.three_track as u32,
+                mid_codec: i.mid_codec as u32,
             }
         };
         Ok(SENA_DEC_OK)
@@ -1111,6 +1116,7 @@ pub unsafe extern "C" fn sena_dec_probe_info(
             audio_sha256: sha,
             audio_span_bytes: probe.audio_span_bytes,
             three_track: probe.three_track as u32,
+            mid_codec: probe.mid_codec as u32,
         })
     }));
     match result {
@@ -1404,6 +1410,7 @@ mod tests {
             audio_sha256: [0; 65],
             audio_span_bytes: 0,
             three_track: 0,
+            mid_codec: 0,
         };
         assert_eq!(unsafe { sena_dec_get_info(handle, &mut info) }, SENA_DEC_OK);
         assert_eq!(
@@ -1551,6 +1558,7 @@ mod tests {
             audio_sha256: [0; 65],
             audio_span_bytes: 0,
             three_track: 0,
+            mid_codec: 0,
         };
         let mut err = [0u8; 256];
         assert_eq!(
@@ -1605,6 +1613,7 @@ mod tests {
                 audio_sha256: [0; 65],
                 audio_span_bytes: 0,
                 three_track: 0,
+            mid_codec: 0,
             };
             let mut err = [0u8; 256];
             assert_eq!(
@@ -1678,6 +1687,7 @@ mod tests {
             audio_sha256: [0; 65],
             audio_span_bytes: 0,
             three_track: 0,
+            mid_codec: 0,
         };
         assert_eq!(unsafe { sena_dec_get_info(handle, &mut info) }, SENA_DEC_OK);
         unsafe { sena_dec_close(handle) };

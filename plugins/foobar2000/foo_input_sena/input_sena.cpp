@@ -91,14 +91,19 @@ void input_sena::get_info(file_info &info, abort_callback &abort) {
     info.info_set("encoding", "lossy");
     info.info_set("codec", "Sena");
     {
-        const char *base = di.profile == 300 ? "xAAC-Opus@300" : "xAAC-Opus@600";
-        if (di.three_track) {
-            pfc::string8 prof(base);
-            prof += "+HF@12000";
-            info.info_set("codec_profile", prof);
+        const bool xhe_mid = di.mid_codec == 1;
+        pfc::string8 base;
+        if (xhe_mid) {
+            // The mid-layer encoder (Fraunhofer IIS vs exhale) is an
+            // encode-side detail; both are xHE-AAC on decode.
+            base = di.profile == 300 ? "xAAC-xAAC@300" : "xAAC-xAAC@600";
         } else {
-            info.info_set("codec_profile", base);
+            base = di.profile == 300 ? "xAAC-Opus@300" : "xAAC-Opus@600";
         }
+        if (di.three_track) {
+            base += "+HF@12000";
+        }
+        info.info_set("codec_profile", base);
     }
     if (di.audio_sha256[0]) {
         info.info_set("Audio SHA256", di.audio_sha256);

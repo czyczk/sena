@@ -1,15 +1,22 @@
 //! senaenc CLI.
 
 use sena_core::{
-    Profile, RECOMMENDED_MIN_TOTAL_KBPS, SENAV_THRESHOLD_KBPS, THREE_TRACK_MIN_KBPS,
-    TOPBAND_DEFAULT_RANGE, account, account3, three_track_tag,
+    MidCodec, Profile, RECOMMENDED_MIN_TOTAL_KBPS, SENAV_THRESHOLD_KBPS, THREE_TRACK_MIN_KBPS,
+    TOPBAND_DEFAULT_RANGE, XFI_MAX_TOTAL_KBPS, XFI_MIN_TOTAL_KBPS, XFI_MID_KBPS, account,
+    account3, three_track_tag, xfi_hf_kbps,
 };
 use sena_enc::{EncoderConfig, exhale_version, opusenc_version, version_ge};
 use std::path::{Path, PathBuf};
 
 fn usage() -> ! {
     eprintln!(
-        "usage: senaenc [--profile 300|600] [--opus-original|--opus-senav] \
+        "usage: senaenc [--profile 300o|600o|300xfi|600xfi] [--opus-original|--opus-senav] \
+         [--opus-topband-stereo <1-500>] [--hf-tilt <0-100>] [--bypass-recommendations] \
+         <bitrate_kbps> <in.wav|-> <out.sena>\n\
+         profile names: <lf split Hz><mid codec>: 300o/600o = Opus mid (default; bare \
+         300/600 still accepted), 300xfi/600xfi = Fraunhofer-IIS xHE-AAC CBR 128k@44.1kHz \
+         mid via ezcd-cli (always three-track, totals {XFI_MIN_TOTAL_KBPS}-{XFI_MAX_TOTAL_KBPS}k \
+         only, extras feed the top band 96k->128k)\n\
          [--opus-topband-stereo <1-500>] [--hf-tilt <0-100>] [--bypass-recommendations] \
          <bitrate_kbps> <in.wav|-> <out.sena>\n\
          --opus-topband-stereo <k>: passed straight to the opusenc-senav mid encode \
@@ -35,6 +42,15 @@ fn usage() -> ! {
 /// Windows executable extensions (.exe plus PATHEXT). On Windows a bare
 /// `exhale` path never resolves to `exhale.exe`, so the end-to-end lookup
 /// next to `senaenc.exe` used to report an adjacent `exhale.exe` as missing.
+/// Windows .exe tools are runnable here: native Windows, or WSL (the
+/// interop binfmt handler exists even when WSL_DISTRO_NAME didn't
+/// propagate into the environment).
+fn windows_exe_runnable() -> bool {
+    cfg!(windows)
+        || std::env::var_os("WSL_DISTRO_NAME").is_some()
+        || std::path::Path::new("/proc/sys/fs/binfmt_misc/WSLInterop").exists()
+}
+
 fn tool_candidates(dir: &Path, name: &str) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     let mut push = |p: PathBuf| {
@@ -43,9 +59,9 @@ fn tool_candidates(dir: &Path, name: &str) -> Vec<PathBuf> {
         }
     };
     push(dir.join(name));
-    #[cfg(windows)]
-    {
+    if windows_exe_runnable() {
         push(dir.join(format!("{name}.exe")));
+        #[cfg(windows)]
         if let Ok(pathext) = std::env::var("PATHEXT") {
             for e in pathext.split(';') {
                 let e = e.trim_start_matches('.').trim();
@@ -191,6 +207,33 @@ fn doctor() -> i32 {
         }
     }
 
+    // ezcd-cli: optional; required only by the xfi profile family
+    match finder.find("ezcd-cli").or_else(|| finder.find("ezcd-cli-portable")) {
+        Some((p, src)) => {
+            let ok = std::process::Command::new(&p)
+                .args(["encoders"])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).contains("xhe-aac-fhg-iis"))
+                .unwrap_or(false);
+            if ok {
+                eprintln!("  [ok] ezcd-cli (xhe-aac-fhg-iis present) ({}, {src})", p.display());
+            } else {
+                warnings += 1;
+                eprintln!("  [warn] ezcd-cli at {} ({src}): `encoders` lacks xhe-aac-fhg-iis", p.display());
+                eprintln!("         impact: the xfi profile family is unavailable.");
+            }
+        }
+        None => {
+            warnings += 1;
+            eprintln!("  [warn] ezcd-cli not found (optional; tried ezcd-cli, ezcd-cli-portable)");
+            eprintln!("         impact: the xfi profile family (Fraunhofer IIS xHE-AAC mid) is unavailable.");
+            eprintln!(
+                "         fix: optional - put ezcd-cli.exe or ezcd-cli-portable.exe next to senaenc.exe ({}) or add its folder to PATH",
+                finder.exe_dir.display()
+            );
+        }
+    }
+
     if fatal > 0 {
         eprintln!("doctor: {fatal} fatal problem(s) - fix them before encoding");
         4
@@ -210,6 +253,7 @@ fn main() {
         std::process::exit(doctor());
     }
     let mut profile = Profile::At600;
+    let mut mid_codec = MidCodec::Opus;
     let mut opus_mode: Option<bool> = None; // None = auto
     let keep_workdir = args.iter().any(|a| a == "--keep-workdir");
     let force = args.iter().any(|a| a == "--force");
@@ -222,9 +266,11 @@ fn main() {
         match args[i].as_str() {
             "--profile" => {
                 i += 1;
-                profile = match args.get(i).map(|s| s.as_str()) {
-                    Some("300") => Profile::At300,
-                    Some("600") => Profile::At600,
+                (profile, mid_codec) = match args.get(i).map(|s| s.as_str()) {
+                    Some("300") | Some("300o") => (Profile::At300, MidCodec::Opus),
+                    Some("600") | Some("600o") => (Profile::At600, MidCodec::Opus),
+                    Some("300xfi") => (Profile::At300, MidCodec::Xhe),
+                    Some("600xfi") => (Profile::At600, MidCodec::Xhe),
                     _ => usage(),
                 };
             }
@@ -261,7 +307,14 @@ fn main() {
     let input = PathBuf::from(&rest[1]);
     let output = PathBuf::from(&rest[2]);
 
-    if account(kbps, profile).is_none() {
+    let xfi = mid_codec == MidCodec::Xhe;
+    if xfi && !(XFI_MIN_TOTAL_KBPS..=XFI_MAX_TOTAL_KBPS).contains(&kbps) {
+        eprintln!(
+            "error: the xfi profile family (Fraunhofer IIS xHE-AAC mid) accepts only              {XFI_MIN_TOTAL_KBPS}-{XFI_MAX_TOTAL_KBPS} kbit/s; requested {kbps}k"
+        );
+        std::process::exit(3);
+    }
+    if !xfi && account(kbps, profile).is_none() {
         let min = profile.min_total_kbps();
         eprintln!(
             "error: minimum bitrate for profile @{} is {min} kbit/s ({}k xHE-AAC + 32k Opus floor); requested {kbps}k. Use plain Opus at this rate.",
@@ -280,18 +333,22 @@ fn main() {
         eprintln!("       re-run with --bypass-recommendations to encode Sena anyway.");
         std::process::exit(5);
     }
-    let three_track = kbps >= THREE_TRACK_MIN_KBPS;
-    if three_track && account3(kbps, profile).is_none() {
+    let three_track = xfi || kbps >= THREE_TRACK_MIN_KBPS;
+    if three_track && !xfi && account3(kbps, profile).is_none() {
         // Unreachable for >= 256k with the defined profiles; kept as a guard.
         eprintln!("error: total bitrate {kbps}k cannot fund the three-track layout");
         std::process::exit(3);
     }
     let (xhe_k, opus_k) = account(kbps, profile).unwrap();
-    let mid_k = if three_track {
+    let mid_k = if xfi {
+        XFI_MID_KBPS
+    } else if three_track {
         account3(kbps, profile).unwrap().1
     } else {
         opus_k
     };
+    // xfi: the mid encode is ezcd-cli (not Opus); --opus-* only selects the
+    // top-band encoder build. use_senav still governs the top-band env.
     let use_senav = opus_mode.unwrap_or(kbps > SENAV_THRESHOLD_KBPS);
 
     // Topband-stereo resolution (mid encode only; the 15600 Hz+ top track
@@ -300,7 +357,12 @@ fn main() {
     // - under --opus-original it is meaningless: warn and ignore;
     // - opus-senav two-track in [192, 256) defaults to the Opus budget;
     // - the three-track layout has no top bands in the mid encode -> off.
-    let topband_kbps = if !use_senav {
+    let topband_kbps = if xfi {
+        if let Some(v) = topband_flag {
+            eprintln!("senaenc: warning: --opus-topband-stereo {v} ignored (xfi mid is xHE-AAC)");
+        }
+        None
+    } else if !use_senav {
         if let Some(v) = topband_flag {
             eprintln!(
                 "senaenc: warning: --opus-topband-stereo {v} ignored (--opus-original selected)"
@@ -336,25 +398,42 @@ fn main() {
         }
     }
     if three_track {
-        eprintln!(
-            "senaenc: profile @{}  total {}k -> xHE-AAC {}k (deducted) + Opus mid {}k (600 Hz..12 kHz) + Opus top {}k (12 kHz+, {}) [{}]{}",
-            profile.crossover_hz(),
-            kbps,
-            xhe_k,
-            mid_k,
-            sena_core::hf_track_kbps(kbps),
-            if use_senav {
-                "opusenc-senav"
-            } else {
-                "opusenc (original)"
-            },
-            three_track_tag(profile),
-            if let Some(t) = topband_kbps {
-                format!("  topband-stereo={t}")
-            } else {
-                String::new()
-            }
-        );
+        if xfi {
+            eprintln!(
+                "senaenc: profile @{}  total {}k -> xHE-AAC {}k (deducted) + FhG-IIS xHE mid {}k CBR@44.1kHz (600 Hz..12 kHz) + Opus top {}k (12 kHz+, {}) [{}]",
+                profile.crossover_hz(),
+                kbps,
+                xhe_k,
+                mid_k,
+                xfi_hf_kbps(kbps),
+                if use_senav {
+                    "opusenc-senav"
+                } else {
+                    "opusenc (original)"
+                },
+                three_track_tag(profile, mid_codec),
+            );
+        } else {
+            eprintln!(
+                "senaenc: profile @{}  total {}k -> xHE-AAC {}k (deducted) + Opus mid {}k (600 Hz..12 kHz) + Opus top {}k (12 kHz+, {}) [{}]{}",
+                profile.crossover_hz(),
+                kbps,
+                xhe_k,
+                mid_k,
+                sena_core::hf_track_kbps(kbps),
+                if use_senav {
+                    "opusenc-senav"
+                } else {
+                    "opusenc (original)"
+                },
+                three_track_tag(profile, mid_codec),
+                if let Some(t) = topband_kbps {
+                    format!("  topband-stereo={t}")
+                } else {
+                    String::new()
+                }
+            );
+        }
     } else {
         eprintln!(
             "senaenc: profile @{}  total {}k -> xHE-AAC {}k (deducted) + Opus {}k ({}){}",
@@ -393,6 +472,22 @@ fn main() {
         std::process::exit(4);
     });
     let opusenc = opusenc.to_string_lossy().into_owned();
+    let ezcd_cli: Option<String> = if xfi {
+        let found = finder
+            .find("ezcd-cli")
+            .or_else(|| finder.find("ezcd-cli-portable"))
+            .unwrap_or_else(|| {
+                eprintln!(
+                    "error: ezcd-cli not found next to senaenc or on PATH \
+                     (tried ezcd-cli, ezcd-cli-portable)"
+                );
+                eprintln!("       the xfi mid layer (Fraunhofer IIS xHE-AAC) cannot be encoded without it.");
+                std::process::exit(4);
+            });
+        Some(found.0.to_string_lossy().into_owned())
+    } else {
+        None
+    };
 
     let wd = std::env::temp_dir().join(format!("senaenc-{}", std::process::id()));
     let cfg = EncoderConfig {
@@ -400,9 +495,11 @@ fn main() {
         total_kbps: kbps,
         use_senav,
         three_track,
+        mid_codec,
         topband_kbps,
         exhale: &exhale,
         opusenc: &opusenc,
+        ezcd_cli: ezcd_cli.as_deref(),
         workdir: &wd,
         hf_tilt_pct,
     };

@@ -10,7 +10,7 @@ fn main() {
     let playable: u64 = demux.init.playable_samples;
     let (mut n_lf, mut n_mid) = (0usize, 0usize);
     for b in &demux.blocks {
-        let block = sena_core::es::decode_block(&b.data).unwrap();
+        let block = sena_core::es::decode_block(&b.data, sena_core::MidCodec::Opus).unwrap();
         n_lf += block.lf.len();
         n_mid += 1;
     }

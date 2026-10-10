@@ -45,7 +45,7 @@ fn malformed_lf_aus_never_panic() {
     let asc = AudioSpecificConfig::parse(&demux.init.lf_asc).expect("asset ASC parses");
     let mut good: Vec<Vec<u8>> = Vec::new();
     for b in &demux.blocks {
-        let block = sena_core::es::decode_block(&b.data).unwrap();
+        let block = sena_core::es::decode_block(&b.data, sena_core::MidCodec::Opus).unwrap();
         for au in block.lf {
             good.push(au.to_vec());
         }

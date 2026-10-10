@@ -101,7 +101,10 @@ impl BlockStore {
 pub struct EsParams {
     pub init: Init,
     pub asc: AudioSpecificConfig,
-    pub mid_head: crate::pipeline::OpusHead,
+    /// Mid-layer OpusHead (Opus mid only).
+    pub mid_head: Option<crate::pipeline::OpusHead>,
+    /// Mid-layer xHE-AAC config (xHE mid only, v3).
+    pub mid_xhe_asc: Option<AudioSpecificConfig>,
     pub tf_head: Option<crate::pipeline::OpusHead>,
     pub info: DecodedInfo,
     pub warnings: Vec<String>,
@@ -111,13 +114,28 @@ pub struct EsParams {
 pub fn parse_params(init: Init) -> Result<EsParams, DecodeError> {
     let asc = AudioSpecificConfig::parse(&init.lf_asc)
         .map_err(|e| DecodeError::Format(format!("ASC parse: {e}")))?;
-    let mid_head = parse_opus_head(&init.opus_head)?;
-    if mid_head.input_rate != SAMPLE_RATE {
-        return Err(DecodeError::Unsupported(format!(
-            "mid OpusHead input sample rate {}, expected {SAMPLE_RATE}",
-            mid_head.input_rate
-        )));
-    }
+    let (mid_head, mid_xhe_asc) = match init.mid_codec {
+        sena_core::MidCodec::Opus => {
+            let head = parse_opus_head(&init.mid_head)?;
+            if head.input_rate != SAMPLE_RATE {
+                return Err(DecodeError::Unsupported(format!(
+                    "mid OpusHead input sample rate {}, expected {SAMPLE_RATE}",
+                    head.input_rate
+                )));
+            }
+            (Some(head), None)
+        }
+        sena_core::MidCodec::Xhe => {
+            if !init.three_track {
+                return Err(DecodeError::Format(
+                    "xHE mid without the three-track layout".into(),
+                ));
+            }
+            let asc = AudioSpecificConfig::parse(&init.mid_head)
+                .map_err(|e| DecodeError::Format(format!("mid ASC parse: {e}")))?;
+            (None, Some(asc))
+        }
+    };
     let tf_head = match &init.hf_head {
         Some(h) => {
             let head = parse_opus_head(h)?;
@@ -158,12 +176,14 @@ pub fn parse_params(init: Init) -> Result<EsParams, DecodeError> {
             playable_frames: init.playable_samples,
             profile: init.profile.crossover_hz() as u32,
             three_track: init.three_track,
+            mid_codec: init.mid_codec,
             sena_version: es::ES_VERSION as u32,
             audio_sha256,
             audio_span_bytes: 0, // filled by the container layer
         },
         asc,
         mid_head,
+        mid_xhe_asc,
         tf_head,
         init,
         warnings: Vec::new(),
@@ -212,6 +232,25 @@ fn decode_opus_packet(lane: &mut OpusLane, data: &[u8], t_ns: u64) -> Result<(),
     Ok(())
 }
 
+/// xHE mid lane state (v3). Field-for-field mirror of the LF lane's
+/// trim/context/anchor machinery, at 44.1 kHz core rate.
+struct MxLane {
+    dec: UsacDecoder,
+    resampler: Resampler,
+    raw: VecDeque<f32>,
+    trim: usize,
+    trim_pending: bool,
+    trim_after: bool,
+    anchored: bool,
+    muted: bool,
+    join48: Option<i64>,
+    decode_from: u64,
+    total_before: i128,
+    ctx: usize,
+    zero_prefix: usize,
+    errors: usize,
+}
+
 struct State {
     lf_rate: u32,
     /// Leading output trims applied on the first produce after a (re)start:
@@ -219,6 +258,12 @@ struct State {
     /// samples from the jump AU up to the target frame.
     lf_trim: usize,
     hf_trim: usize,
+    /// xHE mid lane (v3, 44.1 kHz): mirrors the LF lane (same warmup model:
+    /// AU0 = 2048, trim 1024 core, steady 1024/AU; measured on Fraunhofer
+    /// IIS CBR 128k streams via rxaac). None for an Opus mid. Boxed: a
+    /// second UsacDecoder inline in State overflowed the foobar2000 decode
+    /// thread's stack (see decode_fits_small_host_stack).
+    mx: Option<Box<MxLane>>,
     /// Top layer pre-skip/seek trim (48 kHz units, applied on the
     /// upsampled/shifted timeline).
     tf_trim: usize,
@@ -405,9 +450,11 @@ impl EsDecoder {
         }
         let mut opus = OpusDecoder::new(SAMPLE_RATE, Channels::Stereo)
             .map_err(|e| DecodeError::Codec(format!("opus init: {e}")))?;
-        if self.params.mid_head.output_gain != 0 {
-            opus.set_gain(i32::from(self.params.mid_head.output_gain))
-                .map_err(|e| DecodeError::Codec(format!("opus output gain: {e}")))?;
+        if let Some(mid_head) = self.params.mid_head.as_ref() {
+            if mid_head.output_gain != 0 {
+                opus.set_gain(i32::from(mid_head.output_gain))
+                    .map_err(|e| DecodeError::Codec(format!("opus output gain: {e}")))?;
+            }
         }
         let mut opus2 = None;
         let mut tf_resampler = None;
@@ -421,10 +468,44 @@ impl EsDecoder {
             opus2 = Some(d);
             tf_resampler = Some(Resampler::new(sena_core::HF_TRACK_RATE, SAMPLE_RATE));
         }
+        let mx = match &self.params.mid_xhe_asc {
+            Some(asc) => {
+                let dec = UsacDecoder::new(asc)
+                    .map_err(|e| DecodeError::Codec(format!("rxaac init (mid): {e}")))?;
+                if dec.num_channels() != 2 {
+                    return Err(DecodeError::Unsupported("rxaac mid channels != 2".into()));
+                }
+                if dec.output_rate() != sena_core::XFI_MID_RATE {
+                    return Err(DecodeError::Format(format!(
+                        "rxaac mid output rate {} != {}",
+                        dec.output_rate(),
+                        sena_core::XFI_MID_RATE
+                    )));
+                }
+                Some(Box::new(MxLane {
+                    dec,
+                    resampler: Resampler::new(sena_core::XFI_MID_RATE, SAMPLE_RATE),
+                    raw: VecDeque::new(),
+                    trim: crate::pipeline::XHE_TRIM_CORE_SAMPLES,
+                    trim_pending: true,
+                    trim_after: false,
+                    anchored: true,
+                    muted: false,
+                    join48: None,
+                    decode_from: 0,
+                    total_before: 0,
+                    ctx: 0,
+                    zero_prefix: 0,
+                    errors: 0,
+                }))
+            }
+            None => None,
+        };
         Ok(State {
             lf_rate: self.params.init.lf_rate,
             lf_trim: crate::pipeline::XHE_TRIM_CORE_SAMPLES,
-            hf_trim: self.params.mid_head.pre_skip as usize,
+            hf_trim: self.params.mid_head.as_ref().map_or(0, |h| h.pre_skip as usize),
+            mx,
             tf_trim: self.params.tf_head.as_ref().map_or(0, |h| h.pre_skip as usize),
             tf_next_pkt: 0,
             lf_decode_from: 0,
@@ -499,7 +580,8 @@ impl EsDecoder {
             }
         }
         // integrity check so host bugs surface loudly
-        es::decode_block(data).map_err(|e| DecodeError::Format(format!("push: {e}")))?;
+        es::decode_block(data, self.params.init.mid_codec)
+            .map_err(|e| DecodeError::Format(format!("push: {e}")))?;
         self.queue.push_back((t_ns, data.to_vec()));
         Ok(())
     }
@@ -575,22 +657,100 @@ impl EsDecoder {
 impl EsDecoder {
     /// Decode the lanes of one composite block.
     fn decode_block(&mut self, t_ns: u64, payload: &[u8]) -> Result<(), DecodeError> {
-        let block = es::decode_block(payload).map_err(|e| DecodeError::Format(e.to_string()))?;
+        let block = es::decode_block(payload, self.params.init.mid_codec)
+            .map_err(|e| DecodeError::Format(e.to_string()))?;
         let st = self.state.as_mut().unwrap();
         st.blocks_decoded += 1;
-        let mid_pkt = t_ns / es::BLOCK_NS;
-        if mid_pkt >= st.mid_decode_from {
-            st.mid_bytes += block.mid.len() as u64;
-            let mut lane = OpusLane {
-                dec: &mut st.opus,
-                name: "Opus",
-                errors: &mut st.opus_errors,
-                raw: &mut st.hf_raw,
-                infos: &mut st.opus_infos,
-                total_before: &mut st.opus_total_before,
-                scale: 1,
-            };
-            decode_opus_packet(&mut lane, block.mid, t_ns)?;
+        match block.mid {
+            es::MidSection::Opus(pkt) => {
+                let mid_pkt = t_ns / es::BLOCK_NS;
+                if mid_pkt >= st.mid_decode_from {
+                    st.mid_bytes += pkt.len() as u64;
+                    let mut lane = OpusLane {
+                        dec: &mut st.opus,
+                        name: "Opus",
+                        errors: &mut st.opus_errors,
+                        raw: &mut st.hf_raw,
+                        infos: &mut st.opus_infos,
+                        total_before: &mut st.opus_total_before,
+                        scale: 1,
+                    };
+                    decode_opus_packet(&mut lane, pkt, t_ns)?;
+                }
+            }
+            es::MidSection::Xhe { au_index, aus } => {
+                for (i, au) in aus.iter().enumerate() {
+                    let au_idx = au_index as u64 + i as u64;
+                    // Anchor/ramp logic mirrors the LF lane (below), at the
+                    // 44.1 kHz mid rate.
+                    {
+                        let mx = st.mx.as_mut().unwrap();
+                        if !mx.anchored {
+                            mx.anchored = true;
+                            let au_start48 = mx_au_start48(au_idx, t_ns);
+                            if au_idx == 0 && au_start48 < 0 {
+                                mx.decode_from = 0;
+                                mx.total_before = 0;
+                                mx.trim = crate::pipeline::XHE_TRIM_CORE_SAMPLES;
+                                mx.trim_after = false;
+                                mx.trim_pending = true;
+                            } else if au_payload_indep(au) {
+                                mx.decode_from = au_idx;
+                                mx.total_before =
+                                    1024 + au_start48 as i128 * sena_core::XFI_MID_RATE as i128
+                                        / SAMPLE_RATE as i128;
+                                let start_abs = (st.tf_seek_base + st.produced) as i64;
+                                if au_start48 <= start_abs {
+                                    mx.trim = ((start_abs - au_start48)
+                                        * sena_core::XFI_MID_RATE as i64
+                                        / SAMPLE_RATE as i64)
+                                        .max(0) as usize;
+                                    mx.trim_after = true;
+                                    mx.trim_pending = true;
+                                } else {
+                                    mx.trim = 0;
+                                    mx.join48 = Some(au_start48);
+                                }
+                            } else {
+                                mx.muted = true;
+                                mx.decode_from = au_idx;
+                            }
+                        }
+                    }
+                    {
+                        let mx = st.mx.as_mut().unwrap();
+                        if au_idx < mx.decode_from {
+                            continue;
+                        }
+                        if mx.muted {
+                            if !au_payload_indep(au) {
+                                continue;
+                            }
+                            let au_start48 = mx_au_start48(au_idx, t_ns);
+                            let start_abs = (st.tf_seek_base + st.produced) as i64;
+                            mx.muted = false;
+                            mx.decode_from = au_idx;
+                            mx.total_before =
+                                1024 + au_start48 as i128 * sena_core::XFI_MID_RATE as i128
+                                    / SAMPLE_RATE as i128;
+                            if au_start48 <= start_abs {
+                                mx.trim = ((start_abs - au_start48)
+                                    * sena_core::XFI_MID_RATE as i64
+                                    / SAMPLE_RATE as i64)
+                                    .max(0) as usize;
+                                mx.trim_after = true;
+                                mx.trim_pending = true;
+                                mx.join48 = None;
+                            } else {
+                                mx.trim = 0;
+                                mx.join48 = Some(au_start48);
+                            }
+                        }
+                    }
+                    st.mid_bytes += au.len() as u64;
+                    Self::decode_mx_au(st, au, t_ns)?;
+                }
+            }
         }
         if let Some(au_index) = block.lf_au_index {
             for (i, au) in block.lf.iter().enumerate() {
@@ -734,12 +894,71 @@ impl EsDecoder {
         Ok(())
     }
 
+    /// Decode one xHE mid AU into the lane's raw queue (mirror of
+    /// `decode_lf_au` at the 44.1 kHz mid rate).
+    fn decode_mx_au(st: &mut State, data: &[u8], t_ns: u64) -> Result<(), DecodeError> {
+        let (start_core, samples) = {
+            let mx = st.mx.as_mut().unwrap();
+            let mut out: Vec<f32> = Vec::new();
+            let result = catch_unwind(AssertUnwindSafe(|| mx.dec.decode_au(data, &mut out)));
+            let failed = match result {
+                Ok(Err(e)) => {
+                    eprintln!("warning: mid AU decode error ({t_ns}): {e}");
+                    true
+                }
+                Err(_) => {
+                    eprintln!("warning: mid AU decoder panic ({t_ns}); replacing with silence");
+                    true
+                }
+                Ok(Ok(())) => false,
+            };
+            if failed {
+                mx.errors += 1;
+                out.clear();
+                let n = mx.dec.output_samples() * mx.dec.num_channels();
+                out.resize(n, 0.0);
+            }
+            let samples = out.len() / mx.dec.num_channels();
+            if samples == 0 || samples * mx.dec.num_channels() != out.len() {
+                return Err(DecodeError::Codec(
+                    "rxaac (mid) returned a non-integral frame".into(),
+                ));
+            }
+            if mx.zero_prefix > 0 {
+                let n = mx.zero_prefix.min(samples);
+                out[..n * 2].fill(0.0);
+                mx.zero_prefix -= n;
+            }
+            let start_core = mx.total_before;
+            mx.raw.extend(out);
+            mx.total_before += samples as i128;
+            (start_core, samples)
+        };
+        // Bit accounting rides the mid (OpusPacketInfo) slot: positions in
+        // 48 kHz playable units via the constant warmup shift.
+        let rate = sena_core::XFI_MID_RATE as i128;
+        st.opus_infos.push(OpusPacketInfo {
+            start_48k: (start_core - crate::pipeline::XHE_TRIM_CORE_SAMPLES as i128)
+                * SAMPLE_RATE as i128 / rate,
+            samples_48k: samples as i128 * SAMPLE_RATE as i128 / rate,
+            bits: (data.len() * 8) as u64,
+        });
+        Ok(())
+    }
+
     fn produce_chunk(&mut self) -> Result<(), DecodeError> {
-        let (lf_skip, hf_skip, trim_after) = {
+        let (lf_skip, hf_skip, trim_after, mx_skip, mx_trim_after) = {
             let st = self.state.as_ref().unwrap();
             let lf_trim = if st.lf_trim_pending { st.lf_trim } else { 0 };
             let hf_trim = if st.first { st.hf_trim } else { 0 };
-            (lf_trim, hf_trim, st.lf_trim_pending && st.lf_trim_after)
+            let (mx_trim, mx_after) = match st.mx.as_ref() {
+                Some(mx) => (
+                    if mx.trim_pending { mx.trim } else { 0 },
+                    mx.trim_pending && mx.trim_after,
+                ),
+                None => (0, false),
+            };
+            (lf_trim, hf_trim, st.lf_trim_pending && st.lf_trim_after, mx_trim, mx_after)
         };
         let (ctx, guard, raw_empty) = {
             let st = self.state.as_ref().unwrap();
@@ -752,12 +971,23 @@ impl EsDecoder {
             } else {
                 lf_skip
             });
-            let fresh_hf = (st.hf_raw.len() / 2).saturating_sub(hf_skip);
+            // Mid lane readiness: Opus mid = the direct 48 kHz queue; xHE
+            // mid = the 44.1 kHz lane (muted/ramping mid doesn't gate).
+            let fresh_mid_zero = match st.mx.as_ref() {
+                Some(mx) => {
+                    !mx.muted
+                        && mx.anchored
+                        && (mx.raw.len() / 2).saturating_sub(
+                            mx.ctx + if mx_trim_after { 0 } else { mx_skip },
+                        ) == 0
+                }
+                None => (st.hf_raw.len() / 2).saturating_sub(hf_skip) == 0,
+            };
             let fresh_tf = st.opus2.is_none() || tf_emittable(st) > 0;
             (
                 st.lf_ctx,
                 st.lf_resampler.guard_frames(),
-                (!st.lf_muted && st.lf_anchored && fresh_lf == 0) || fresh_hf == 0 || !fresh_tf,
+                (!st.lf_muted && st.lf_anchored && fresh_lf == 0) || fresh_mid_zero || !fresh_tf,
             )
         };
         if raw_empty {
@@ -767,11 +997,17 @@ impl EsDecoder {
                 st.lf_raw.clear();
                 st.hf_raw.clear();
                 st.tf_raw.clear();
+                if let Some(mx) = st.mx.as_mut() {
+                    mx.raw.clear();
+                }
                 st.lf_infos.clear();
                 st.opus_infos.clear();
                 st.tf_infos.clear();
                 st.first = false;
                 st.lf_trim_pending = false;
+                if let Some(mx) = st.mx.as_mut() {
+                    mx.trim_pending = false;
+                }
             }
             return Ok(());
         }
@@ -786,7 +1022,7 @@ impl EsDecoder {
             /// Absolute playable frame of lf48 index 0 (i64::MAX/2 = no LF).
             abs0: i64,
         }
-        let (lwin, hf_after, tf_out, take, start, rate, lf_pass_core, lf_consume_core, straddle) = {
+        let (lwin, mxw, hf_after, tf_out, take, start, rate, lf_pass_core, lf_consume_core, mx_pass_core, straddle) = {
             let st = self.state.as_ref().unwrap();
             let resampler = &st.lf_resampler;
             // The resample window is the whole pending LF raw: retained left
@@ -871,8 +1107,15 @@ impl EsDecoder {
             } else {
                 (lf_abs0 + right_cap as i64 - start_abs).max(0) as usize
             };
+            // xHE mid window: whole pending raw resampled with retained
+            // left context; emit capped at the fully-supported region.
+            let mxw = st
+                .mx
+                .as_ref()
+                .map(|mx| mx_window(mx.as_ref(), mx_skip, mx_trim_after, st.finished, start_abs));
+            let mid_cap = mxw.as_ref().map_or(hf_after.len() / 2, |w| w.cap);
             let n = lf_cap
-                .min(hf_after.len() / 2)
+                .min(mid_cap)
                 .min(if let Some(t) = &tf_out {
                     let w48 = t.shifted.len() / 2;
                     let cap = if st.finished {
@@ -893,8 +1136,12 @@ impl EsDecoder {
             // A chunk that straddles a future ramp join ends at the join:
             // the silent part needs no LF window, and the window stays
             // untouched for the next chunk (which then starts exactly at
-            // the join and runs aligned).
-            let straddle_join = join.map(|j| (j - start_abs) as usize);
+            // the join and runs aligned). Same for a future mid-xHE join.
+            let straddle_join = [join, mxw.as_ref().and_then(|w| w.join)]
+                .into_iter()
+                .flatten()
+                .min()
+                .map(|j| (j - start_abs) as usize);
             if let Some(limit) = straddle_join {
                 take = take.min(limit);
             }
@@ -904,17 +1151,46 @@ impl EsDecoder {
             // The rational ratio only represents some output counts exactly;
             // trim up to 2 frames from the chunk so the resampler can map the
             // consumed core count one-to-one (the frames are emitted by the
-            // next chunk). At stream end the window tail is zero-padded
-            // anyway, so the final chunk emits everything left regardless of
-            // representability (the bookkeeping is moot once drained).
-            let consume_core = if straddle_join.is_some() {
-                0
+            // next chunk). With an xHE mid, `take` must be representable on
+            // BOTH resamplers (LF and 44.1 kHz mid); moreover the mid lane
+            // must keep chunk ends on the resampler's *output* phase grid
+            // (multiples of n=160): only then do window boundaries preserve
+            // the whole-file phase (16k/32k get this for free from the
+            // representability loop). At stream end the window tail is
+            // zero-padded anyway, so the final chunk emits everything left
+            // regardless of representability (the bookkeeping is moot once
+            // drained).
+            let (consume_core, mx_consume_core) = if straddle_join.is_some() {
+                (0, 0)
             } else if st.finished {
-                window_core.saturating_sub(front_core)
+                let mxc = mxw
+                    .as_ref()
+                    .map_or(0, |w| w.window_core.saturating_sub(w.front_core));
+                (window_core.saturating_sub(front_core), mxc)
+            } else if let Some(mx) = st.mx.as_ref() {
+                let ngrid = mx.resampler.phases();
+                take -= take % ngrid;
+                loop {
+                    if take == 0 {
+                        return Ok(());
+                    }
+                    if resampler.input_frames_for_output(take).is_some() {
+                        break;
+                    }
+                    take -= ngrid;
+                }
+                let lf_k = resampler.input_frames_for_output(take).unwrap();
+                let mx_k = mx.resampler.input_frames_for_output(take).unwrap();
+                (lf_k, mx_k)
             } else {
                 loop {
-                    if let Some(k) = resampler.input_frames_for_output(take) {
-                        break k;
+                    let lf_k = resampler.input_frames_for_output(take);
+                    let mx_k = match st.mx.as_ref() {
+                        Some(mx) => mx.resampler.input_frames_for_output(take),
+                        None => Some(0),
+                    };
+                    if let (Some(a), Some(b)) = (lf_k, mx_k) {
+                        break (a, b);
                     }
                     take -= 1;
                 }
@@ -924,11 +1200,15 @@ impl EsDecoder {
             let fresh_cap = window_core.saturating_sub(window_front_core);
             let lf_consume_core = consume_core.min(fresh_cap);
             let lf_pass_core = front_core + lf_consume_core;
+            let mx_pass_core = mxw.as_ref().map_or(0, |w| {
+                w.front_core + mx_consume_core.min(w.window_core.saturating_sub(w.front_core))
+            });
             let start = st.produced;
             let end = start + take as u64;
             let rate = self.chunk_bits(&st.lf_infos, &st.opus_infos, &st.tf_infos, start, end);
             (
                 LfWin { lf48, abs0: lf_abs0 },
+                mxw,
                 hf_after,
                 tf_out,
                 take,
@@ -936,6 +1216,7 @@ impl EsDecoder {
                 rate,
                 lf_pass_core,
                 lf_consume_core,
+                mx_pass_core,
                 straddle_join.is_some(),
             )
         };
@@ -955,8 +1236,20 @@ impl EsDecoder {
             } else {
                 (0.0, 0.0)
             };
-            let hl = hf_after[i * 2] * gain;
-            let hr = hf_after[i * 2 + 1] * gain;
+            let (hl, hr) = if let Some(mw) = &mxw {
+                // xHE mid window index on the absolute timeline (like LF).
+                let mi = start_abs + i as i64 - mw.abs0;
+                if mi >= 0 && (mi as usize) < mw.s48.len() / 2 {
+                    (
+                        mw.s48[mi as usize * 2] * gain,
+                        mw.s48[mi as usize * 2 + 1] * gain,
+                    )
+                } else {
+                    (0.0, 0.0)
+                }
+            } else {
+                (hf_after[i * 2] * gain, hf_after[i * 2 + 1] * gain)
+            };
             let (tl, tr) = if let Some(t) = &tf_out {
                 (
                     t.shifted[(t.j_start + i) * 2] * gain,
@@ -987,8 +1280,25 @@ impl EsDecoder {
                 st.lf_ctx = lf_pass_core - drain_core;
                 // `lf_consume_core` bookkeeping for the bit accounting.
                 Self::trim_lf_infos(&mut st.lf_infos, lf_consume_core as i128);
+                // xHE mid lane: same drain discipline at 44.1 kHz, plus a
+                // second invariant the LF rates get for free: the retained
+                // context must stay a multiple of m (147) so its output span
+                // (ctx*160/147) is an exact integer and `abs0` stays on the
+                // n=160 output grid. Draining `pass - ctx_target` keeps both
+                // grids locked (the window base then satisfies
+                // (D-1024) ≡ 0 mod 147 automatically).
+                if let Some(mx) = st.mx.as_mut() {
+                    let grid = mx.resampler.decimation();
+                    let ctx_target =
+                        mx.resampler.guard_frames().div_ceil(grid) * grid;
+                    let drain_core = mx_pass_core.saturating_sub(ctx_target);
+                    mx.raw.drain(..drain_core * 2);
+                    mx.ctx = mx_pass_core - drain_core;
+                }
             }
-            st.hf_raw.drain(..(hf_skip + take) * 2);
+            if st.mx.is_none() {
+                st.hf_raw.drain(..(hf_skip + take) * 2);
+            }
             if st.opus2.is_some() {
                 // Drain only raw 16 kHz frames whose 48 kHz support is fully
                 // behind the next emit point: the shift needs HILBERT_DELAY
@@ -1009,6 +1319,9 @@ impl EsDecoder {
             Self::trim_opus_infos(&mut st.tf_infos, take as i128);
             st.first = false;
             st.lf_trim_pending = false;
+            if let Some(mx) = st.mx.as_mut() {
+                mx.trim_pending = false;
+            }
         }
 
         let mut last_bits = *self.bits_prefix.last().unwrap();
@@ -1042,7 +1355,7 @@ impl EsDecoder {
             add_bits_interval(&mut delta, n as i128, s48 - base, e48 - base, info.bits as f64);
         }
         for (infos, skip) in [
-            (opus_infos, self.params.mid_head.pre_skip as i128),
+            (opus_infos, self.params.mid_head.as_ref().map_or(0, |h| h.pre_skip) as i128),
             (
                 tf_infos,
                 self.params.tf_head.as_ref().map_or(0, |h| h.pre_skip) as i128,
@@ -1141,8 +1454,28 @@ impl EsDecoder {
                         }
                     };
                     let hf_ready = {
-                        let trim = if st.first { st.hf_trim as i128 } else { 0 };
-                        ((st.hf_raw.len() / 2) as i128 - trim).max(0) as u64
+                        match st.mx.as_ref() {
+                            Some(mx) => {
+                                // xHE mid lane: same readiness shape as LF.
+                                if mx.muted || !mx.anchored {
+                                    u64::MAX
+                                } else {
+                                    let trim = if mx.trim_pending { mx.trim as i128 } else { 0 };
+                                    let reserve = mx.ctx as i128
+                                        + if st.finished {
+                                            0
+                                        } else {
+                                            mx.resampler.guard_frames() as i128
+                                        };
+                                    let core = (mx.raw.len() / 2) as i128 - trim - reserve;
+                                    (core * 48_000 / sena_core::XFI_MID_RATE as i128).max(0) as u64
+                                }
+                            }
+                            None => {
+                                let trim = if st.first { st.hf_trim as i128 } else { 0 };
+                                ((st.hf_raw.len() / 2) as i128 - trim).max(0) as u64
+                            }
+                        }
                     };
                     let tf_ready = tf_emittable(st).max(0) as u64;
                     let ready = lf_ready.min(hf_ready);
@@ -1301,13 +1634,20 @@ impl EsDecoder {
         st.lf_trim = 0;
         st.lf_trim_pending = false;
         st.lf_zero_prefix = 0;
+        // Same for an xHE mid lane: it anchors on the first delivered mid AU.
+        if let Some(mx) = st.mx.as_mut() {
+            mx.anchored = false;
+            mx.trim = 0;
+            mx.trim_pending = false;
+            mx.zero_prefix = 0;
+        }
         if b0 == 0 {
             // Stream start: the make_state defaults apply to the mid/top
             // lanes (pre-skip trims).
             self.state = Some(st);
             return Ok(());
         }
-        let ps_mid = self.params.mid_head.pre_skip as u64;
+        let ps_mid = self.params.mid_head.as_ref().map_or(0, |h| h.pre_skip as u64);
         let ps_tf = self.params.tf_head.as_ref().map_or(0, |h| h.pre_skip as u64);
         // Emit from the earliest covered playable frame of the delivered
         // layers: the mid/top packets in block b0 cover [b0*960 - ps, ...).
@@ -1357,7 +1697,25 @@ impl EsDecoder {
         }
         let lf_trim = (target_raw_core - start_au * 1024) as usize;
 
-        let ps_mid = self.params.mid_head.pre_skip as u64;
+        let xhe_mid = self.params.mid_xhe_asc.is_some();
+        let ps_mid = self.params.mid_head.as_ref().map_or(0, |h| h.pre_skip as u64);
+        // xHE mid lane: the LF AU math at the 44.1 kHz mid rate.
+        let (mx_start_au, mx_trim) = if xhe_mid {
+            let rate = sena_core::XFI_MID_RATE as u64;
+            let c = (frame as u128 * rate as u128 / 48_000) as u64;
+            let target_raw = c + crate::pipeline::XHE_TRIM_CORE_SAMPLES as u64;
+            let au = target_raw / crate::pipeline::XHE_TRIM_CORE_SAMPLES as u64;
+            let mut start_au = self.prev_indep_mx_au(au);
+            if start_au == au && start_au > 0 {
+                start_au = self.prev_indep_mx_au(start_au - 1);
+            }
+            (
+                Some(start_au),
+                Some((target_raw - start_au * 1024) as usize),
+            )
+        } else {
+            (None, None)
+        };
         let j0 = (frame + ps_mid) / es::BLOCK_FRAMES;
         let hf_trim = (frame + ps_mid - j0 * es::BLOCK_FRAMES) as usize;
 
@@ -1375,9 +1733,14 @@ impl EsDecoder {
         };
 
         // Block jump: the earliest lane anchor (LF AU by-end block, top
-        // packet's block == its index, mid packet's block == its index).
+        // packet's block == its index, mid packet's block == its index or,
+        // for an xHE mid, the mid AU's by-end block).
+        let mid_block = match mx_start_au {
+            Some(au) => es::xhe_block(au, sena_core::XFI_MID_RATE, n_blocks),
+            None => j0,
+        };
         let b0 = es::lf_block(start_au, lf_rate, n_blocks)
-            .min(j0)
+            .min(mid_block)
             .min(tf_j0)
             .min(n_blocks - 1);
 
@@ -1394,6 +1757,20 @@ impl EsDecoder {
         st.tf_seek_base = frame;
         st.lf_decode_from = start_au;
         st.lf_total_before = start_au as i128 * 1024;
+        if let (Some(mx), Some(start_au), Some(trim)) =
+            (st.mx.as_mut(), mx_start_au, mx_trim)
+        {
+            mx.decode_from = start_au;
+            mx.total_before = start_au as i128 * 1024;
+            mx.trim = trim;
+            mx.trim_after = true;
+            mx.trim_pending = true;
+            mx.zero_prefix = if start_au == 0 {
+                crate::pipeline::XHE_TRIM_CORE_SAMPLES
+            } else {
+                0
+            };
+        }
         st.mid_decode_from = j0;
         st.opus_total_before = j0 as i128 * es::BLOCK_FRAMES as i128;
         st.tf_decode_from = tf_j0;
@@ -1435,6 +1812,110 @@ impl EsDecoder {
             }
         }
         0
+    }
+
+    /// Largest xHE-mid AU index <= `au` flagged independent (mirror of
+    /// `prev_indep_au` over the mid AU map cached by the demux index).
+    fn prev_indep_mx_au(&self, au: u64) -> u64 {
+        let store = self.store.as_ref().unwrap();
+        let blocks = store.blocks();
+        if blocks.is_empty() {
+            return 0;
+        }
+        let est =
+            es::xhe_block(au, sena_core::XFI_MID_RATE, blocks.len() as u64) as usize;
+        for b in blocks[..=est.min(blocks.len() - 1)].iter().rev() {
+            if let Some(ai) = b.mx_au_index {
+                for (i, &first) in b.mx_first.iter().take(b.mx_count as usize).enumerate().rev() {
+                    let idx = ai as u64 + i as u64;
+                    if idx <= au && first & INDEP_BIT != 0 {
+                        return idx;
+                    }
+                }
+            }
+        }
+        0
+    }
+}
+
+/// Start of xHE-mid AU `k`'s content on the 48 kHz grid of its arrival
+/// block — the rational-rate generalization of `lf_au_start48` (44.1 kHz
+/// does not divide 48 kHz, so per-AU durations alternate 1114/1115).
+fn mx_au_start48(k: u64, block_ts_ns: u64) -> i64 {
+    let rate = sena_core::XFI_MID_RATE;
+    if k == 0 {
+        return -(es::xhe_au_end48(1, rate) as i64);
+    }
+    let ts48 = (block_ts_ns / 1_000_000 * 48) as i64;
+    let end48 = es::xhe_au_end48(k, rate) as i64;
+    let dur = end48 - es::xhe_au_end48(k - 1, rate) as i64;
+    let r = (end48 - 1).rem_euclid(es::BLOCK_FRAMES as i64) + 1;
+    ts48 + r - dur
+}
+
+/// xHE mid resample window (same window discipline as the LF lane).
+struct MxWin {
+    s48: Vec<f64>,
+    abs0: i64,
+    cap: usize,
+    window_core: usize,
+    front_core: usize,
+    join: Option<i64>,
+}
+
+/// Compute the mid lane's resample window. `#[inline(never)]`: its
+/// temporaries then live in their own frame instead of inflating
+/// `produce_chunk`'s (the fb2k decode thread stack is tight, see
+/// `decode_fits_small_host_stack`).
+#[inline(never)]
+fn mx_window(
+    mx: &MxLane,
+    mx_skip: usize,
+    mx_trim_after: bool,
+    finished: bool,
+    start_abs: i64,
+) -> MxWin {
+    let raw_drop = if mx_trim_after { 0 } else { mx_skip };
+    // LF 同构：window_front_core = 窗口内的上下文；front_core = raw_drop +
+    // window_front_core 才是"从 raw 头越过的总量"（drain 记账用它）。
+    let window_front_core =
+        mx.ctx.max(raw_drop) - raw_drop + if mx_trim_after { mx_skip } else { 0 };
+    let front_core = raw_drop + window_front_core;
+    let mid_after: Vec<f64> = mx
+        .raw
+        .iter()
+        .skip(raw_drop * 2)
+        .map(|&s| f64::from(s))
+        .collect();
+    let mx48 = mx.resampler.process(&mid_after, 2);
+    let mx_off = mx.resampler.output_frames(window_front_core);
+    let window_core = mid_after.len() / 2;
+    let right_cap = if finished {
+        mx48.len() / 2
+    } else {
+        mx.resampler
+            .output_frames(window_core.saturating_sub(mx.resampler.guard_frames()))
+    };
+    let join = mx.join48.filter(|&j| start_abs < j);
+    let abs0 = if mx.muted || !mx.anchored {
+        i64::MAX / 2
+    } else if let Some(j) = join {
+        j
+    } else {
+        start_abs - mx_off as i64
+    };
+    let cap = if abs0 >= i64::MAX / 4 {
+        usize::MAX
+    } else {
+        (abs0 + right_cap as i64 - start_abs).max(0) as usize
+    };
+    MxWin {
+        s48: mx48,
+        abs0,
+        cap,
+        window_core,
+        front_core,
+        join,
     }
 }
 
@@ -1535,7 +2016,11 @@ mod tests {
     /// bit-for-bit.
     #[test]
     fn push_matches_container_decode() {
-        for asset in ["01__p300__lfa__hf144", "01__p600__3t__hf160+96"] {
+        for asset in [
+            "01__p300__lfa__hf144",
+            "01__p600__3t__hf160+96",
+            "01__p600xfi__hf96",
+        ] {
             let bytes = asset_bytes(asset);
             let reference = decode_all(&mut store_decoder(&bytes));
             let pushed = decode_all(&mut push_decoder(&bytes));
@@ -1587,7 +2072,7 @@ mod tests {
         let bytes = asset_bytes("01__p300__lfa__hf144");
         let (params, blocks) = store_params(&bytes);
         let playable = params.info.playable_frames;
-        let ps = params.mid_head.pre_skip as u64;
+        let ps = params.mid_head.unwrap().pre_skip as u64;
         let ps_tf = params.tf_head.as_ref().map_or(0, |h| h.pre_skip as u64);
         let three = params.tf_head.is_some();
         let mut d = EsDecoder::open_push(params).unwrap();
@@ -1621,6 +2106,7 @@ mod tests {
             "01__p600__3t__hf160+96",
             "05__p300__lfa__hf144",
             "09__p600__lfd__hf136",
+            "01__p600xfi__hf96",
         ] {
             let bytes = asset_bytes(asset);
             let whole = crate::pipeline::decode(&Demuxed::parse(bytes.clone()).unwrap()).unwrap();
@@ -1678,6 +2164,46 @@ mod tests {
         assert!(max < 1.1, "mid-file seek diff {max}");
     }
 
+    /// xHE mid (v3): the three-track layout with a 44.1 kHz USAC mid lane
+    /// decodes whole-file, and a mid-file seek keeps exact length and
+    /// converges to the continuous decode after the ramp.
+    #[test]
+    fn xhe_mid_seek() {
+        let bytes = asset_bytes("01__p600xfi__hf96");
+        let whole = crate::pipeline::decode(&Demuxed::parse(bytes.clone()).unwrap()).unwrap();
+        let whole_pcm: Vec<f32> = whole.pcm_f64().iter().map(|&v| v as f32).collect();
+        let playable = whole.info().playable_frames as usize;
+
+        let mut d = store_decoder(&bytes);
+        d.seek(0).unwrap();
+        let got = decode_all(&mut d);
+        assert_eq!(got.len(), playable * 2);
+        let max = got
+            .iter()
+            .zip(whole_pcm.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        // The USAC lanes (LF + xHE mid) are not sample-exact across a
+        // restart (decoder state re-converges); the Opus-mid class (~1e-4)
+        // does not apply here.
+        assert!(max < 5e-3, "seek(0) vs continuous: {max}");
+
+        let target = (playable / 3) as u64;
+        let mut d = store_decoder(&bytes);
+        d.seek(target).unwrap();
+        let got = decode_all(&mut d);
+        assert_eq!(got.len(), (playable - target as usize) * 2);
+        let settle = 48000; // 1 s: USAC lanes converge after the indep join
+        let mut max = 0.0f32;
+        for i in settle..playable - target as usize {
+            for c in 0..2 {
+                let diff = (got[i * 2 + c] - whole_pcm[target as usize * 2 + i * 2 + c]).abs();
+                max = max.max(diff);
+            }
+        }
+        assert!(max < 1.1, "mid-file seek diff {max}");
+    }
+
     /// The bit-accounting prefix must stay bounded to produced-but-unread
     /// frames over a full decode and across a seek.
     #[test]
@@ -1722,7 +2248,11 @@ mod tests {
         for asset in ["01__p300__lfa__hf144", "01__p600__3t__hf160+96"] {
             let bytes = asset_bytes(asset);
             let handle = std::thread::Builder::new()
-                .stack_size(if cfg!(debug_assertions) { 512 * 1024 } else { 448 * 1024 })
+                // 448 KiB mirrors the foobar2000 decode thread's 544 KiB
+                // budget (release); debug builds need more headroom for the
+                // same code (the v3 xHE-mid lane widened debug frames; 512
+                // KiB no longer fits, 640 does).
+                .stack_size(if cfg!(debug_assertions) { 640 * 1024 } else { 448 * 1024 })
                 .spawn(move || {
                     let mut d = store_decoder(&bytes);
                     let playable = d.info().playable_frames;

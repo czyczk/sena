@@ -117,13 +117,19 @@ def parse_init(cp):
     assert len(blob) == cb, "truncated SENA-INIT"
     assert blob[:4] == b"SEN2", blob[:4]
     version = struct.unpack("<H", blob[4:6])[0]
-    assert version == 2, version
+    assert version in (2, 3), version
     profile = {0: 300, 1: 600}[blob[6]]
     three_track = bool(blob[7])
-    lf_rate = struct.unpack("<I", blob[8:12])[0]
-    playable = struct.unpack("<Q", blob[12:20])[0]
-    sha = blob[20:52]
-    p = 52
+    if version >= 3:
+        mid_codec = blob[8]  # 0 = Opus, 1 = xHE-AAC
+        off = 9
+    else:
+        mid_codec = 0
+        off = 8
+    lf_rate = struct.unpack("<I", blob[off:off + 4])[0]
+    playable = struct.unpack("<Q", blob[off + 4:off + 12])[0]
+    sha = blob[off + 12:off + 44]
+    p = off + 44
 
     def take16():
         nonlocal p
@@ -138,19 +144,31 @@ def parse_init(cp):
     assert p == len(blob), "trailing bytes in SENA-INIT"
     return {
         "profile": profile, "three_track": three_track, "lf_rate": lf_rate,
-        "playable": playable, "sha": sha, "asc": asc,
+        "playable": playable, "sha": sha, "asc": asc, "mid_codec": mid_codec,
         "opus_head": opus_head, "hf_head": hf_head,
     }
 
 
-def decode_block(b):
-    """composite ES block -> (mid_packet, [lf_au...], [top_packet...])"""
+def decode_block(b, xhe_mid=False):
+    """composite ES block -> (mid_packet_or_None, [mid_au...], [lf_au...], [top_packet...])"""
     p = 0
     flags = b[p]; p += 1
     assert flags == 0, flags
-    mid_len = struct.unpack("<H", b[p:p + 2])[0]; p += 2
-    mid = b[p:p + mid_len]; p += mid_len
-    assert mid_len > 0
+    if xhe_mid:
+        # counted AU list: count(1) au_index(3) [len(3) + payload]*
+        mc = b[p]; p += 1
+        mid = []
+        if mc:
+            p += 3
+            for _ in range(mc):
+                n = int.from_bytes(b[p:p + 3], "little"); p += 3
+                mid.append(b[p:p + n]); p += n
+        mid_pkt = None
+    else:
+        mid_len = struct.unpack("<H", b[p:p + 2])[0]; p += 2
+        mid_pkt = b[p:p + mid_len]; p += mid_len
+        assert mid_len > 0
+        mid = []
     lf_count = b[p]; p += 1
     lf = []
     if lf_count:
@@ -164,7 +182,7 @@ def decode_block(b):
         n = struct.unpack("<H", b[p:p + 2])[0]; p += 2
         hf.append(b[p:p + n]); p += n
     assert p == len(b), "trailing bytes in block"
-    return mid, lf, hf
+    return mid_pkt, mid, lf, hf
 
 
 # ---------- workdir elementary streams ----------
@@ -183,7 +201,7 @@ def m4a_aus(path):
             pp += szz
         return out
 
-    sizes, mstart = None, None
+    sizes, mstart, stco0 = None, None, None
     for tg, s_, e_ in boxes(0, len(f)):
         if tg == b"mdat":
             mstart = s_
@@ -207,7 +225,14 @@ def m4a_aus(path):
                                         int.from_bytes(f[s6 + 12 + 4 * i:s6 + 16 + 4 * i], "big")
                                         for i in range(n)
                                     ]
-    off = mstart + 2  # exhale's 2-byte "informative" mdat preamble
+                                if t6 == b"stco":
+                                    n = int.from_bytes(f[s6 + 4:s6 + 8], "big")
+                                    if n:
+                                        stco0 = int.from_bytes(f[s6 + 8:s6 + 12], "big")
+    # stco's first chunk offset is authoritative when present (exhale's
+    # variable "informative" preamble; FhG/mp4v2 has none); the 2-byte
+    # preamble assumption is only a fallback for old exhale files.
+    off = stco0 if stco0 is not None else mstart + 2
     aus = []
     for sz_ in sizes:
         aus.append(f[off:off + sz_])
@@ -324,43 +349,57 @@ def bsig(ref, dec, lo, hi):
 
 def main():
     inp, profile_s, sena_path, wd = sys.argv[1:5]
-    profile = int(profile_s)
+    xfi = profile_s.endswith("xfi")
+    profile = int(profile_s.removesuffix("xfi").removesuffix("o"))
     tracks, clusters, frames = parse_sena(sena_path)
     assert len(tracks) == 1 and tracks[1]["codec"] == "A_MS/ACM", tracks
     init = parse_init(tracks[1]["private"])
     assert init["profile"] == profile, (init["profile"], profile)
-    exp_name = f"Sena xAAC-Opus@{profile}" + ("-Opus@12000" if init["three_track"] else "")
+    xhe_mid = init["mid_codec"] == 1
+    assert xhe_mid == xfi, (xhe_mid, xfi)
+    exp_name = f"Sena xAAC-{'xAAC' if xhe_mid else 'Opus'}@{profile}" + \
+        ("-Opus@12000" if init["three_track"] else "")
     assert tracks[1].get("name") == exp_name, tracks[1].get("name")
     assert clusters > 10, clusters
     playable = init["playable"]
 
-    mid_pkts, lf_aus, top_pkts = [], [], []
+    mid_pkts, mid_aus, lf_aus, top_pkts = [], [], [], []
     for i, blk in enumerate(frames[1]):
-        mid, lf, top = decode_block(blk)
-        mid_pkts.append(mid)
+        mid_pkt, maus, lf, top = decode_block(blk, xhe_mid)
+        if mid_pkt is not None:
+            mid_pkts.append(mid_pkt)
+        mid_aus.extend(maus)
         lf_aus.extend(lf)  # block order + in-block order = absolute AU order
         top_pkts.extend(top)
 
     lf_ref = m4a_aus(f"{wd}/lf.m4a")
     assert len(lf_ref) == len(lf_aus) and all(a == b for a, b in zip(lf_ref, lf_aus)), "LF AUs differ"
-    mid_ogg = f"{wd}/mid.opus" if init["three_track"] else f"{wd}/hf.opus"
-    mid_ref = ogg_audio(mid_ogg)
-    assert len(mid_ref) == len(mid_pkts) and all(a == b for a, b in zip(mid_ref, mid_pkts)), \
-        "mid packets differ or tags not stripped"
+    if xhe_mid:
+        mid_ref = m4a_aus(f"{wd}/mid.m4a")
+        assert len(mid_ref) == len(mid_aus) and all(a == b for a, b in zip(mid_ref, mid_aus)), \
+            "mid AUs differ"
+    else:
+        mid_ogg = f"{wd}/mid.opus" if init["three_track"] else f"{wd}/hf.opus"
+        mid_ref = ogg_audio(mid_ogg)
+        assert len(mid_ref) == len(mid_pkts) and all(a == b for a, b in zip(mid_ref, mid_pkts)), \
+            "mid packets differ or tags not stripped"
     if init["three_track"]:
         top_ref = ogg_audio(f"{wd}/hf.opus")
         assert len(top_ref) == len(top_pkts) and all(a == b for a, b in zip(top_ref, top_pkts)), \
             "top packets differ or tags not stripped"
-    print(f"container OK: {len(lf_aus)} LF AUs, {len(mid_pkts)} mid + "
+    print(f"container OK: {len(lf_aus)} LF AUs, {len(mid_pkts) or len(mid_aus)} mid + "
           f"{len(top_pkts)} top packets, {clusters} clusters, "
           f"three_track={init['three_track']}")
 
     subprocess.run(["xhedec", f"{wd}/lf.m4a", f"{wd}/lf_dec.wav"], check=True)
-    head = init["opus_head"]
-    pre_skip = struct.unpack("<H", head[10:12])[0]
-    with open(f"{wd}/mid_re.opus", "wb") as fh:
-        fh.write(make_opus_ogg(head, mid_pkts, pre_skip, playable + pre_skip))
-    subprocess.run(["opusdec", "--quiet", "--force-wav", f"{wd}/mid_re.opus", f"{wd}/hf_dec.wav"], check=True)
+    if xhe_mid:
+        subprocess.run(["xhedec", f"{wd}/mid.m4a", f"{wd}/hf_dec.wav"], check=True)
+    else:
+        head = init["opus_head"]
+        pre_skip = struct.unpack("<H", head[10:12])[0]
+        with open(f"{wd}/mid_re.opus", "wb") as fh:
+            fh.write(make_opus_ogg(head, mid_pkts, pre_skip, playable + pre_skip))
+        subprocess.run(["opusdec", "--quiet", "--force-wav", f"{wd}/mid_re.opus", f"{wd}/hf_dec.wav"], check=True)
     if init["three_track"]:
         thead = init["hf_head"]
         tskip = struct.unpack("<H", thead[10:12])[0]
@@ -373,9 +412,26 @@ def main():
     lf, fs = sf.read(f"{wd}/lf_dec.wav", dtype="float64", always_2d=True)
     if fs != SR:
         lf = soxr.resample(lf, fs, SR, quality="HQ")
-    hp, _ = sf.read(f"{wd}/hf_dec.wav", dtype="float64", always_2d=True)
+    hp, fs_hp = sf.read(f"{wd}/hf_dec.wav", dtype="float64", always_2d=True)
+    if fs_hp != SR:
+        hp = soxr.resample(hp, fs_hp, SR, quality="HQ")
     lf /= PAD
     hp /= PAD
+    lag_l = xcorr_lag(ref.mean(axis=1), lf.mean(axis=1), SR)
+    # Per-lane alignment: an xHE mid carries the 1024-sample core warmup
+    # (~1115 @48k) while the Opus top rail is pre-skip-trimmed to ~0; trim
+    # each lane with its own lag BEFORE summing (the sum-then-trim form
+    # silently ate the top rail's tail margin).
+    lag_h = xcorr_lag(ref.mean(axis=1), hp.mean(axis=1), SR)
+    exp_lag = -(1024 * SR // init["lf_rate"])
+    assert abs(lag_l - exp_lag) <= 8, f"xhe lag {lag_l} vs {exp_lag}"
+    exp_lag_h = -(1024 * SR // 44100) if xhe_mid else 0
+    assert abs(lag_h - exp_lag_h) <= 8, f"mid lag {lag_h} vs {exp_lag_h}"
+
+    def appl(x, lag):
+        return x[lag:] if lag >= 0 else x[-lag:]
+
+    hp = appl(hp, lag_h)
     if init["three_track"]:
         hp2, fs2 = sf.read(f"{wd}/hf2_dec.wav", dtype="float64", always_2d=True)
         hp2 /= PAD
@@ -383,20 +439,15 @@ def main():
         # baseband: shift it back up (analytic signal times
         # exp(+2j*pi*fc*t), take real part) before summing with the mid.
         assert fs2 == SR, fs2
+        # The top rail is pre-skip trimmed (lag 0 by construction); xcorr
+        # against the full-band ref is unreliable on the thin 12 kHz+ slice.
+        hp2 = appl(hp2, 0)
         t = np.arange(len(hp2)) / SR
         hp2 = np.real(hilbert(hp2, axis=0) * np.exp(2j * np.pi * HF_SPLIT_HZ * t)[:, None])
         m = min(len(hp), len(hp2))
         hp = hp[:m] + hp2[:m]
-    lag_l = xcorr_lag(ref.mean(axis=1), lf.mean(axis=1), SR)
-    lag_h = xcorr_lag(ref.mean(axis=1), hp.mean(axis=1), SR)
-    exp_lag = -(1024 * SR // init["lf_rate"])
-    assert abs(lag_l - exp_lag) <= 8, f"xhe lag {lag_l} vs {exp_lag}"
-    assert abs(lag_h) <= 8, f"opus lag {lag_h}"
 
-    def appl(x, lag):
-        return x[lag:] if lag >= 0 else x[-lag:]
-
-    lfs, hps = appl(lf, lag_l), appl(hp, lag_h)
+    lfs, hps = appl(lf, lag_l), hp
     assert playable == len(ref), (playable, len(ref))
     n = playable
     sena = lfs[:n] + hps[:n]
