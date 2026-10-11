@@ -453,7 +453,16 @@ pub fn decode(demux: &Demuxed) -> Result<Decoded, DecodeError> {
                         });
                     }
                     let after: Vec<f64> = raw[trim * 2..].iter().map(|&s| f64::from(s)).collect();
-                    let up = Resampler::new(rate, SAMPLE_RATE).process(&after, 2);
+                    let up = if rate == sena_core::XFI_MID_RATE {
+                        Resampler::new_with_passband(
+                            rate,
+                            SAMPLE_RATE,
+                            sena_core::XFI_MID_RESAMPLE_PASS_HZ,
+                        )
+                        .process(&after, 2)
+                    } else {
+                        Resampler::new(rate, SAMPLE_RATE).process(&after, 2)
+                    };
                     // Reuse the Opus-info accounting slot; playable mapping
                     // is the constant warmup shift (raw_core - 1024) as in
                     // the LF timeline model.

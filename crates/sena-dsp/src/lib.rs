@@ -172,8 +172,6 @@ impl Resampler {
         }
         let g = gcd(fs_in, fs_out);
         let n = (fs_out / g) as usize;
-        let m = (fs_in / g) as usize;
-        let fs_lcm = fs_in as u64 * n as u64;
         let min_nyq = fs_in.min(fs_out) as f64 / 2.0;
         // Upsampling (n > 1): the sinc zeros must sit at multiples of the
         // input sample spacing (cutoff = input Nyquist) so that the
@@ -183,8 +181,35 @@ impl Resampler {
         } else {
             0.90 * min_nyq
         };
-        let trans = min_nyq - pass;
-        let fc_sinc = if n > 1 { min_nyq } else { pass + 0.5 * trans };
+        Self::build(fs_in, fs_out, min_nyq - pass)
+    }
+
+    /// Band-limited variant: the passband edge is `pass_hz` (content is
+    /// known to end there) while the stopband still starts at the smaller
+    /// Nyquist. The default constructor preserves ~98% of Nyquist, which
+    /// for awkward ratios (e.g. 44100 -> 48000, lcm 7.056 MHz) forces a
+    /// ~192k-tap kernel; a band-limited content spec shrinks the kernel
+    /// proportionally with no in-band consequence.
+    pub fn new_with_passband(fs_in: u32, fs_out: u32, pass_hz: f64) -> Self {
+        if fs_in == fs_out {
+            return Self::with_kernel(1, 1, vec![1.0], 0, 0);
+        }
+        let min_nyq = fs_in.min(fs_out) as f64 / 2.0;
+        let trans = min_nyq - pass_hz;
+        assert!(pass_hz > 0.0 && trans > 0.0, "bad passband spec");
+        Self::build(fs_in, fs_out, trans)
+    }
+
+    fn build(fs_in: u32, fs_out: u32, trans: f64) -> Self {
+        let g = gcd(fs_in, fs_out);
+        let n = (fs_out / g) as usize;
+        let m = (fs_in / g) as usize;
+        let fs_lcm = fs_in as u64 * n as u64;
+        let min_nyq = fs_in.min(fs_out) as f64 / 2.0;
+        // Upsampling keeps the sinc cutoff at the input Nyquist (the
+        // interpolation property at original sample points); downsampling
+        // centers the transition band.
+        let fc_sinc = if n > 1 { min_nyq } else { min_nyq - 0.5 * trans };
         let taps = ((fs_lcm as f64) * 12.0 / trans).ceil() as usize | 1;
         let delay = (taps - 1) / 2;
         let win = kaiser_window(taps);
@@ -448,8 +473,16 @@ pub struct StreamResampler {
 
 impl StreamResampler {
     pub fn new(fs_in: u32, fs_out: u32) -> Self {
+        Self::with_resampler(Resampler::new(fs_in, fs_out))
+    }
+
+    pub fn new_with_passband(fs_in: u32, fs_out: u32, pass_hz: f64) -> Self {
+        Self::with_resampler(Resampler::new_with_passband(fs_in, fs_out, pass_hz))
+    }
+
+    fn with_resampler(base: Resampler) -> Self {
         Self {
-            base: Resampler::new(fs_in, fs_out),
+            base,
             pend: Vec::new(),
             pend_start: 0,
             total_in: 0,

@@ -181,6 +181,12 @@ pub const XFI_MID_KBPS: u32 = 128;
 /// Stream rate of the xHE-AAC mid layer (encoder-enforced, CBR).
 pub const XFI_MID_RATE: u32 = 44100;
 
+/// The xfi mid band carries at most the 12 kHz-split content, so the
+/// 44.1 kHz <-> 48 kHz resamples only need a 13 kHz passband (stopband at
+/// the 22.05 kHz Nyquist as usual) — the full-Nyquist spec would force a
+/// ~192k-tap kernel at the 7.056 MHz lcm for zero audible benefit.
+pub const XFI_MID_RESAMPLE_PASS_HZ: f64 = 13_000.0;
+
 /// Nominal top-band rate for the xfi family: 96k at the 256k minimum,
 /// +1k per +1k total, capped at 128k (reached at 288k).
 pub fn xfi_hf_kbps(total_kbps: u32) -> u32 {

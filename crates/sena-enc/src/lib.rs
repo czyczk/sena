@@ -712,9 +712,10 @@ pub fn encode_stream<R: std::io::Read>(
                             ));
                         }
                         RailRole::MidXhe44 => {
-                            mid44_rs = Some(StreamResampler::new(
+                            mid44_rs = Some(StreamResampler::new_with_passband(
                                 SAMPLE_RATE,
                                 sena_core::XFI_MID_RATE,
+                                sena_core::XFI_MID_RESAMPLE_PASS_HZ,
                             ));
                             mid_wr = Some(RailSink::Pipe(
                                 name,
@@ -741,9 +742,10 @@ pub fn encode_stream<R: std::io::Read>(
                             )?));
                         }
                         RailRole::MidXhe44 => {
-                            mid44_rs = Some(StreamResampler::new(
+                            mid44_rs = Some(StreamResampler::new_with_passband(
                                 SAMPLE_RATE,
                                 sena_core::XFI_MID_RATE,
+                                sena_core::XFI_MID_RESAMPLE_PASS_HZ,
                             ));
                             mid_wr = Some(RailSink::File(wav::WavWriter::create(
                                 &wdp.join("mid44.wav"),
@@ -887,9 +889,13 @@ pub fn encode_stream<R: std::io::Read>(
                 // playable end on the golden clip).
                 let m = rs.push(&mid_p, ch);
                 mid_wr.as_mut().unwrap().push(&m)?;
+                // + 4 warmup frames of slack: the coverage gate needs
+                // playable + warmup + AU quantization, and a seek into the
+                // tail additionally needs the decode-side resampler guard
+                // (a 2-AU pad left the tail 5.5 ms short on tail seeks).
                 let min_frames = (sena_core::XFI_MID_RATE as usize * 2 / 5).max(
                     playable * sena_core::XFI_MID_RATE as usize / SAMPLE_RATE as usize
-                        + 2 * sena_core::XHE_WARMUP_CORE,
+                        + 4 * sena_core::XHE_WARMUP_CORE,
                 );
                 let mut pad_iters = 0;
                 while rs.output_frames_total() < min_frames {
