@@ -9,3 +9,4 @@ sena-dsp.workspace = true
 sena-mux.workspace = true
 sena-enc.workspace = true
 ctrlc.workspace = true
+clap.workspace = true

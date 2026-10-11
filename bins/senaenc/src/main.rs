@@ -8,36 +8,100 @@ use sena_core::{
 use sena_enc::{EncoderConfig, exhale_version, opusenc_version, version_ge};
 use std::path::{Path, PathBuf};
 
-fn usage() -> ! {
-    eprintln!(
-        "usage: senaenc [--profile 300o|600o|300xfi|600xfi] [--opus-original|--opus-senav] \
-         [--opus-topband-stereo <1-500>] [--hf-tilt <0-100>] [--bypass-recommendations] \
-         <bitrate_kbps> <in.wav|-> <out.sena>\n\
-         profile names: <lf split Hz><mid codec>: 300o/600o = Opus mid (default; bare \
-         300/600 still accepted), 300xfi/600xfi = Fraunhofer-IIS xHE-AAC CBR 128k@44.1kHz \
-         mid via ezcd-cli (always three-track, totals {XFI_MIN_TOTAL_KBPS}-{XFI_MAX_TOTAL_KBPS}k \
-         only, extras feed the top band 96k->128k)\n\
-         [--opus-topband-stereo <1-500>] [--hf-tilt <0-100>] [--bypass-recommendations] \
-         <bitrate_kbps> <in.wav|-> <out.sena>\n\
-         --opus-topband-stereo <k>: passed straight to the opusenc-senav mid encode \
-         (AUDIFF_TOPBAND_STEREO); default = the Opus budget when using opus-senav at a \
-         total in [192, 256) kbit/s; ignored (with a warning) with --opus-original; \
-         never applied to the 15600 Hz+ top track\n\
-         --hf-tilt <pct>: optional gentle high-frequency tilt on the Opus band (percent of the \
-         reference curve; 0 = off; default off)\n\
-         --tmpdir <dir>: parent dir for the spool workdir (e.g. a RAM disk); \
-         falls back to the system temp dir when missing/full\n\
-         totals >= {THREE_TRACK_MIN_KBPS}k use the three-track layout: exhale LF + \
-         Opus mid (600 Hz..12 kHz) + Opus top (12 kHz+ band shifted to baseband, \
-         16 kHz stream; 96k nominal, 128k at totals >= 320k)\n\
-         senaenc doctor                              check required encoder tools\n\
-         minimum bitrate: {}k (@600) / {}k (@300); below {RECOMMENDED_MIN_TOTAL_KBPS}k plain Opus\n\
-         is recommended and senaenc refuses unless --bypass-recommendations is given\n\
-         default profile: 600; default opus: original <= {SENAV_THRESHOLD_KBPS}k, senav above",
-        Profile::At600.min_total_kbps(),
-        Profile::At300.min_total_kbps(),
-    );
-    std::process::exit(2);
+use clap::{CommandFactory, Parser, Subcommand};
+
+/// senaenc: WAV -> .sena encoder CLI.
+#[derive(Parser)]
+#[command(
+    name = "senaenc",
+    version,
+    about = "Sena encoder: WAV -> .sena (exhale LF + Opus/xHE-AAC mid + Opus top)",
+    override_usage = "senaenc [OPTIONS] <BITRATE_KBPS> <IN.WAV|-> <OUT.SENA>\n       senaenc doctor",
+    args_conflicts_with_subcommands = true
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Cmd>,
+
+    /// Encoding profile: <LF split Hz><mid codec>. 300o/600o = Opus mid
+    /// (bare 300/600 still accepted); 300xfi/600xfi = Fraunhofer-IIS
+    /// xHE-AAC CBR 128k @ 44.1 kHz mid via ezcd-cli (always three-track;
+    /// totals 256-288k only, extras feed the top band 96k->128k).
+    #[arg(long, default_value = "600o", value_parser = parse_profile, value_name = "PROFILE")]
+    profile: (Profile, MidCodec),
+
+    /// Force the stock opusenc build for the Opus rails (default: original
+    /// at totals <= 192k, senav above).
+    #[arg(long, conflicts_with = "opus_senav")]
+    opus_original: bool,
+    /// Force the SenaV-tuned opusenc build for the Opus rails.
+    #[arg(long)]
+    opus_senav: bool,
+
+    /// Passed straight to the opusenc-senav mid encode as
+    /// AUDIFF_TOPBAND_STEREO (kbps). Default: the Opus budget when senav is
+    /// used at totals in [192, 256); ignored (with a warning) under
+    /// --opus-original; never applied to the 12 kHz+ top track.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=500), value_name = "1-500")]
+    opus_topband_stereo: Option<u64>,
+
+    /// Optional gentle high-frequency tilt on the Opus band (percent of the
+    /// reference curve; 0 = off; default off).
+    #[arg(long, value_parser = parse_tilt, value_name = "0-100")]
+    hf_tilt: Option<f64>,
+
+    /// Parent dir for the spool workdir (e.g. a RAM disk like Z:\);
+    /// falls back to the system temp dir when missing or full. Workdirs
+    /// are per-run unique, cleaned on every perceivable exit, and stale
+    /// leftovers (>1 h) are swept at startup.
+    #[arg(long, value_name = "DIR")]
+    tmp_dir: Option<PathBuf>,
+
+    /// Keep the workdir after a successful encode (debug; prints its path).
+    #[arg(long)]
+    keep_workdir: bool,
+    /// Overwrite an existing output file.
+    #[arg(long)]
+    force: bool,
+    /// Encode below the recommended minimum bitrate anyway.
+    #[arg(long)]
+    bypass_recommendations: bool,
+
+    /// Total Sena bitrate in kbit/s (see README for the per-profile
+    /// minimums and the recommended floor).
+    #[arg(value_name = "BITRATE_KBPS")]
+    bitrate_kbps: Option<u32>,
+    /// Input WAV file; '-' reads stdin (foobar2000 converter pipes).
+    #[arg(value_name = "IN.WAV|-")]
+    input: Option<PathBuf>,
+    /// Output .sena path (refuses to overwrite without --force).
+    #[arg(value_name = "OUT.SENA")]
+    output: Option<PathBuf>,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Check the required encoder tools (exhale, opusenc, ezcd-cli).
+    Doctor,
+}
+
+fn parse_profile(s: &str) -> Result<(Profile, MidCodec), String> {
+    match s {
+        "300" | "300o" => Ok((Profile::At300, MidCodec::Opus)),
+        "600" | "600o" => Ok((Profile::At600, MidCodec::Opus)),
+        "300xfi" => Ok((Profile::At300, MidCodec::Xhe)),
+        "600xfi" => Ok((Profile::At600, MidCodec::Xhe)),
+        _ => Err("expected 300o | 600o | 300xfi | 600xfi".into()),
+    }
+}
+
+fn parse_tilt(s: &str) -> Result<f64, String> {
+    let v: f64 = s.parse().map_err(|_| "expected a number in 0..=100".to_string())?;
+    if (0.0..=100.0).contains(&v) {
+        Ok(v)
+    } else {
+        Err("expected a number in 0..=100".into())
+    }
 }
 
 /// Name candidates to probe in one directory: the name as-is, then the
@@ -253,72 +317,33 @@ fn doctor() -> i32 {
 
 fn main() {
     use std::io::IsTerminal;
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.len() == 1 && args[0] == "doctor" {
+    let cli = Cli::parse();
+    if matches!(cli.command, Some(Cmd::Doctor)) {
         std::process::exit(doctor());
     }
-    let mut profile = Profile::At600;
-    let mut mid_codec = MidCodec::Opus;
-    let mut opus_mode: Option<bool> = None; // None = auto
-    let keep_workdir = args.iter().any(|a| a == "--keep-workdir");
-    let force = args.iter().any(|a| a == "--force");
-    let bypass = args.iter().any(|a| a == "--bypass-recommendations");
-    let mut hf_tilt_pct: Option<f64> = None;
-    let mut topband_flag: Option<u32> = None;
-    let mut tmpdir: Option<std::path::PathBuf> = None;
-    let mut rest = vec![];
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--profile" => {
-                i += 1;
-                (profile, mid_codec) = match args.get(i).map(|s| s.as_str()) {
-                    Some("300") | Some("300o") => (Profile::At300, MidCodec::Opus),
-                    Some("600") | Some("600o") => (Profile::At600, MidCodec::Opus),
-                    Some("300xfi") => (Profile::At300, MidCodec::Xhe),
-                    Some("600xfi") => (Profile::At600, MidCodec::Xhe),
-                    _ => usage(),
-                };
-            }
-            "--opus-original" => opus_mode = Some(false),
-            "--opus-senav" => opus_mode = Some(true),
-            "--opus-topband-stereo" => {
-                i += 1;
-                let v: u32 = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(0);
-                if !(1..=500).contains(&v) {
-                    usage();
-                }
-                topband_flag = Some(v);
-            }
-            "--hf-tilt" => {
-                i += 1;
-                let v: f64 = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(-1.0);
-                if !(0.0..=100.0).contains(&v) {
-                    usage();
-                }
-                hf_tilt_pct = if v > 0.0 { Some(v) } else { None };
-            }
-            "--tmpdir" => {
-                i += 1;
-                tmpdir = match args.get(i) {
-                    Some(d) => Some(std::path::PathBuf::from(d)),
-                    None => usage(),
-                };
-            }
-            "--keep-workdir" => {}
-            "--force" => {}
-            "--bypass-recommendations" => {}
-            a if a.starts_with('-') && rest.is_empty() => usage(),
-            a => rest.push(a.to_string()),
-        }
-        i += 1;
-    }
-    if rest.len() != 3 {
-        usage();
-    }
-    let kbps: u32 = rest[0].parse().unwrap_or_else(|_| usage());
-    let input = PathBuf::from(&rest[1]);
-    let output = PathBuf::from(&rest[2]);
+    let (profile, mid_codec) = cli.profile;
+    let opus_mode: Option<bool> = if cli.opus_original {
+        Some(false)
+    } else if cli.opus_senav {
+        Some(true)
+    } else {
+        None
+    };
+    let keep_workdir = cli.keep_workdir;
+    let force = cli.force;
+    let bypass = cli.bypass_recommendations;
+    let hf_tilt_pct = cli.hf_tilt.filter(|&v| v > 0.0);
+    let topband_flag = cli.opus_topband_stereo.map(|v| v as u32);
+    let tmpdir = cli.tmp_dir;
+    let (kbps, input, output) = match (cli.bitrate_kbps, cli.input, cli.output) {
+        (Some(b), Some(i), Some(o)) => (b, i, o),
+        _ => Cli::command()
+            .error(
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "expected <BITRATE_KBPS> <IN.WAV|-> <OUT.SENA>",
+            )
+            .exit(),
+    };
 
     let xfi = mid_codec == MidCodec::Xhe;
     if xfi && !(XFI_MIN_TOTAL_KBPS..=XFI_MAX_TOTAL_KBPS).contains(&kbps) {

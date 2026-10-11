@@ -24,6 +24,7 @@ sena-enc = { path = "crates/sena-enc" }
 sena-dec = { path = "crates/sena-dec" }
 rustfft = "6"
 fs2 = "0.4"
+clap = { version = "4", features = ["derive"] }
 ctrlc = { version = "3", features = ["termination"] }
 opus-decoder = { path = "../ropus/crates/opus-decoder", default-features = false }
 sha2 = "0.10"
