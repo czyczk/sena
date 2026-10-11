@@ -164,6 +164,12 @@ impl WavStream {
         }
     }
 
+    /// Total frame count declared by the WAV header (None when the
+    /// streaming/unknown-length convention is used).
+    pub fn declared_frames(&self) -> Option<usize> {
+        self.declared_frames
+    }
+
     /// Append bytes; tries to parse the header once enough is available.
     pub fn feed(&mut self, bytes: &[u8]) -> Result<(), Error> {
         self.buf.extend_from_slice(bytes);
@@ -312,6 +318,7 @@ impl WavStream {
 /// f64 samples (s16 or f32), patches the RIFF/data sizes on finish.
 pub struct WavWriter {
     f: std::fs::File,
+    path: std::path::PathBuf,
     bits: usize,
     body: u64,
 }
@@ -324,7 +331,32 @@ impl WavWriter {
         write_hdr(&mut hdr, rate, ch, bits, 0);
         f.write_all(&hdr)?;
         f.seek(std::io::SeekFrom::End(0))?;
-        Ok(Self { f, bits: bits as usize, body: 0 })
+        Ok(Self { f, path: path.to_path_buf(), bits: bits as usize, body: 0 })
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    /// Move the in-progress file to `new_path` (another filesystem, e.g.
+    /// the fallback volume after ENOSPC) and continue appending there.
+    /// The header length fields stay zero until finish() patches them, so
+    /// relocation mid-stream is just a copy plus a re-open.
+    pub fn relocate(&mut self, new_path: &std::path::Path) -> Result<(), Error> {
+        use std::io::{Seek, Write};
+        self.f.flush().map_err(Error::Io)?;
+        std::fs::copy(&self.path, new_path).map_err(Error::Io)?;
+        // Free the source volume immediately (it may be a full RAM disk).
+        std::fs::remove_file(&self.path).map_err(Error::Io)?;
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(new_path)
+            .map_err(Error::Io)?;
+        f.seek(std::io::SeekFrom::End(0)).map_err(Error::Io)?;
+        self.f = f;
+        self.path = new_path.to_path_buf();
+        Ok(())
     }
 
     pub fn push(&mut self, x: &[f64]) -> Result<(), Error> {
@@ -373,6 +405,28 @@ impl WavWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wav_writer_relocate_preserves_content() {
+        let dir = std::env::temp_dir().join(format!("wav-reloc-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.wav");
+        let b = dir.join("b.wav");
+        let mut w = WavWriter::create(&a, 44100, 16, 2).unwrap();
+        w.push(&[0.0, 0.5, -0.5, 0.25]).unwrap();
+        w.relocate(&b).unwrap();
+        assert!(!a.exists(), "source must be freed after relocation");
+        w.push(&[1.0, -1.0]).unwrap();
+        w.finish().unwrap();
+        let (x, ch, rate) = read_f64(&b).unwrap();
+        assert_eq!((ch, rate), (2, 44100));
+        assert_eq!(x.len(), 6);
+        let expect = [0.0f64, 0.5, -0.5, 0.25, 32767.0 / 32768.0, -1.0];
+        for (g, e) in x.iter().zip(expect) {
+            assert!((g - e).abs() < 1.0 / 32768.0 + 1e-9, "{g} vs {e}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn reads_24bit_and_float_at_odd_rates() {

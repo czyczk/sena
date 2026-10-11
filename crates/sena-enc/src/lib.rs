@@ -8,6 +8,7 @@ use std::process::Command;
 
 pub mod ogg;
 pub mod wav;
+pub mod workdir;
 
 /// Errors surfaced to the CLI.
 #[derive(Debug)]
@@ -55,11 +56,27 @@ pub struct EncoderConfig<'a> {
     /// ezcd-cli executable (required when `mid_codec` is `Xhe`): probed as
     /// `ezcd-cli` then `ezcd-cli-portable` next to senaenc, then on PATH.
     pub ezcd_cli: Option<&'a str>,
+    /// Base directory for the workdir: a unique `senaenc-<pid>-<rand>`
+    /// subdir is created under it after a free-space preflight (needs the
+    /// input length, known once the WAV header is parsed).
     pub workdir: &'a Path,
+    /// Fallback base when the primary fails the preflight or fills up
+    /// mid-encode (the LF spool is relocated there; see workdir.rs).
+    pub workdir_fallback: Option<&'a Path>,
+    /// Registry the chosen workdir(s) are reported to for exit cleanup.
+    pub cleanup: Option<workdir::Cleanup>,
     /// Optional gentle HF tilt on the Opus-bound band, percent of the
     /// reference curve (None/0 = off). In the three-track layout the tilt
     /// applies to the mid band only.
     pub hf_tilt_pct: Option<f64>,
+}
+
+/// What an encode run left behind: the workdir actually used (and, when
+/// the LF spool overflowed the primary volume, the fallback dir it was
+/// relocated into).
+pub struct EncodeOutcome {
+    pub workdir: std::path::PathBuf,
+    pub spill_dir: Option<std::path::PathBuf>,
 }
 
 /// Streams of one encoded Sena file (codec payloads exactly as muxed).
@@ -319,12 +336,12 @@ pub fn check_exhale(path: &str) -> Result<(), Error> {
     }
 }
 
-pub fn encode(cfg: &EncoderConfig, input: &Path, output: &Path) -> Result<(), Error> {
+pub fn encode(cfg: &EncoderConfig, input: &Path, output: &Path) -> Result<EncodeOutcome, Error> {
     let mut f = std::fs::File::open(input)?;
     encode_stream(cfg, &mut f, output)
 }
 
-pub fn encode_bytes(cfg: &EncoderConfig, input: &[u8], output: &Path) -> Result<(), Error> {
+pub fn encode_bytes(cfg: &EncoderConfig, input: &[u8], output: &Path) -> Result<EncodeOutcome, Error> {
     let mut bytes = input;
     encode_stream(cfg, &mut bytes, output)
 }
@@ -359,6 +376,7 @@ pub fn encoded_audio_sha256_es(init_zeroed_blob: &[u8], blocks: &[Vec<u8>]) -> [
 /// memory via pipe backpressure, nothing touches disk).
 enum RailSink {
     File(wav::WavWriter),
+    Spool(SpoolWriter),
     Pipe(wav::PipeWavWriter<std::process::ChildStdin>),
 }
 
@@ -366,6 +384,7 @@ impl RailSink {
     fn push(&mut self, x: &[f64]) -> Result<(), Error> {
         match self {
             RailSink::File(w) => w.push(x),
+            RailSink::Spool(w) => w.push(x),
             RailSink::Pipe(w) => w.push(x).map_err(|e| match e {
                 Error::Io(io) if io.kind() == std::io::ErrorKind::BrokenPipe => {
                     Error::Subprocess(format!("encoder closed its input pipe early: {io}"))
@@ -378,6 +397,7 @@ impl RailSink {
     fn finish(self) -> Result<(), Error> {
         match self {
             RailSink::File(w) => w.finish(),
+            RailSink::Spool(w) => w.finish(),
             RailSink::Pipe(w) => {
                 // Dropping the returned ChildStdin closes the pipe (EOF).
                 w.finish().map(|_| ())
@@ -410,6 +430,95 @@ enum RailRole {
     Mid,
     MidXhe44,
     Hf,
+}
+
+/// ENOSPC (unix) / ERROR_DISK_FULL / ERROR_HANDLE_DISK_FULL (Windows).
+fn is_disk_full(e: &std::io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(28) | Some(112) | Some(39))
+}
+
+/// Pick and create the workdir, now that the input header gave us the
+/// track length: preflight the primary base's free space against the
+/// estimated footprint; on short/unknown space or a failed mkdir, fall
+/// back to the secondary base (a warning goes to stderr either way).
+fn choose_workdir(cfg: &EncoderConfig, ws: &wav::WavStream) -> Result<std::path::PathBuf, Error> {
+    let est = ws
+        .declared_frames()
+        .map(|f| workdir::estimate_bytes(cfg.profile.lf_rate(), ws.rate().unwrap_or(SAMPLE_RATE), f as u64, cfg.total_kbps));
+    let fits = |base: &Path| -> bool {
+        match (workdir::free_space(base), est) {
+            (Some(free), Some(need)) => free >= need,
+            (Some(free), None) => free >= 512 * 1024 * 1024,
+            (None, _) => true, // space not measurable: proceed optimistically
+        }
+    };
+    let primary = cfg.workdir;
+    let mut chosen = if fits(primary) {
+        match workdir::create_unique_dir(primary) {
+            Ok(d) => d,
+            Err(_) if cfg.workdir_fallback.is_some() => {
+                let fb = cfg.workdir_fallback.unwrap();
+                eprintln!(
+                    "senaenc: workdir {} unusable, falling back to {}",
+                    primary.display(),
+                    fb.display()
+                );
+                workdir::create_unique_dir(fb)?
+            }
+            Err(e) => return Err(e),
+        }
+    } else if let Some(fb) = cfg.workdir_fallback {
+        eprintln!(
+            "senaenc: workdir {} low on space, falling back to {}",
+            primary.display(),
+            fb.display()
+        );
+        workdir::create_unique_dir(fb)?
+    } else {
+        // No fallback configured: proceed optimistically (the estimate is
+        // conservative; a real ENOSPC still surfaces from the writers).
+        workdir::create_unique_dir(primary)?
+    };
+    if let Some(c) = &cfg.cleanup {
+        c.register(chosen.clone());
+    }
+    Ok(std::mem::take(&mut chosen))
+}
+
+/// The LF rail's file sink (exhale input): a WavWriter that relocates to
+/// the fallback volume on ENOSPC and keeps appending there.
+struct SpoolWriter {
+    w: wav::WavWriter,
+    spill_base: Option<std::path::PathBuf>,
+    cleanup: Option<workdir::Cleanup>,
+    spilled_to: Option<std::path::PathBuf>,
+}
+
+impl SpoolWriter {
+    fn push(&mut self, x: &[f64]) -> Result<(), Error> {
+        match self.w.push(x) {
+            Err(Error::Io(e)) if is_disk_full(&e) && self.spill_base.is_some() => {
+                let base = self.spill_base.clone().unwrap();
+                let dir = workdir::create_unique_dir(&base)?;
+                let newp = dir.join("lf.wav");
+                eprintln!(
+                    "senaenc: workdir volume full; relocating the LF spool to {}",
+                    newp.display()
+                );
+                self.w.relocate(&newp)?;
+                if let Some(c) = &self.cleanup {
+                    c.register(dir.clone());
+                }
+                self.spilled_to = Some(dir);
+                self.w.push(x)
+            }
+            r => r,
+        }
+    }
+
+    fn finish(self) -> Result<(), Error> {
+        self.w.finish()
+    }
 }
 
 /// A spawned encoder child consuming a rail pipe; reaped after the pass.
@@ -471,12 +580,12 @@ pub fn encode_stream<R: std::io::Read>(
     cfg: &EncoderConfig,
     input: &mut R,
     output: &Path,
-) -> Result<(), Error> {
+) -> Result<EncodeOutcome, Error> {
     use sena_dsp::{CrossoverStream, StreamResampler};
 
-    let wd = cfg.workdir;
-    std::fs::create_dir_all(wd)?;
     let mut st = StageTimes::new();
+    let mut wd: Option<std::path::PathBuf> = None;
+    let mut spill_dir: Option<std::path::PathBuf> = None;
 
     let mut ws = wav::WavStream::new();
     let mut norm: Option<StreamResampler> = None;
@@ -497,7 +606,6 @@ pub fn encode_stream<R: std::io::Read>(
     let mut hf_wr: Option<RailSink> = None;
     let mut mid44_rs: Option<StreamResampler> = None;
     let mut piped = PipedSet { children: Vec::new() };
-    let mut exhale_cmd: Option<Command> = None;
     let mut dump_rails = false;
     let hf_rate = if cfg.three_track {
         sena_core::HF_TRACK_RATE
@@ -541,14 +649,16 @@ pub fn encode_stream<R: std::io::Read>(
                 .three_track
                 .then(|| StreamResampler::new(SAMPLE_RATE, sena_core::HF_TRACK_RATE));
             lf_rs = Some(StreamResampler::new(SAMPLE_RATE, lf_rate));
-            // Delivery: exhale is fed a spooled s24 file (its WAV reader
+            // Delivery: exhale is fed a spooled s16 file (its WAV reader
             // seeks); the piped encoders stream f32 over stdin. The
             // SENAENC_DUMP_RAILS knob writes every rail to a workdir file
             // instead of spawning encoders (DSP regression tests).
             dump_rails = std::env::var_os("SENAENC_DUMP_RAILS").is_some();
+            let chosen = choose_workdir(cfg, &ws)?;
+            wd = Some(chosen);
+            let wdp: &Path = wd.as_ref().unwrap();
             if !dump_rails {
-                let (ex, eps) = build_codec_commands(cfg, wd, &mut st)?;
-                exhale_cmd = Some(ex);
+                let eps = build_codec_commands(cfg, wdp, &mut st)?;
                 for (role, name, mut cmd) in eps {
                     let mut child = cmd
                         .stdin(std::process::Stdio::piped())
@@ -588,7 +698,7 @@ pub fn encode_stream<R: std::io::Read>(
                     match role {
                         RailRole::Mid => {
                             mid_wr = Some(RailSink::File(wav::WavWriter::create(
-                                &wd.join("mid.wav"),
+                                &wdp.join("mid.wav"),
                                 SAMPLE_RATE,
                                 32,
                                 2,
@@ -600,7 +710,7 @@ pub fn encode_stream<R: std::io::Read>(
                                 sena_core::XFI_MID_RATE,
                             ));
                             mid_wr = Some(RailSink::File(wav::WavWriter::create(
-                                &wd.join("mid44.wav"),
+                                &wdp.join("mid44.wav"),
                                 sena_core::XFI_MID_RATE,
                                 32,
                                 2,
@@ -608,7 +718,7 @@ pub fn encode_stream<R: std::io::Read>(
                         }
                         RailRole::Hf => {
                             hf_wr = Some(RailSink::File(wav::WavWriter::create(
-                                &wd.join("hf.wav"),
+                                &wdp.join("hf.wav"),
                                 hf_rate,
                                 32,
                                 2,
@@ -624,12 +734,12 @@ pub fn encode_stream<R: std::io::Read>(
             // golden clip and all three real tracks (measured, card 80);
             // keep the frozen encoder's input distribution. Its reader
             // lseeks, so no pipe.
-            lf_wr = Some(RailSink::File(wav::WavWriter::create(
-                &wd.join("lf.wav"),
-                lf_rate,
-                16,
-                2,
-            )?));
+            lf_wr = Some(RailSink::Spool(SpoolWriter {
+                w: wav::WavWriter::create(&wdp.join("lf.wav"), lf_rate, 16, 2)?,
+                spill_base: cfg.workdir_fallback.map(|p| p.to_path_buf()),
+                cleanup: cfg.cleanup.clone(),
+                spilled_to: None,
+            }));
             continue;
         }
 
@@ -764,32 +874,38 @@ pub fn encode_stream<R: std::io::Read>(
             end_tick(&mut st.t, &mut st.write);
         }
     }
+    // The LF spool may have been relocated mid-pass; exhale is built with
+    // the final path, and the fallback dir joins the cleanup set.
+    if let RailSink::Spool(sp) = &lf_wr {
+        if let Some(d) = &sp.spilled_to {
+            spill_dir = Some(d.clone());
+        }
+    }
+    let lf_wav = match &lf_wr {
+        RailSink::Spool(sp) => sp.w.path().to_path_buf(),
+        _ => unreachable!("LF rail is always the spool sink"),
+    };
     lf_wr.finish()?;
     if let Some(mw) = mid_wr {
         mw.finish()?;
     }
     hf_wr.finish()?;
+    let wd = wd.expect("workdir chosen at pipeline init");
+    let outcome = EncodeOutcome { workdir: wd.clone(), spill_dir };
     if dump_rails {
         // DSP-only mode (SENAENC_DUMP_RAILS): rails are workdir files,
         // no encoders were spawned.
-        return Ok(());
+        return Ok(outcome);
     }
     st.begin();
     let reap = piped.reap();
     end_tick(&mut st.t, &mut st.opus);
     reap?;
-    let result = finish_codecs(
-        cfg,
-        wd,
-        playable,
-        output,
-        &mut st,
-        exhale_cmd.expect("codec commands built"),
-    );
+    let result = finish_codecs(cfg, &wd, playable, output, &mut st, &lf_wav);
     if result.is_ok() {
         st.report(playable);
     }
-    result
+    result.map(|_| outcome)
 }
 
 /// Env-gated stage timing for pipeline analysis (SENAENC_TIME=1 prints the
@@ -1047,7 +1163,7 @@ fn build_codec_commands(
     cfg: &EncoderConfig,
     wd: &Path,
     st: &mut StageTimes,
-) -> Result<(Command, Vec<(RailRole, &'static str, Command)>), Error> {
+) -> Result<Vec<(RailRole, &'static str, Command)>, Error> {
     st.begin();
     let ck_err: Option<Error> = check_exhale(cfg.exhale)
         .and_then(|_| {
@@ -1071,11 +1187,6 @@ fn build_codec_commands(
     if xhe_mid && !cfg.three_track {
         return Err(Error::Format("xhe mid requires the three-track layout".into()));
     }
-    let lf_wav = wd.join("lf.wav");
-    let mut ex = Command::new(cfg.exhale);
-    ex.arg(cfg.profile.xhe_preset().to_string())
-        .arg(&lf_wav)
-        .arg(&lf_m4a);
     let (mid_kbps, rail_kbps) = if cfg.three_track {
         if xhe_mid {
             let (_, mid, hf) = sena_core::account3_xfi(cfg.total_kbps, cfg.profile)
@@ -1146,7 +1257,7 @@ fn build_codec_commands(
         }
         pipes.push((RailRole::Hf, "opusenc(hf)", op2));
     }
-    Ok((ex, pipes))
+    Ok(pipes)
 }
 
 /// Run exhale on the spooled LF WAV, extract all streams and mux the
@@ -1158,9 +1269,15 @@ fn finish_codecs(
     playable: usize,
     output: &Path,
     st: &mut StageTimes,
-    mut ex: Command,
+    lf_wav: &Path,
 ) -> Result<(), Error> {
     let lf_m4a = wd.join("lf.m4a");
+    // exhale's input path is resolved only now: the LF spool may have been
+    // relocated to the fallback volume by an ENOSPC during the pass.
+    let mut ex = Command::new(cfg.exhale);
+    ex.arg(cfg.profile.xhe_preset().to_string())
+        .arg(lf_wav)
+        .arg(&lf_m4a);
     let hf_ogg = wd.join("hf.opus");
     let mid_ogg = wd.join("mid.opus");
     let mid_m4a = wd.join("mid.m4a");
@@ -1784,6 +1901,7 @@ mod tests {
         let src = synth_wav(3, 44100, true);
         let wd = std::env::temp_dir().join(format!("sena-enc-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&wd);
+        std::fs::create_dir_all(&wd).unwrap();
         let cfg = EncoderConfig {
             profile: Profile::At300,
             total_kbps: 160,
@@ -1795,13 +1913,16 @@ mod tests {
             opusenc: "/nonexistent/opusenc",
             ezcd_cli: None,
             workdir: &wd,
+            workdir_fallback: None,
+            cleanup: None,
             hf_tilt_pct: None,
         };
         // DSP-only mode: rails land as workdir files, no encoders spawned.
         unsafe { std::env::set_var("SENAENC_DUMP_RAILS", "1") };
         let mut bytes = &src[..];
         let out = wd.join("out.sena");
-        encode_stream(&cfg, &mut bytes, &out).unwrap();
+        let outcome = encode_stream(&cfg, &mut bytes, &out).unwrap();
+        let wdp = outcome.workdir.as_path();
 
         // Reference: the same DSP via the batch functions.
         let (x, ch, in_rate) = wav::read_f64_bytes(&src).unwrap();
@@ -1816,8 +1937,8 @@ mod tests {
         wav::write_s16(&ref_lf, &low16, 16000).unwrap();
         wav::write_f32(&ref_hf, &high_p, SAMPLE_RATE).unwrap();
 
-        let lf = wav::read_f64(&wd.join("lf.wav")).unwrap().0;
-        let hf = wav::read_f64(&wd.join("hf.wav")).unwrap().0;
+        let lf = wav::read_f64(&wdp.join("lf.wav")).unwrap().0;
+        let hf = wav::read_f64(&wdp.join("hf.wav")).unwrap().0;
         let (rlf, _, _) = wav::read_f64(&ref_lf).unwrap();
         let (rhf, _, _) = wav::read_f64(&ref_hf).unwrap();
         assert_eq!(lf.len(), rlf.len(), "LF lengths differ");
@@ -1836,6 +1957,7 @@ mod tests {
         assert!(ml <= 1.0 / 32768.0 + 1e-9, "LF max diff {ml}");
         assert!(mh < 1e-6, "HF max diff {mh}");
         let _ = std::fs::remove_dir_all(&wd);
+        std::fs::create_dir_all(&wd).unwrap();
     }
 
     #[test]
@@ -1845,6 +1967,7 @@ mod tests {
         let src = synth_wav(3, 44100, true);
         let wd = std::env::temp_dir().join(format!("sena-enc-tilt-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&wd);
+        std::fs::create_dir_all(&wd).unwrap();
         let cfg = EncoderConfig {
             profile: Profile::At300,
             total_kbps: 160,
@@ -1856,12 +1979,15 @@ mod tests {
             opusenc: "/nonexistent/opusenc",
             ezcd_cli: None,
             workdir: &wd,
+            workdir_fallback: None,
+            cleanup: None,
             hf_tilt_pct: Some(100.0),
         };
         unsafe { std::env::set_var("SENAENC_DUMP_RAILS", "1") };
         let mut bytes = &src[..];
         let out = wd.join("out.sena");
-        encode_stream(&cfg, &mut bytes, &out).unwrap();
+        let outcome = encode_stream(&cfg, &mut bytes, &out).unwrap();
+        let wdp = outcome.workdir.as_path();
 
         let (x, ch, in_rate) = wav::read_f64_bytes(&src).unwrap();
         let x48 = sena_dsp::Resampler::new(in_rate, SAMPLE_RATE).process(&x, ch);
@@ -1886,7 +2012,7 @@ mod tests {
         let ref_hf = wd.join("ref_hf_tilt.wav");
         let high_p: Vec<f64> = tilted.iter().map(|v| v * PRE_GAIN).collect();
         wav::write_f32(&ref_hf, &high_p, SAMPLE_RATE).unwrap();
-        let hf = wav::read_f64(&wd.join("hf.wav")).unwrap().0;
+        let hf = wav::read_f64(&wdp.join("hf.wav")).unwrap().0;
         let (rhf, _, _) = wav::read_f64(&ref_hf).unwrap();
         assert_eq!(hf.len(), rhf.len(), "HF lengths differ");
         let mh = hf
@@ -1896,6 +2022,7 @@ mod tests {
             .fold(0.0, f64::max);
         assert!(mh < 1e-6, "HF max diff {mh}");
         let _ = std::fs::remove_dir_all(&wd);
+        std::fs::create_dir_all(&wd).unwrap();
     }
 
     /// Build a minimal m4a: moov(trak(mdia(mdhd, minf(stbl(stsd(mp4a(esds)),
@@ -2092,6 +2219,7 @@ mod tests {
         let src = synth_wav(3, 44100, true);
         let wd = std::env::temp_dir().join(format!("sena-enc-3t-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&wd);
+        std::fs::create_dir_all(&wd).unwrap();
         let cfg = EncoderConfig {
             profile: Profile::At300,
             total_kbps: 256,
@@ -2103,12 +2231,15 @@ mod tests {
             opusenc: "/nonexistent/opusenc",
             ezcd_cli: None,
             workdir: &wd,
+            workdir_fallback: None,
+            cleanup: None,
             hf_tilt_pct: None,
         };
         unsafe { std::env::set_var("SENAENC_DUMP_RAILS", "1") };
         let mut bytes = &src[..];
         let out = wd.join("out.sena");
-        encode_stream(&cfg, &mut bytes, &out).unwrap();
+        let outcome = encode_stream(&cfg, &mut bytes, &out).unwrap();
+        let wdp = outcome.workdir.as_path();
 
         let (x, ch, in_rate) = wav::read_f64_bytes(&src).unwrap();
         let x48 = sena_dsp::Resampler::new(in_rate, SAMPLE_RATE).process(&x, ch);
@@ -2124,9 +2255,9 @@ mod tests {
         wav::write_f32(&ref_mid, &mid_p, SAMPLE_RATE).unwrap();
         wav::write_f32(&ref_top, &top_p, sena_core::HF_TRACK_RATE).unwrap();
 
-        let got_mid = wav::read_f64(&wd.join("mid.wav")).unwrap().0;
+        let got_mid = wav::read_f64(&wdp.join("mid.wav")).unwrap().0;
         let (got_top, top_rate) = {
-            let (v, _, r) = wav::read_f64(&wd.join("hf.wav")).unwrap();
+            let (v, _, r) = wav::read_f64(&wdp.join("hf.wav")).unwrap();
             (v, r)
         };
         assert_eq!(top_rate, sena_core::HF_TRACK_RATE);
@@ -2163,5 +2294,6 @@ mod tests {
             assert!((sum_r - high[i * 2 + 1]).abs() < 1e-4, "frame {i} R");
         }
         let _ = std::fs::remove_dir_all(&wd);
+        std::fs::create_dir_all(&wd).unwrap();
     }
 }

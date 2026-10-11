@@ -43,6 +43,14 @@ allocation 11-16% and worsened the 24-144 Hz envelope on the golden
 clip and three real tracks). Set SENAENC_DUMP_RAILS=1 to write rails as workdir
 files instead of spawning encoders (DSP regression tests).
 
+- `--tmpdir <dir>`: parent dir for the spool workdir (point it at a RAM
+  disk, e.g. Windows `--tmpdir Z:\`). A unique `senaenc-<pid>-<rand>`
+  subdir is created per run (multi-instance safe); on low space or a
+  missing/full volume the run falls back to the system temp dir (an ENOSPC
+  mid-encode relocates the LF spool and continues). Workdirs are removed
+  on every perceivable exit (normal, error, panic, Ctrl+C/SIGTERM); a
+  startup sweep deletes `senaenc-*` leftovers older than 1 h from killed
+  processes.
 - `<bitrate_kbps>`: total Sena bitrate. Hard minimum: 64k for @600, 56k for
   @300 (the xHE-AAC allotment plus a 32k Opus floor); lower requests are
   rejected. Below 128k a plain Opus encode is recommended instead and

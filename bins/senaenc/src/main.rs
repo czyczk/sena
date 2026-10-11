@@ -25,6 +25,8 @@ fn usage() -> ! {
          never applied to the 15600 Hz+ top track\n\
          --hf-tilt <pct>: optional gentle high-frequency tilt on the Opus band (percent of the \
          reference curve; 0 = off; default off)\n\
+         --tmpdir <dir>: parent dir for the spool workdir (e.g. a RAM disk); \
+         falls back to the system temp dir when missing/full\n\
          totals >= {THREE_TRACK_MIN_KBPS}k use the three-track layout: exhale LF + \
          Opus mid (600 Hz..12 kHz) + Opus top (12 kHz+ band shifted to baseband, \
          16 kHz stream; 96k nominal, 128k at totals >= 320k)\n\
@@ -260,6 +262,7 @@ fn main() {
     let bypass = args.iter().any(|a| a == "--bypass-recommendations");
     let mut hf_tilt_pct: Option<f64> = None;
     let mut topband_flag: Option<u32> = None;
+    let mut tmpdir: Option<std::path::PathBuf> = None;
     let mut rest = vec![];
     let mut i = 0;
     while i < args.len() {
@@ -291,6 +294,13 @@ fn main() {
                     usage();
                 }
                 hf_tilt_pct = if v > 0.0 { Some(v) } else { None };
+            }
+            "--tmpdir" => {
+                i += 1;
+                tmpdir = match args.get(i) {
+                    Some(d) => Some(std::path::PathBuf::from(d)),
+                    None => usage(),
+                };
             }
             "--keep-workdir" => {}
             "--force" => {}
@@ -489,22 +499,60 @@ fn main() {
         None
     };
 
-    // Spool dir for the one file-based rail (lf.wav for exhale, s24):
-    // prefer tmpfs (/dev/shm) so even that never touches real disk.
-    let wd = {
-        let name = format!("senaenc-{}", std::process::id());
+    // Workdir bases: explicit --tmpdir or the default tmpfs preference,
+    // with the system temp dir as the fallback volume. A unique
+    // senaenc-<pid>-<rand> subdir is created inside after the free-space
+    // preflight (see sena_enc::workdir).
+    let default_base = || {
         let shm = std::path::Path::new("/dev/shm");
         #[cfg(unix)]
         let shm_ok = shm.is_dir();
         #[cfg(not(unix))]
         let shm_ok = false;
-        let _ = shm;
         if shm_ok {
-            shm.join(name)
+            shm.to_path_buf()
         } else {
-            std::env::temp_dir().join(name)
+            std::env::temp_dir()
         }
     };
+    let (wd_primary, wd_fallback) = match &tmpdir {
+        Some(d) => (d.clone(), Some(default_base())),
+        None => {
+            let b = default_base();
+            let t = std::env::temp_dir();
+            if b == t { (b, None) } else { (b, Some(t)) }
+        }
+    };
+    // Reap leftovers from unperceivable exits (SIGKILL/TerminateProcess);
+    // everything perceivable is covered by the guard + signal handlers.
+    sena_enc::workdir::sweep_stale(&wd_primary);
+    if let Some(fb) = &wd_fallback {
+        sena_enc::workdir::sweep_stale(fb);
+    }
+
+    // Exit cleanup: the guard covers normal/error/panic paths; the signal
+    // handler (a normal thread context via ctrlc) covers Ctrl+C/SIGTERM.
+    let cleanup = sena_enc::workdir::Cleanup::new();
+    struct WorkdirGuard {
+        cleanup: sena_enc::workdir::Cleanup,
+        armed: bool,
+    }
+    impl Drop for WorkdirGuard {
+        fn drop(&mut self) {
+            if self.armed {
+                self.cleanup.clean_now();
+            }
+        }
+    }
+    let mut guard = WorkdirGuard { cleanup: cleanup.clone(), armed: true };
+    {
+        let c = cleanup.clone();
+        let _ = ctrlc::set_handler(move || {
+            c.clean_now();
+            std::process::exit(130);
+        });
+    }
+
     let cfg = EncoderConfig {
         profile,
         total_kbps: kbps,
@@ -515,7 +563,9 @@ fn main() {
         exhale: &exhale,
         opusenc: &opusenc,
         ezcd_cli: ezcd_cli.as_deref(),
-        workdir: &wd,
+        workdir: &wd_primary,
+        workdir_fallback: wd_fallback.as_deref(),
+        cleanup: Some(cleanup.clone()),
         hf_tilt_pct,
     };
     // Streaming encode: the input is consumed as the DSP makes progress, so
@@ -526,15 +576,19 @@ fn main() {
     } else {
         sena_enc::encode(&cfg, &input, &output)
     };
-    if let Err(e) = result {
-        eprintln!("error: {e}");
-        let _ = std::fs::remove_dir_all(&wd);
-        std::process::exit(1);
-    }
+    let outcome = match result {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    };
     if keep_workdir {
-        eprintln!("senaenc: workdir kept at {}", wd.display());
-    } else {
-        let _ = std::fs::remove_dir_all(&wd);
+        eprintln!("senaenc: workdir kept at {}", outcome.workdir.display());
+        if let Some(d) = &outcome.spill_dir {
+            eprintln!("senaenc: LF spool relocated to {}", d.display());
+        }
+        guard.armed = false;
     }
     eprintln!("senaenc: wrote {}", output.display());
 }
