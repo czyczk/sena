@@ -43,8 +43,8 @@ allocation 11-16% and worsened the 24-144 Hz envelope on the golden
 clip and three real tracks). Set SENAENC_DUMP_RAILS=1 to write rails as workdir
 files instead of spawning encoders (DSP regression tests).
 
-- `--tmpdir <dir>`: parent dir for the spool workdir (point it at a RAM
-  disk, e.g. Windows `--tmpdir Z:\`). A unique `senaenc-<pid>-<rand>`
+- `--tmp-dir <dir>`: parent dir for the spool workdir (point it at a RAM
+  disk, e.g. Windows `--tmp-dir Z:\`). A unique `senaenc-<pid>-<rand>`
   subdir is created per run (multi-instance safe); on low space or a
   missing/full volume the run falls back to the system temp dir (an ENOSPC
   mid-encode relocates the LF spool and continues). Workdirs are removed
