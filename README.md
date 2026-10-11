@@ -25,7 +25,12 @@ Profile names follow `<lf split Hz><mid codec>`: `300o`/`600o` = Opus mid
 Fraunhofer-IIS xHE-AAC CBR 128k @ 44.1 kHz mid (via ezcd-cli), always the
 three-track layout, nominal totals 256-288k only (everything above 256k
 feeds the top band: 96k at 256k .. 128k at 288k). The LF rail (exhale) is
-identical in both families.
+identical in both families. The FhG core's finalize stage (in-band
+loudness/peak metadata) requires every f32 sample in the closed interval
+[-1, 1] — exactly +/-1.0 passes, one ULP above fails
+(`DeinitCompress rc=4`) — and needs at least one 0.4 s BS.1770 gating
+block: senaenc feeds s16 (clamped to [-1, 1], scaled by 32767, so values
+stay strictly inside (-1, 1)) and pads short inputs with zeros.
 
 - `<bitrate_kbps>`: total Sena bitrate. Hard minimum: 64k for @600, 56k for
   @300 (the xHE-AAC allotment plus a 32k Opus floor); lower requests are

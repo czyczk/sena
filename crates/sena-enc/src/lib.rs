@@ -875,47 +875,6 @@ fn run_codecs(
         (mid, 0)
     };
     let mut cmds: Vec<(&str, &mut Command)> = vec![("exhale", &mut ex)];
-    // xfi mid: resample the 48 kHz mid band WAV down to 44.1 kHz first
-    // (ezcd-cli is driven with --resample off: the SRC is ours).
-    let mut ezcd = None;
-    if xhe_mid {
-        let ezcd_path = cfg.ezcd_cli.ok_or_else(|| {
-            Error::Format("xfi profile requires ezcd-cli (next to senaenc or on PATH)".into())
-        })?;
-        let (x, ch, rate) = wav::read_f64(&mid_wav)?;
-        if rate != SAMPLE_RATE {
-            return Err(Error::Format(format!("mid.wav is {rate} Hz, expected {SAMPLE_RATE}")));
-        }
-        // Extend with 100 ms of zeros so the resampler tail rings out: the
-        // 1024-sample warmup trim must still leave >= playable coverage
-        // (the LF rail gets the same tail from StreamResampler::finish).
-        let mut xext = x;
-        xext.resize(xext.len() + 4800 * ch, 0.0);
-        let m44 = sena_dsp::Resampler::new(SAMPLE_RATE, sena_core::XFI_MID_RATE).process(&xext, ch);
-        let mid44 = wd.join("mid44.wav");
-        // s16 (like the LF rail): ezcd-cli's f32 WAV path mis-encodes at
-        // 44.1 kHz (ACDX_DeinitCompress rc=4); s16/s24 are fine.
-        wav::write_s16(&mid44, &m44, sena_core::XFI_MID_RATE)?;
-        let win_host = is_windows_exe(ezcd_path);
-        let mid44_arg = cli_path(&mid44, win_host)?;
-        let mid_m4a_arg = cli_path(&mid_m4a, win_host)?;
-        let mut c = Command::new(ezcd_path);
-        c.arg("encode")
-            .arg("--encoder")
-            .arg("xhe-aac-fhg-iis")
-            .arg("--mode")
-            .arg("cbr")
-            .arg("--bitrate")
-            .arg(sena_core::XFI_MID_KBPS.to_string())
-            .arg("--sample-rate")
-            .arg(sena_core::XFI_MID_RATE.to_string())
-            .arg("--resample")
-            .arg("off")
-            .arg("-o")
-            .arg(&mid_m4a_arg)
-            .arg(&mid44_arg);
-        ezcd = Some(c);
-    }
     let mut op = Command::new(cfg.opusenc);
     op.arg("--quiet")
         .arg("--bitrate")
@@ -929,9 +888,7 @@ fn run_codecs(
     if cfg.use_senav {
         apply_senav_env(&mut op, cfg.topband_kbps);
     }
-    if let Some(e) = ezcd.as_mut() {
-        cmds.push(("ezcd-cli(mid)", e));
-    } else {
+    if !xhe_mid {
         cmds.push(("opusenc(mid)", &mut op));
     }
     // Three-track top-band encode (A_OPUSHF): the tiered hf nominal
@@ -950,7 +907,93 @@ fn run_codecs(
         cmds.push(("opusenc(hf)", &mut op2));
     }
     let t0 = std::time::Instant::now();
-    let codec_err = run_parallel(&mut cmds);
+    // xfi mid chain (resample 48k -> 44.1k + ezcd-cli) runs on its own
+    // thread, parallel with the exhale/Opus passes: the resample only needs
+    // mid.wav, and serializing it in front of the codec group would add its
+    // whole runtime to every encode.
+    let ezcd_path = if xhe_mid {
+        Some(cfg.ezcd_cli.ok_or_else(|| {
+            Error::Format("xfi profile requires ezcd-cli (next to senaenc or on PATH)".into())
+        })?)
+    } else {
+        None
+    };
+    let codec_err = std::thread::scope(|s| {
+        let mid_m4a = &mid_m4a;
+        let mid_job = if let Some(ezcd_path) = ezcd_path {
+            Some(s.spawn(move || -> Result<(), Error> {
+                let (x, ch, rate) = wav::read_f64(&mid_wav)?;
+                if rate != SAMPLE_RATE {
+                    return Err(Error::Format(format!(
+                        "mid.wav is {rate} Hz, expected {SAMPLE_RATE}"
+                    )));
+                }
+                // Extend with 100 ms of zeros so the resampler tail rings
+                // out: the 1024-sample warmup trim must still leave >=
+                // playable coverage (the LF rail gets the same tail from
+                // StreamResampler::finish).
+                let mut xext = x;
+                xext.resize(xext.len() + 4800 * ch, 0.0);
+                // The FhG core's finalize stage refuses anything shorter
+                // than one BS.1770 gating block (0.4 s), content-
+                // independent; pad short inputs with (inaudible) zeros.
+                let min_frames = SAMPLE_RATE as usize * 2 / 5;
+                if xext.len() < min_frames * ch {
+                    xext.resize(min_frames * ch, 0.0);
+                }
+                let m44 = sena_dsp::Resampler::new(SAMPLE_RATE, sena_core::XFI_MID_RATE)
+                    .process(&xext, ch);
+                let mid44 = wd.join("mid44.wav");
+                let win_host = is_windows_exe(ezcd_path);
+                let mid44_arg = cli_path(&mid44, win_host)?;
+                let mid_m4a_arg = cli_path(&mid_m4a, win_host)?;
+                // The FhG core's finalize stage (mandatory in-band
+                // loudness/peak metadata) requires every f32 sample in
+                // the CLOSED interval [-1, 1]: exactly +/-1.0 passes, one
+                // ULP above fails (DeinitCompress rc=4), independent of
+                // rate/depth/level. s16 output is safe by construction:
+                // write_s16 clamps to [-1, 1] and scales by 32767, so the
+                // encoder-side values stay strictly inside (-1, 1).
+                wav::write_s16(&mid44, &m44, sena_core::XFI_MID_RATE)?;
+                let out = Command::new(ezcd_path)
+                    .arg("encode")
+                    .arg("--encoder")
+                    .arg("xhe-aac-fhg-iis")
+                    .arg("--mode")
+                    .arg("cbr")
+                    .arg("--bitrate")
+                    .arg(sena_core::XFI_MID_KBPS.to_string())
+                    .arg("--sample-rate")
+                    .arg(sena_core::XFI_MID_RATE.to_string())
+                    .arg("--resample")
+                    .arg("off")
+                    .arg("-o")
+                    .arg(&mid_m4a_arg)
+                    .arg(&mid44_arg)
+                    .output()
+                    .map_err(Error::Io)?;
+                if !out.status.success() {
+                    return Err(Error::Subprocess(format!(
+                        "ezcd-cli(mid) failed: {}",
+                        String::from_utf8_lossy(&out.stderr)
+                    )));
+                }
+                Ok(())
+            }))
+        } else {
+            None
+        };
+        let mut err = run_parallel(&mut cmds);
+        if let Some(h) = mid_job {
+            let r = h.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
+            if let Err(e) = r {
+                if err.is_none() {
+                    err = Some(e);
+                }
+            }
+        }
+        err
+    });
     if st.on {
         let d = t0.elapsed().as_secs_f64();
         st.exhale += d;
