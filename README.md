@@ -29,8 +29,19 @@ identical in both families. The FhG core's finalize stage (in-band
 loudness/peak metadata) requires every f32 sample in the closed interval
 [-1, 1] — exactly +/-1.0 passes, one ULP above fails
 (`DeinitCompress rc=4`) — and needs at least one 0.4 s BS.1770 gating
-block: senaenc feeds s16 (clamped to [-1, 1], scaled by 32767, so values
-stay strictly inside (-1, 1)) and pads short inputs with zeros.
+block: senaenc streams f32 clamped to [-1, 1] (non-finite -> 0) and
+zero-pads short inputs.
+
+Encoder input delivery is per-(encoder, rail) contract, not one shared
+temp WAV: opusenc and ezcd-cli stream f32 over stdin (unknown-length WAV
+convention, nothing touches disk, memory bounded by pipe backpressure);
+the xfi mid is resampled 48k -> 44.1 kHz inline during the DSP pass.
+exhale keeps a spooled s16 file (its WAV reader seeks) under a
+tmpfs-preferred workdir — s16 on purpose: exhale's VBR operating point
+is tuned and validated on s16 input (s24 input consistently cut its
+allocation 11-16% and worsened the 24-144 Hz envelope on the golden
+clip and three real tracks). Set SENAENC_DUMP_RAILS=1 to write rails as workdir
+files instead of spawning encoders (DSP regression tests).
 
 - `<bitrate_kbps>`: total Sena bitrate. Hard minimum: 64k for @600, 56k for
   @300 (the xHE-AAC allotment plus a 32k Opus floor); lower requests are

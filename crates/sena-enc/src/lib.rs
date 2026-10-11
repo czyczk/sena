@@ -353,6 +353,114 @@ pub fn encoded_audio_sha256_es(init_zeroed_blob: &[u8], blocks: &[Vec<u8>]) -> [
 /// Full encode pipeline over a streaming input (stdin-safe).
 ///
 /// The WAV is parsed incrementally and pushed through the streaming DSP
+/// Rail delivery sink: each encoder is fed in its own native input domain
+/// (see the contract table on [`rail_layout`]). File sinks spool to the
+/// workdir; pipe sinks stream WAV frames into the encoder's stdin (bounded
+/// memory via pipe backpressure, nothing touches disk).
+enum RailSink {
+    File(wav::WavWriter),
+    Pipe(wav::PipeWavWriter<std::process::ChildStdin>),
+}
+
+impl RailSink {
+    fn push(&mut self, x: &[f64]) -> Result<(), Error> {
+        match self {
+            RailSink::File(w) => w.push(x),
+            RailSink::Pipe(w) => w.push(x).map_err(|e| match e {
+                Error::Io(io) if io.kind() == std::io::ErrorKind::BrokenPipe => {
+                    Error::Subprocess(format!("encoder closed its input pipe early: {io}"))
+                }
+                other => other,
+            }),
+        }
+    }
+
+    fn finish(self) -> Result<(), Error> {
+        match self {
+            RailSink::File(w) => w.finish(),
+            RailSink::Pipe(w) => {
+                // Dropping the returned ChildStdin closes the pipe (EOF).
+                w.finish().map(|_| ())
+            }
+        }
+    }
+}
+
+/// Which rails exist, and with what delivery contract, for the selected
+/// profile family. Contracts (encoder-native input domains):
+///   exhale (LF):        s16 file @ lf_rate (frozen operating point — s24
+///                       input shifted exhale's VBR allocation ~18% on the
+///                       golden clip; its reader lseeks, so no pipe.)
+///   opusenc (mid / HF): f32 pipe (unknown-length convention, read to EOF)
+///   ezcd-cli (xfi mid): f32 pipe @ 44.1 kHz, clamped to [-1, 1] + non-
+///                       finite -> 0 (the FhG finalize-stage contract),
+///                       >= 0.4 s (one BS.1770 gating block) zero-padded
+fn rail_layout(cfg: &EncoderConfig) -> Vec<RailRole> {
+    if !cfg.three_track {
+        vec![RailRole::Hf]
+    } else if cfg.mid_codec == sena_core::MidCodec::Xhe {
+        vec![RailRole::MidXhe44, RailRole::Hf]
+    } else {
+        vec![RailRole::Mid, RailRole::Hf]
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum RailRole {
+    Mid,
+    MidXhe44,
+    Hf,
+}
+
+/// A spawned encoder child consuming a rail pipe; reaped after the pass.
+struct PipedChild {
+    name: &'static str,
+    child: std::process::Child,
+}
+
+struct PipedSet {
+    children: Vec<PipedChild>,
+}
+
+impl PipedSet {
+    /// Reap every child (its stdin was closed when the sink dropped).
+    fn reap(mut self) -> Result<(), Error> {
+        let mut err: Option<Error> = None;
+        for pc in std::mem::take(&mut self.children) {
+            match pc.child.wait_with_output() {
+                Ok(out) if out.status.success() => {}
+                Ok(out) => {
+                    if err.is_none() {
+                        err = Some(Error::Subprocess(format!(
+                            "{} failed: {}",
+                            pc.name,
+                            String::from_utf8_lossy(&out.stderr)
+                        )));
+                    }
+                }
+                Err(e) => {
+                    if err.is_none() {
+                        err = Some(Error::Io(e));
+                    }
+                }
+            }
+        }
+        match err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for PipedSet {
+    fn drop(&mut self) {
+        for pc in &mut self.children {
+            let _ = pc.child.kill();
+            let _ = pc.child.wait();
+        }
+    }
+}
+
 /// (rate normalize -> crossover split -> LF downsample) chunk by chunk,
 /// writing the two codec-input WAVs as the input arrives. This keeps the
 /// memory bounded and makes the input consumption rate track the actual
@@ -384,9 +492,18 @@ pub fn encode_stream<R: std::io::Read>(
         .filter(|&s| s > 0.0)
         .map(|s| sena_dsp::FirStream::new(sena_dsp::tilt_taps(s)));
     let mut lf_rs: Option<StreamResampler> = None;
-    let mut lf_wr: Option<wav::WavWriter> = None;
-    let mut mid_wr: Option<wav::WavWriter> = None;
-    let mut hf_wr: Option<wav::WavWriter> = None;
+    let mut lf_wr: Option<RailSink> = None;
+    let mut mid_wr: Option<RailSink> = None;
+    let mut hf_wr: Option<RailSink> = None;
+    let mut mid44_rs: Option<StreamResampler> = None;
+    let mut piped = PipedSet { children: Vec::new() };
+    let mut exhale_cmd: Option<Command> = None;
+    let mut dump_rails = false;
+    let hf_rate = if cfg.three_track {
+        sena_core::HF_TRACK_RATE
+    } else {
+        SAMPLE_RATE
+    };
     let mut ch = 2usize;
     let mut byte_buf = [0u8; 262_144];
     let mut eof = false;
@@ -424,25 +541,95 @@ pub fn encode_stream<R: std::io::Read>(
                 .three_track
                 .then(|| StreamResampler::new(SAMPLE_RATE, sena_core::HF_TRACK_RATE));
             lf_rs = Some(StreamResampler::new(SAMPLE_RATE, lf_rate));
-            lf_wr = Some(wav::WavWriter::create(&wd.join("lf.wav"), lf_rate, 16, 2)?);
-            if cfg.three_track {
-                mid_wr = Some(wav::WavWriter::create(
-                    &wd.join("mid.wav"),
-                    SAMPLE_RATE,
-                    32,
-                    2,
-                )?);
+            // Delivery: exhale is fed a spooled s24 file (its WAV reader
+            // seeks); the piped encoders stream f32 over stdin. The
+            // SENAENC_DUMP_RAILS knob writes every rail to a workdir file
+            // instead of spawning encoders (DSP regression tests).
+            dump_rails = std::env::var_os("SENAENC_DUMP_RAILS").is_some();
+            if !dump_rails {
+                let (ex, eps) = build_codec_commands(cfg, wd, &mut st)?;
+                exhale_cmd = Some(ex);
+                for (role, name, mut cmd) in eps {
+                    let mut child = cmd
+                        .stdin(std::process::Stdio::piped())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::piped())
+                        .spawn()
+                        .map_err(Error::Io)?;
+                    let stdin = child.stdin.take().expect("piped stdin");
+                    piped.children.push(PipedChild { name, child });
+                    match role {
+                        RailRole::Mid => {
+                            mid_wr = Some(RailSink::Pipe(wav::PipeWavWriter::new(
+                                stdin, SAMPLE_RATE, 2, false,
+                            )?));
+                        }
+                        RailRole::MidXhe44 => {
+                            mid44_rs = Some(StreamResampler::new(
+                                SAMPLE_RATE,
+                                sena_core::XFI_MID_RATE,
+                            ));
+                            mid_wr = Some(RailSink::Pipe(wav::PipeWavWriter::new(
+                                stdin,
+                                sena_core::XFI_MID_RATE,
+                                2,
+                                true,
+                            )?));
+                        }
+                        RailRole::Hf => {
+                            hf_wr = Some(RailSink::Pipe(wav::PipeWavWriter::new(
+                                stdin, hf_rate, 2, false,
+                            )?));
+                        }
+                    }
+                }
+            } else {
+                for role in rail_layout(cfg) {
+                    match role {
+                        RailRole::Mid => {
+                            mid_wr = Some(RailSink::File(wav::WavWriter::create(
+                                &wd.join("mid.wav"),
+                                SAMPLE_RATE,
+                                32,
+                                2,
+                            )?));
+                        }
+                        RailRole::MidXhe44 => {
+                            mid44_rs = Some(StreamResampler::new(
+                                SAMPLE_RATE,
+                                sena_core::XFI_MID_RATE,
+                            ));
+                            mid_wr = Some(RailSink::File(wav::WavWriter::create(
+                                &wd.join("mid44.wav"),
+                                sena_core::XFI_MID_RATE,
+                                32,
+                                2,
+                            )?));
+                        }
+                        RailRole::Hf => {
+                            hf_wr = Some(RailSink::File(wav::WavWriter::create(
+                                &wd.join("hf.wav"),
+                                hf_rate,
+                                32,
+                                2,
+                            )?));
+                        }
+                    }
+                }
             }
-            hf_wr = Some(wav::WavWriter::create(
-                &wd.join("hf.wav"),
-                if cfg.three_track {
-                    sena_core::HF_TRACK_RATE
-                } else {
-                    SAMPLE_RATE
-                },
-                32,
+            // exhale stays on s16: its internal domain is 24-bit, but its
+            // rate-distortion operating point was tuned and validated with
+            // s16 input — feeding s24 consistently cut VBR allocation
+            // 11-16% and worsened the 24-144 Hz envelope sigma on the
+            // golden clip and all three real tracks (measured, card 80);
+            // keep the frozen encoder's input distribution. Its reader
+            // lseeks, so no pipe.
+            lf_wr = Some(RailSink::File(wav::WavWriter::create(
+                &wd.join("lf.wav"),
+                lf_rate,
+                16,
                 2,
-            )?);
+            )?));
             continue;
         }
 
@@ -460,6 +647,7 @@ pub fn encode_stream<R: std::io::Read>(
                     lf_wr.as_mut().unwrap(),
                     mid_wr.as_mut(),
                     hf_wr.as_mut().unwrap(),
+                    mid44_rs.as_mut(),
                     &mut tilt,
                     &mut st,
                 )?;
@@ -544,7 +732,22 @@ pub fn encode_stream<R: std::io::Read>(
             let mid_p: Vec<f64> = mid_f.iter().map(|v| v * PRE_GAIN).collect();
             let top_p: Vec<f64> = top16.iter().map(|v| v * PRE_GAIN).collect();
             st.begin();
-            mid_wr.as_mut().unwrap().push(&mid_p)?;
+            if let Some(rs) = mid44_rs.as_mut() {
+                // xfi mid: flush the 44.1k resampler tail, then zero-pad
+                // to the FhG finalize floor (one 0.4 s BS.1770 gating
+                // block) before the final tail chunk.
+                let m = rs.push(&mid_p, ch);
+                mid_wr.as_mut().unwrap().push(&m)?;
+                let min_frames = sena_core::XFI_MID_RATE as usize * 2 / 5;
+                while rs.output_frames_total() < min_frames {
+                    let m = rs.push(&vec![0.0f64; 4800 * ch], ch);
+                    mid_wr.as_mut().unwrap().push(&m)?;
+                }
+                let m = rs.finish(ch);
+                mid_wr.as_mut().unwrap().push(&m)?;
+            } else {
+                mid_wr.as_mut().unwrap().push(&mid_p)?;
+            }
             hf_wr.push(&top_p)?;
             end_tick(&mut st.t, &mut st.write);
         } else {
@@ -566,8 +769,23 @@ pub fn encode_stream<R: std::io::Read>(
         mw.finish()?;
     }
     hf_wr.finish()?;
-
-    let result = run_codecs(cfg, wd, playable, output, &mut st);
+    if dump_rails {
+        // DSP-only mode (SENAENC_DUMP_RAILS): rails are workdir files,
+        // no encoders were spawned.
+        return Ok(());
+    }
+    st.begin();
+    let reap = piped.reap();
+    end_tick(&mut st.t, &mut st.opus);
+    reap?;
+    let result = finish_codecs(
+        cfg,
+        wd,
+        playable,
+        output,
+        &mut st,
+        exhale_cmd.expect("codec commands built"),
+    );
     if result.is_ok() {
         st.report(playable);
     }
@@ -669,9 +887,10 @@ fn push_chunk(
     shift_hf: Option<&mut sena_dsp::ShiftStream>,
     tf_rs: Option<&mut sena_dsp::StreamResampler>,
     lf_rs: &mut sena_dsp::StreamResampler,
-    lf_wr: &mut wav::WavWriter,
-    mut mid_wr: Option<&mut wav::WavWriter>,
-    hf_wr: &mut wav::WavWriter,
+    lf_wr: &mut RailSink,
+    mut mid_wr: Option<&mut RailSink>,
+    hf_wr: &mut RailSink,
+    mut mid44_rs: Option<&mut sena_dsp::StreamResampler>,
     tilt: &mut Option<sena_dsp::FirStream>,
     st: &mut StageTimes,
 ) -> Result<(), Error> {
@@ -698,6 +917,7 @@ fn push_chunk(
                     tf_rs.unwrap(),
                     tilt,
                     mid_wr.as_mut().unwrap(),
+                    mid44_rs.as_deref_mut(),
                     hf_wr,
                     &mut b_time,
                 )
@@ -743,7 +963,7 @@ fn lf_branch(
     low: &[f64],
     ch: usize,
     lf_rs: &mut sena_dsp::StreamResampler,
-    lf_wr: &mut wav::WavWriter,
+    lf_wr: &mut RailSink,
     t: &mut (f64, f64),
 ) -> Result<(), Error> {
     if low.is_empty() {
@@ -771,8 +991,9 @@ fn hf_branch3(
     shift_hf: &mut sena_dsp::ShiftStream,
     tf_rs: &mut sena_dsp::StreamResampler,
     tilt: &mut Option<sena_dsp::FirStream>,
-    mid_wr: &mut wav::WavWriter,
-    hf_wr: &mut wav::WavWriter,
+    mid_wr: &mut RailSink,
+    mut mid44_rs: Option<&mut sena_dsp::StreamResampler>,
+    hf_wr: &mut RailSink,
     t: &mut (f64, f64),
 ) -> Result<(), Error> {
     let t0 = std::time::Instant::now();
@@ -793,7 +1014,13 @@ fn hf_branch3(
         };
         let mid_p: Vec<f64> = mid.iter().map(|v| v * PRE_GAIN).collect();
         let t1 = std::time::Instant::now();
-        if let Err(e) = mid_wr.push(&mid_p) {
+        // xfi mid: resample 48k -> 44.1k inline (the sink clamps to [-1,1]
+        // for the FhG finalize contract); opus mid: f32 as-is.
+        let r = match mid44_rs.as_mut() {
+            Some(rs) => mid_wr.push(&rs.push(&mid_p, ch)),
+            None => mid_wr.push(&mid_p),
+        };
+        if let Err(e) = r {
             err = Some(e);
         }
         t.1 += t1.elapsed().as_secs_f64();
@@ -812,17 +1039,15 @@ fn hf_branch3(
     }
 }
 
-/// Encode the temp band WAVs, extract the streams and mux the container.
-fn run_codecs(
+/// Build every encoder command (and run the cheap tool checks) up front,
+/// so a broken toolchain fails before the DSP pass. exhale runs after the
+/// pass on the spooled s24 lf.wav; the piped encoders (opusenc / ezcd-cli)
+/// are spawned at pipeline init and stream their rail over stdin.
+fn build_codec_commands(
     cfg: &EncoderConfig,
     wd: &Path,
-    playable: usize,
-    output: &Path,
     st: &mut StageTimes,
-) -> Result<(), Error> {
-    let lf_wav = wd.join("lf.wav");
-    let mid_wav = wd.join("mid.wav");
-    let hf_wav = wd.join("hf.wav");
+) -> Result<(Command, Vec<(RailRole, &'static str, Command)>), Error> {
     st.begin();
     let ck_err: Option<Error> = check_exhale(cfg.exhale)
         .and_then(|_| {
@@ -838,15 +1063,6 @@ fn run_codecs(
         return Err(e);
     }
 
-    // --- encode ---
-    // The codec passes are independent (separate input files, separate
-    // output files) and each is single-threaded, so run them concurrently.
-    // Two-track: opusenc codes hf.wav (600 Hz..Nyquist at 48 kHz).
-    // Three-track: it codes mid.wav (600 Hz..12 kHz at 48 kHz) and a
-    // second opusenc codes hf.wav (the 12 kHz+ band shifted to baseband,
-    // 16 kHz) at the tiered hf nominal (96k below a 320k total, else 128k).
-    // xfi mid: mid.wav is resampled to 44.1 kHz and coded by ezcd-cli
-    // (Fraunhofer IIS xHE-AAC CBR 128k) instead of opusenc.
     let lf_m4a = wd.join("lf.m4a");
     let hf_ogg = wd.join("hf.opus");
     let mid_ogg = wd.join("mid.opus");
@@ -855,6 +1071,7 @@ fn run_codecs(
     if xhe_mid && !cfg.three_track {
         return Err(Error::Format("xhe mid requires the three-track layout".into()));
     }
+    let lf_wav = wd.join("lf.wav");
     let mut ex = Command::new(cfg.exhale);
     ex.arg(cfg.profile.xhe_preset().to_string())
         .arg(&lf_wav)
@@ -874,126 +1091,83 @@ fn run_codecs(
             .ok_or_else(|| Error::Format("total bitrate below Sena minimum".into()))?;
         (mid, 0)
     };
-    let mut cmds: Vec<(&str, &mut Command)> = vec![("exhale", &mut ex)];
+    let mut pipes: Vec<(RailRole, &'static str, Command)> = Vec::new();
     let mut op = Command::new(cfg.opusenc);
     op.arg("--quiet")
         .arg("--bitrate")
         .arg(mid_kbps.to_string())
         .arg("--vbr");
-    if cfg.three_track {
-        op.arg(&mid_wav).arg(&mid_ogg);
-    } else {
-        op.arg(&hf_wav).arg(&hf_ogg);
-    }
     if cfg.use_senav {
         apply_senav_env(&mut op, cfg.topband_kbps);
     }
-    if !xhe_mid {
-        cmds.push(("opusenc(mid)", &mut op));
+    if cfg.three_track {
+        if xhe_mid {
+            let ezcd_path = cfg.ezcd_cli.ok_or_else(|| {
+                Error::Format("xfi profile requires ezcd-cli (next to senaenc or on PATH)".into())
+            })?;
+            let win_host = is_windows_exe(ezcd_path);
+            let mid_m4a_arg = cli_path(&mid_m4a, win_host)?;
+            let mut c = Command::new(ezcd_path);
+            c.arg("encode")
+                .arg("--encoder")
+                .arg("xhe-aac-fhg-iis")
+                .arg("--mode")
+                .arg("cbr")
+                .arg("--bitrate")
+                .arg(sena_core::XFI_MID_KBPS.to_string())
+                .arg("--sample-rate")
+                .arg(sena_core::XFI_MID_RATE.to_string())
+                .arg("--resample")
+                .arg("off")
+                .arg("-o")
+                .arg(&mid_m4a_arg)
+                .arg("-");
+            pipes.push((RailRole::MidXhe44, "ezcd-cli(mid)", c));
+        } else {
+            op.arg("-").arg(&mid_ogg);
+            pipes.push((RailRole::Mid, "opusenc(mid)", op));
+        }
+    } else {
+        op.arg("-").arg(&hf_ogg);
+        pipes.push((RailRole::Hf, "opusenc(mid)", op));
     }
     // Three-track top-band encode (A_OPUSHF): the tiered hf nominal
     // (96k/128k); the topband-stereo knob is never armed for it.
-    let mut op2 = Command::new(cfg.opusenc);
     if cfg.three_track {
+        let mut op2 = Command::new(cfg.opusenc);
         op2.arg("--quiet")
             .arg("--bitrate")
             .arg(rail_kbps.to_string())
             .arg("--vbr")
-            .arg(&hf_wav)
+            .arg("-")
             .arg(&hf_ogg);
         if cfg.use_senav {
             apply_senav_env(&mut op2, None);
         }
-        cmds.push(("opusenc(hf)", &mut op2));
+        pipes.push((RailRole::Hf, "opusenc(hf)", op2));
     }
+    Ok((ex, pipes))
+}
+
+/// Run exhale on the spooled LF WAV, extract all streams and mux the
+/// container. The piped encoders were reaped by the caller, so their
+/// outputs are already complete on disk.
+fn finish_codecs(
+    cfg: &EncoderConfig,
+    wd: &Path,
+    playable: usize,
+    output: &Path,
+    st: &mut StageTimes,
+    mut ex: Command,
+) -> Result<(), Error> {
+    let lf_m4a = wd.join("lf.m4a");
+    let hf_ogg = wd.join("hf.opus");
+    let mid_ogg = wd.join("mid.opus");
+    let mid_m4a = wd.join("mid.m4a");
+    let xhe_mid = cfg.mid_codec == sena_core::MidCodec::Xhe;
     let t0 = std::time::Instant::now();
-    // xfi mid chain (resample 48k -> 44.1k + ezcd-cli) runs on its own
-    // thread, parallel with the exhale/Opus passes: the resample only needs
-    // mid.wav, and serializing it in front of the codec group would add its
-    // whole runtime to every encode.
-    let ezcd_path = if xhe_mid {
-        Some(cfg.ezcd_cli.ok_or_else(|| {
-            Error::Format("xfi profile requires ezcd-cli (next to senaenc or on PATH)".into())
-        })?)
-    } else {
-        None
-    };
-    let codec_err = std::thread::scope(|s| {
-        let mid_m4a = &mid_m4a;
-        let mid_job = if let Some(ezcd_path) = ezcd_path {
-            Some(s.spawn(move || -> Result<(), Error> {
-                let (x, ch, rate) = wav::read_f64(&mid_wav)?;
-                if rate != SAMPLE_RATE {
-                    return Err(Error::Format(format!(
-                        "mid.wav is {rate} Hz, expected {SAMPLE_RATE}"
-                    )));
-                }
-                // Extend with 100 ms of zeros so the resampler tail rings
-                // out: the 1024-sample warmup trim must still leave >=
-                // playable coverage (the LF rail gets the same tail from
-                // StreamResampler::finish).
-                let mut xext = x;
-                xext.resize(xext.len() + 4800 * ch, 0.0);
-                // The FhG core's finalize stage refuses anything shorter
-                // than one BS.1770 gating block (0.4 s), content-
-                // independent; pad short inputs with (inaudible) zeros.
-                let min_frames = SAMPLE_RATE as usize * 2 / 5;
-                if xext.len() < min_frames * ch {
-                    xext.resize(min_frames * ch, 0.0);
-                }
-                let m44 = sena_dsp::Resampler::new(SAMPLE_RATE, sena_core::XFI_MID_RATE)
-                    .process(&xext, ch);
-                let mid44 = wd.join("mid44.wav");
-                let win_host = is_windows_exe(ezcd_path);
-                let mid44_arg = cli_path(&mid44, win_host)?;
-                let mid_m4a_arg = cli_path(&mid_m4a, win_host)?;
-                // The FhG core's finalize stage (mandatory in-band
-                // loudness/peak metadata) requires every f32 sample in
-                // the CLOSED interval [-1, 1]: exactly +/-1.0 passes, one
-                // ULP above fails (DeinitCompress rc=4), independent of
-                // rate/depth/level. s16 output is safe by construction:
-                // write_s16 clamps to [-1, 1] and scales by 32767, so the
-                // encoder-side values stay strictly inside (-1, 1).
-                wav::write_s16(&mid44, &m44, sena_core::XFI_MID_RATE)?;
-                let out = Command::new(ezcd_path)
-                    .arg("encode")
-                    .arg("--encoder")
-                    .arg("xhe-aac-fhg-iis")
-                    .arg("--mode")
-                    .arg("cbr")
-                    .arg("--bitrate")
-                    .arg(sena_core::XFI_MID_KBPS.to_string())
-                    .arg("--sample-rate")
-                    .arg(sena_core::XFI_MID_RATE.to_string())
-                    .arg("--resample")
-                    .arg("off")
-                    .arg("-o")
-                    .arg(&mid_m4a_arg)
-                    .arg(&mid44_arg)
-                    .output()
-                    .map_err(Error::Io)?;
-                if !out.status.success() {
-                    return Err(Error::Subprocess(format!(
-                        "ezcd-cli(mid) failed: {}",
-                        String::from_utf8_lossy(&out.stderr)
-                    )));
-                }
-                Ok(())
-            }))
-        } else {
-            None
-        };
-        let mut err = run_parallel(&mut cmds);
-        if let Some(h) = mid_job {
-            let r = h.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
-            if let Err(e) = r {
-                if err.is_none() {
-                    err = Some(e);
-                }
-            }
-        }
-        err
-    });
+    let mut cmds: Vec<(&str, &mut Command)> = vec![("exhale", &mut ex)];
+    let codec_err = run_parallel(&mut cmds);
     if st.on {
         let d = t0.elapsed().as_secs_f64();
         st.exhale += d;
@@ -1623,10 +1797,11 @@ mod tests {
             workdir: &wd,
             hf_tilt_pct: None,
         };
+        // DSP-only mode: rails land as workdir files, no encoders spawned.
+        unsafe { std::env::set_var("SENAENC_DUMP_RAILS", "1") };
         let mut bytes = &src[..];
         let out = wd.join("out.sena");
-        let err = encode_stream(&cfg, &mut bytes, &out);
-        assert!(err.is_err(), "expected codec-step failure, got {err:?}");
+        encode_stream(&cfg, &mut bytes, &out).unwrap();
 
         // Reference: the same DSP via the batch functions.
         let (x, ch, in_rate) = wav::read_f64_bytes(&src).unwrap();
@@ -1683,10 +1858,10 @@ mod tests {
             workdir: &wd,
             hf_tilt_pct: Some(100.0),
         };
+        unsafe { std::env::set_var("SENAENC_DUMP_RAILS", "1") };
         let mut bytes = &src[..];
         let out = wd.join("out.sena");
-        let err = encode_stream(&cfg, &mut bytes, &out);
-        assert!(err.is_err(), "expected codec-step failure, got {err:?}");
+        encode_stream(&cfg, &mut bytes, &out).unwrap();
 
         let (x, ch, in_rate) = wav::read_f64_bytes(&src).unwrap();
         let x48 = sena_dsp::Resampler::new(in_rate, SAMPLE_RATE).process(&x, ch);
@@ -1930,10 +2105,10 @@ mod tests {
             workdir: &wd,
             hf_tilt_pct: None,
         };
+        unsafe { std::env::set_var("SENAENC_DUMP_RAILS", "1") };
         let mut bytes = &src[..];
         let out = wd.join("out.sena");
-        let err = encode_stream(&cfg, &mut bytes, &out);
-        assert!(err.is_err(), "expected codec-step failure, got {err:?}");
+        encode_stream(&cfg, &mut bytes, &out).unwrap();
 
         let (x, ch, in_rate) = wav::read_f64_bytes(&src).unwrap();
         let x48 = sena_dsp::Resampler::new(in_rate, SAMPLE_RATE).process(&x, ch);

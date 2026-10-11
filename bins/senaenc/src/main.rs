@@ -489,7 +489,22 @@ fn main() {
         None
     };
 
-    let wd = std::env::temp_dir().join(format!("senaenc-{}", std::process::id()));
+    // Spool dir for the one file-based rail (lf.wav for exhale, s24):
+    // prefer tmpfs (/dev/shm) so even that never touches real disk.
+    let wd = {
+        let name = format!("senaenc-{}", std::process::id());
+        let shm = std::path::Path::new("/dev/shm");
+        #[cfg(unix)]
+        let shm_ok = shm.is_dir();
+        #[cfg(not(unix))]
+        let shm_ok = false;
+        let _ = shm;
+        if shm_ok {
+            shm.join(name)
+        } else {
+            std::env::temp_dir().join(name)
+        }
+    };
     let cfg = EncoderConfig {
         profile,
         total_kbps: kbps,

@@ -1,5 +1,6 @@
 //! Minimal WAV read/write. Input: 8/16/24-bit PCM and IEEE float32, any
-//! sample rate. Output: 16-bit PCM and float32.
+//! sample rate. Output: 16/24-bit PCM and float32, to files or to a
+//! streaming sink (encoder stdin pipes, unknown length convention).
 
 use super::Error;
 
@@ -336,6 +337,12 @@ impl WavWriter {
                     out.extend_from_slice(&s.to_le_bytes());
                 }
             }
+            24 => {
+                for &v in x {
+                    let s = (v.clamp(-1.0, 1.0) * 8_388_607.0).round() as i32;
+                    out.extend_from_slice(&s.to_le_bytes()[..3]);
+                }
+            }
             32 => {
                 for &v in x {
                     out.extend_from_slice(&(v as f32).to_le_bytes());
@@ -383,5 +390,55 @@ mod tests {
         assert!((x[0] - 0.0).abs() < 1e-9);
         assert!(x[2] > 0.0);
         assert!(x[3] < 0.0);
+    }
+}
+
+/// Streaming WAV writer over any `Write` sink (encoder stdin pipes): the
+/// header declares the unknown-length convention (RIFF/data sizes
+/// 0xFFFFFFFF, which opusenc and ezcd-cli both read until EOF) and frames
+/// are pushed as f32. With `clamp` set, samples are clamped to the CLOSED
+/// interval [-1, 1] and non-finite values become 0 — the Fraunhofer xHE
+/// core's finalize stage requires every f32 sample in [-1, 1] (exactly
+/// +/-1.0 passes, one ULP above fails with DeinitCompress rc=4).
+pub struct PipeWavWriter<W: std::io::Write> {
+    w: W,
+    clamp: bool,
+    wrote: u64,
+}
+
+impl<W: std::io::Write> PipeWavWriter<W> {
+    pub fn new(mut w: W, rate: u32, ch: u16, clamp: bool) -> Result<Self, Error> {
+        let mut hdr = Vec::new();
+        write_hdr(&mut hdr, rate, ch, 32, 0xFFFF_FFFF);
+        // write_hdr put 36 + 0xFFFFFFFF in the RIFF size field; force the
+        // streaming convention there too.
+        hdr[4..8].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        w.write_all(&hdr).map_err(Error::Io)?;
+        Ok(Self { w, clamp, wrote: 0 })
+    }
+
+    pub fn push(&mut self, x: &[f64]) -> Result<(), Error> {
+        let mut out = Vec::with_capacity(x.len() * 4);
+        for &v in x {
+            let v = if self.clamp {
+                if v.is_finite() {
+                    v.clamp(-1.0, 1.0)
+                } else {
+                    0.0
+                }
+            } else {
+                v
+            };
+            out.extend_from_slice(&(v as f32).to_le_bytes());
+        }
+        self.w.write_all(&out).map_err(Error::Io)?;
+        self.wrote += out.len() as u64;
+        Ok(())
+    }
+
+    /// Flush and return the inner sink (dropping it closes the pipe).
+    pub fn finish(mut self) -> Result<W, Error> {
+        self.w.flush().map_err(Error::Io)?;
+        Ok(self.w)
     }
 }
