@@ -216,7 +216,10 @@ fn doctor() -> i32 {
                 .args(["encoders"])
                 .output()
                 .map(|o| String::from_utf8_lossy(&o.stdout).contains("xhe-aac-fhg-iis"))
-                .unwrap_or(false);
+                .unwrap_or_else(|e| {
+                    eprintln!("  [warn] cannot run {}: {e}", p.display());
+                    false
+                });
             if ok {
                 eprintln!("  [ok] ezcd-cli (xhe-aac-fhg-iis present) ({}, {src})", p.display());
             } else {

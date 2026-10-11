@@ -107,7 +107,11 @@ fn run_parallel(cmds: &mut [(&str, &mut Command)]) -> Option<Error> {
     }
     let spawned: Vec<std::io::Result<(&str, std::process::Child)>> = cmds
         .iter_mut()
-        .map(|(what, c)| c.spawn().map(|h| (*what, h)))
+        .map(|(what, c)| {
+            c.spawn()
+                .map_err(|e| std::io::Error::new(e.kind(), format!("{what}: {e}")))
+                .map(|h| (*what, h))
+        })
         .collect();
     let results: Vec<Result<(&str, std::process::Output), Error>> = std::thread::scope(|s| {
         let handles: Vec<_> = spawned
@@ -157,10 +161,10 @@ pub fn check_senav_version(path: &str) -> Result<(), Error> {
     let out = Command::new(path)
         .arg("--version")
         .output()
-        .map_err(Error::Io)?;
+        .map_err(|e| Error::Subprocess(format!("cannot run opusenc-senav at {path}: {e}")))?;
     let text = String::from_utf8_lossy(&out.stdout);
     if !out.status.success() && text.is_empty() {
-        return Err(Error::Subprocess("opusenc-senav --version failed".into()));
+        return Err(Error::Subprocess(format!("opusenc-senav --version failed at {path}")));
     }
     let Some(pos) = text.find("Opus SenaV m") else {
         return Err(Error::Subprocess(format!(
@@ -182,7 +186,7 @@ pub fn check_version(path: &str, marker: Option<&str>, what: &str) -> Result<(),
     let out = Command::new(path)
         .arg("--version")
         .output()
-        .map_err(Error::Io)?;
+        .map_err(|e| Error::Subprocess(format!("cannot run {what} at {path}: {e}")))?;
     let text = String::from_utf8_lossy(&out.stdout);
     if !out.status.success() && text.is_empty() {
         return Err(Error::Subprocess(format!("{what} --version failed")));
@@ -202,7 +206,7 @@ pub fn opusenc_version(path: &str) -> Result<String, Error> {
     let out = Command::new(path)
         .arg("--version")
         .output()
-        .map_err(Error::Io)?;
+        .map_err(|e| Error::Subprocess(format!("cannot run opusenc at {path}: {e}")))?;
     for text in [
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
@@ -275,7 +279,7 @@ pub fn version_ge(a: &str, b: &str) -> bool {
 }
 
 /// ezcd-cli invocation: on WSL (Linux host, Windows .exe payload) file path
-/// arguments must be translated to Windows paths.
+/// arguments must be translated to Windows paths via wslpath.
 fn cli_path(p: &Path, windows_host: bool) -> Result<String, Error> {
     if !windows_host {
         return Ok(p.to_string_lossy().into_owned());
@@ -284,7 +288,7 @@ fn cli_path(p: &Path, windows_host: bool) -> Result<String, Error> {
         .arg("-w")
         .arg(p)
         .output()
-        .map_err(Error::Io)?;
+        .map_err(|e| Error::Subprocess(format!("cannot run wslpath (needed by the WSL ezcd-cli bridge): {e}")))?;
     if !out.status.success() {
         return Err(Error::Subprocess(format!(
             "wslpath -w {} failed",
@@ -294,10 +298,32 @@ fn cli_path(p: &Path, windows_host: bool) -> Result<String, Error> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// True when the given tool path is a Windows executable (`.exe`), i.e. on
-/// WSL it needs Windows-style path arguments.
-fn is_windows_exe(path: &str) -> bool {
-    cfg!(windows) || path.to_ascii_lowercase().ends_with(".exe")
+/// Pinned semantics: translation is a WSL-only bridge concern.
+#[cfg(test)]
+mod windows_paths_tests {
+    #[test]
+    fn translation_only_on_linux_host_with_exe_payload() {
+        #[cfg(target_os = "linux")]
+        {
+            assert!(super::needs_windows_paths("/tools/ezcd-cli.exe"));
+            assert!(super::needs_windows_paths("/tools/EZCD-CLI.EXE"));
+            assert!(!super::needs_windows_paths("/usr/bin/ezcd-cli"));
+        }
+        #[cfg(windows)]
+        {
+            assert!(!super::needs_windows_paths("C:\\tools\\ezcd-cli.exe"));
+            assert!(!super::needs_windows_paths("C:\\tools\\ezcd-cli"));
+        }
+    }
+}
+
+/// True when path arguments handed to this tool need Windows translation:
+/// only on a Linux host (WSL) with a Windows `.exe` payload. On native
+/// Windows every tool is a Windows program and paths are already native —
+/// translating there would (a) be wrong and (b) fail, because wslpath does
+/// not exist off WSL.
+fn needs_windows_paths(path: &str) -> bool {
+    cfg!(target_os = "linux") && path.to_ascii_lowercase().ends_with(".exe")
 }
 
 /// Run exhale and return its version. `exhale -V` prints the version and
@@ -311,11 +337,16 @@ pub fn exhale_version(path: &str) -> Result<String, Error> {
             String::from_utf8_lossy(&out.stderr)
         )
     };
-    let out = Command::new(path).arg("-V").output().map_err(Error::Io)?;
+    let out = Command::new(path)
+        .arg("-V")
+        .output()
+        .map_err(|e| Error::Subprocess(format!("cannot run exhale at {path}: {e}")))?;
     if let Some(v) = parse_exhale_version(&all(&out)) {
         return Ok(v);
     }
-    let out = Command::new(path).output().map_err(Error::Io)?;
+    let out = Command::new(path)
+        .output()
+        .map_err(|e| Error::Subprocess(format!("cannot run exhale at {path}: {e}")))?;
     if let Some(v) = parse_exhale_version(&all(&out)) {
         return Ok(v);
     }
@@ -665,7 +696,12 @@ pub fn encode_stream<R: std::io::Read>(
                         .stdout(std::process::Stdio::null())
                         .stderr(std::process::Stdio::piped())
                         .spawn()
-                        .map_err(Error::Io)?;
+                        .map_err(|e| {
+                            Error::Subprocess(format!(
+                                "cannot start encoder {name} ({}): {e}",
+                                cmd.get_program().to_string_lossy()
+                            ))
+                        })?;
                     let stdin = child.stdin.take().expect("piped stdin");
                     piped.children.push(PipedChild { name, child });
                     match role {
@@ -1228,7 +1264,7 @@ fn build_codec_commands(
             let ezcd_path = cfg.ezcd_cli.ok_or_else(|| {
                 Error::Format("xfi profile requires ezcd-cli (next to senaenc or on PATH)".into())
             })?;
-            let win_host = is_windows_exe(ezcd_path);
+            let win_host = needs_windows_paths(ezcd_path);
             let mid_m4a_arg = cli_path(&mid_m4a, win_host)?;
             let mut c = Command::new(ezcd_path);
             c.arg("encode")
