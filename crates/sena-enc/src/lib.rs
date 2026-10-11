@@ -377,7 +377,7 @@ pub fn encoded_audio_sha256_es(init_zeroed_blob: &[u8], blocks: &[Vec<u8>]) -> [
 enum RailSink {
     File(wav::WavWriter),
     Spool(SpoolWriter),
-    Pipe(wav::PipeWavWriter<std::process::ChildStdin>),
+    Pipe(&'static str, wav::PipeWavWriter<std::process::ChildStdin>),
 }
 
 impl RailSink {
@@ -385,9 +385,9 @@ impl RailSink {
         match self {
             RailSink::File(w) => w.push(x),
             RailSink::Spool(w) => w.push(x),
-            RailSink::Pipe(w) => w.push(x).map_err(|e| match e {
+            RailSink::Pipe(name, w) => w.push(x).map_err(|e| match e {
                 Error::Io(io) if io.kind() == std::io::ErrorKind::BrokenPipe => {
-                    Error::Subprocess(format!("encoder closed its input pipe early: {io}"))
+                    Error::Subprocess(format!("encoder {name} closed its input pipe early: {io}"))
                 }
                 other => other,
             }),
@@ -398,7 +398,7 @@ impl RailSink {
         match self {
             RailSink::File(w) => w.finish(),
             RailSink::Spool(w) => w.finish(),
-            RailSink::Pipe(w) => {
+            RailSink::Pipe(_, w) => {
                 // Dropping the returned ChildStdin closes the pipe (EOF).
                 w.finish().map(|_| ())
             }
@@ -670,26 +670,26 @@ pub fn encode_stream<R: std::io::Read>(
                     piped.children.push(PipedChild { name, child });
                     match role {
                         RailRole::Mid => {
-                            mid_wr = Some(RailSink::Pipe(wav::PipeWavWriter::new(
-                                stdin, SAMPLE_RATE, 2, false,
-                            )?));
+                            mid_wr = Some(RailSink::Pipe(
+                                name,
+                                wav::PipeWavWriter::new(stdin, SAMPLE_RATE, 2, false)?,
+                            ));
                         }
                         RailRole::MidXhe44 => {
                             mid44_rs = Some(StreamResampler::new(
                                 SAMPLE_RATE,
                                 sena_core::XFI_MID_RATE,
                             ));
-                            mid_wr = Some(RailSink::Pipe(wav::PipeWavWriter::new(
-                                stdin,
-                                sena_core::XFI_MID_RATE,
-                                2,
-                                true,
-                            )?));
+                            mid_wr = Some(RailSink::Pipe(
+                                name,
+                                wav::PipeWavWriter::new(stdin, sena_core::XFI_MID_RATE, 2, true)?,
+                            ));
                         }
                         RailRole::Hf => {
-                            hf_wr = Some(RailSink::Pipe(wav::PipeWavWriter::new(
-                                stdin, hf_rate, 2, false,
-                            )?));
+                            hf_wr = Some(RailSink::Pipe(
+                                name,
+                                wav::PipeWavWriter::new(stdin, hf_rate, 2, false)?,
+                            ));
                         }
                     }
                 }
@@ -844,12 +844,25 @@ pub fn encode_stream<R: std::io::Read>(
             st.begin();
             if let Some(rs) = mid44_rs.as_mut() {
                 // xfi mid: flush the 44.1k resampler tail, then zero-pad
-                // to the FhG finalize floor (one 0.4 s BS.1770 gating
-                // block) before the final tail chunk.
+                // until (a) the FhG finalize floor (one 0.4 s BS.1770
+                // gating block) and (b) full playable coverage after the
+                // 1024-sample warmup trim + AU quantization are both met
+                // (the streaming finish tail alone was 7.6 ms short of the
+                // playable end on the golden clip).
                 let m = rs.push(&mid_p, ch);
                 mid_wr.as_mut().unwrap().push(&m)?;
-                let min_frames = sena_core::XFI_MID_RATE as usize * 2 / 5;
+                let min_frames = (sena_core::XFI_MID_RATE as usize * 2 / 5).max(
+                    playable * sena_core::XFI_MID_RATE as usize / SAMPLE_RATE as usize
+                        + 2 * sena_core::XHE_WARMUP_CORE,
+                );
+                let mut pad_iters = 0;
                 while rs.output_frames_total() < min_frames {
+                    pad_iters += 1;
+                    if pad_iters > 16 {
+                        return Err(Error::Format(
+                            "mid 44.1k resampler produced no output while padding".into(),
+                        ));
+                    }
                     let m = rs.push(&vec![0.0f64; 4800 * ch], ch);
                     mid_wr.as_mut().unwrap().push(&m)?;
                 }
@@ -1179,7 +1192,6 @@ fn build_codec_commands(
         return Err(e);
     }
 
-    let lf_m4a = wd.join("lf.m4a");
     let hf_ogg = wd.join("hf.opus");
     let mid_ogg = wd.join("mid.opus");
     let mid_m4a = wd.join("mid.m4a");
@@ -1381,6 +1393,20 @@ fn finish_codecs(
         let mut mid_by_block: std::collections::BTreeMap<u64, Vec<(u32, &[u8])>> =
             Default::default();
         if let MidStream::Xhe(aus) = &mid_stream {
+            // Hard coverage gate: after the 1024-sample warmup trim the AUs
+            // must still reach the end of the playable range (the inline
+            // resampler tail plus the 0.4 s floor exist to guarantee this).
+            let n = aus.len() as u64;
+            let covered = es::xhe_au_end48(n, sena_core::XFI_MID_RATE).saturating_sub(
+                sena_core::XHE_WARMUP_CORE as u64 * sena_core::SAMPLE_RATE as u64
+                    / sena_core::XFI_MID_RATE as u64,
+            );
+            if covered < playable as u64 {
+                return Err(Error::Format(format!(
+                    "xHE mid covers {covered} of {playable} playable frames ({} AUs)",
+                    aus.len()
+                )));
+            }
             for (k, au) in aus.iter().enumerate() {
                 mid_by_block
                     .entry(es::xhe_block(k as u64, sena_core::XFI_MID_RATE, n_blocks))

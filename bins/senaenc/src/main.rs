@@ -508,7 +508,10 @@ fn main() {
         #[cfg(unix)]
         let shm_ok = shm.is_dir();
         #[cfg(not(unix))]
-        let shm_ok = false;
+        let shm_ok = {
+            let _ = &shm;
+            false
+        };
         if shm_ok {
             shm.to_path_buf()
         } else {
@@ -580,6 +583,8 @@ fn main() {
         Ok(o) => o,
         Err(e) => {
             eprintln!("error: {e}");
+            // process::exit runs no destructors: clean the workdir first.
+            cleanup.clean_now();
             std::process::exit(1);
         }
     };

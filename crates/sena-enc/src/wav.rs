@@ -457,7 +457,6 @@ mod tests {
 pub struct PipeWavWriter<W: std::io::Write> {
     w: W,
     clamp: bool,
-    wrote: u64,
 }
 
 impl<W: std::io::Write> PipeWavWriter<W> {
@@ -468,7 +467,7 @@ impl<W: std::io::Write> PipeWavWriter<W> {
         // streaming convention there too.
         hdr[4..8].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
         w.write_all(&hdr).map_err(Error::Io)?;
-        Ok(Self { w, clamp, wrote: 0 })
+        Ok(Self { w, clamp })
     }
 
     pub fn push(&mut self, x: &[f64]) -> Result<(), Error> {
@@ -486,7 +485,6 @@ impl<W: std::io::Write> PipeWavWriter<W> {
             out.extend_from_slice(&(v as f32).to_le_bytes());
         }
         self.w.write_all(&out).map_err(Error::Io)?;
-        self.wrote += out.len() as u64;
         Ok(())
     }
 
