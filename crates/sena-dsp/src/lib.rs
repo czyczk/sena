@@ -1922,3 +1922,81 @@ mod tests {
         assert!(e < 1e-12, "stream vs batch error {e}");
     }
 }
+
+/// SRC quality regression pins (card 81): the 44.1k<->48k roundtrip must
+/// stay flat through the 12 kHz content band and keep ultrasonic probe
+/// leakage below the codec noise floor. Guards future kernel/spec changes.
+#[cfg(test)]
+mod src_quality {
+    use super::*;
+    use std::f64::consts::PI;
+
+    fn tone(freq: f64, n: usize) -> Vec<f64> {
+        (0..n).map(|i| (2.0 * PI * freq * i as f64 / 48000.0).sin()).collect()
+    }
+
+    fn tone_gain(y: &[f64], f: f64) -> f64 {
+        let x = &y[4800..y.len() - 4800];
+        let (mut re, mut im) = (0.0, 0.0);
+        for (i, &v) in x.iter().enumerate() {
+            let ph = 2.0 * PI * f * i as f64 / 48000.0;
+            re += v * ph.cos();
+            im += v * ph.sin();
+        }
+        2.0 * (re * re + im * im).sqrt() / x.len() as f64
+    }
+
+    /// Energy below 20 kHz excluding the probe tone's own +-300 Hz
+    /// (fold-back residue after the roundtrip).
+    fn band_residual(y: &[f64], probe: f64) -> f64 {
+        let x = &y[4800..y.len() - 4800];
+        let n = x.len();
+        let mut acc = 0.0f64;
+        // Goertzel per 200 Hz bin center is overkill; a direct DFT on the
+        // 0..20k band edges is cheap enough for a test.
+        let mut f = 100.0;
+        while f < 20_000.0 {
+            if (f - probe).abs() > 300.0 {
+                let (mut re, mut im) = (0.0, 0.0);
+                for (i, &v) in x.iter().enumerate() {
+                    let ph = 2.0 * PI * f * i as f64 / 48000.0;
+                    re += v * ph.cos();
+                    im += v * ph.sin();
+                }
+                acc += 2.0 * (re * re + im * im).sqrt() / n as f64;
+            }
+            f += 200.0;
+        }
+        acc
+    }
+
+    fn roundtrip(x: &[f64], pass: Option<f64>) -> Vec<f64> {
+        let down = match pass {
+            None => Resampler::new(48000, 44100).process(x, 1),
+            Some(p) => Resampler::new_with_passband(48000, 44100, p).process(x, 1),
+        };
+        match pass {
+            None => Resampler::new(44100, 48000).process(&down, 1),
+            Some(p) => Resampler::new_with_passband(44100, 48000, p).process(&down, 1),
+        }
+    }
+
+    #[test]
+    fn passband_flat_and_alias_floor() {
+        let n = 48000 * 5;
+        for (spec, pass) in [("default", None), ("band13k", Some(13_000.0))] {
+            for f in [500.0, 4000.0, 8000.0, 11000.0, 12000.0] {
+                let g = tone_gain(&roundtrip(&tone(f, n), pass), f);
+                assert!(
+                    (g - 1.0).abs() < 1e-3,
+                    "{spec} passband gain at {f} Hz: {g}"
+                );
+            }
+            // 22 kHz probe: rejected into the stopband, and nothing audible
+            // folds back below 20 kHz.
+            let y = roundtrip(&tone(22_000.0, n), pass);
+            let res = band_residual(&y, 22_000.0);
+            assert!(res < 1e-4, "{spec} 22k fold-back residual {res}");
+        }
+    }
+}
