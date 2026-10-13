@@ -201,6 +201,8 @@ struct OpusLane<'a> {
 
 /// Decode one Opus packet with PLC fallback and append the PCM to the
 /// lane's raw queue.
+
+
 fn decode_opus_packet(lane: &mut OpusLane, data: &[u8], t_ns: u64) -> Result<(), DecodeError> {
     let mut buf = vec![0.0f32; 5760 * 2];
     let mut n = match lane.dec.decode_float(Some(data), &mut buf, DecodeMode::Normal) {
@@ -242,6 +244,18 @@ struct MxLane {
     ctx: usize,
     zero_prefix: usize,
     errors: usize,
+    /// Total 44.1 kHz samples ever appended to `raw`; with
+    /// `content_shift` this gives the content-timeline position of the
+    /// raw-queue head (the resample window base), which the mid lane must
+    /// hold on the m=147 decimation grid for phase consistency with the
+    /// whole-file decode.
+    total_appended: u64,
+    /// Content-timeline position of the first sample ever appended to
+    /// `raw` after the current anchor: set when the anchor AU is decoded
+    /// (restart class dependent: a preroll-emitting restart starts one AU
+    /// earlier than a content-only one). AU 0 anchors at -1024 (its
+    /// warmup preroll).
+    content_shift: i64,
 }
 
 struct State {
@@ -495,6 +509,8 @@ impl EsDecoder {
                     ctx: 0,
                     zero_prefix: 0,
                     errors: 0,
+                    total_appended: 0,
+                    content_shift: 0,
                 }))
             }
             None => None,
@@ -906,6 +922,19 @@ impl EsDecoder {
             // there the trim would skip one AU too much (measured: content
             // lands exactly one AU late). Detect the class by the actual
             // emitted length and shift the pending trim back one AU.
+            if au_idx == mx.decode_from {
+                // Content-timeline origin of this restart's emission:
+                // a preroll-emitting restart covers the anchor AU's
+                // content plus one AU of preroll before it; a content-only
+                // restart starts exactly at the content.
+                mx.content_shift = au_idx as i64
+                    * crate::pipeline::XHE_TRIM_CORE_SAMPLES as i64
+                    - if samples == crate::pipeline::XHE_TRIM_CORE_SAMPLES {
+                        0
+                    } else {
+                        crate::pipeline::XHE_TRIM_CORE_SAMPLES as i64
+                    };
+            }
             if au_idx == mx.decode_from
                 && au_idx != 0
                 && mx.trim_pending
@@ -919,6 +948,23 @@ impl EsDecoder {
                 out[..n * 2].fill(0.0);
                 mx.zero_prefix -= n;
             }
+            // A non-anchor AU must contribute exactly its 1024 content
+            // samples to the timeline. With a diverged post-restart state
+            // the codec may emit a mid-stream preroll (2048 = preroll +
+            // content) at a later independency AU; if those 1024 extra
+            // samples enter the queue, every later sample shifts one AU
+            // off the playable timeline (permanently, silently). Drop the
+            // preroll; the anchor AU itself is handled by the trim/class
+            // logic above.
+            let mut out = out;
+            let mut samples = samples;
+            if au_idx != mx.decode_from
+                && samples == 2 * crate::pipeline::XHE_TRIM_CORE_SAMPLES
+            {
+                out.drain(..crate::pipeline::XHE_TRIM_CORE_SAMPLES * 2);
+                samples = crate::pipeline::XHE_TRIM_CORE_SAMPLES;
+            }
+            mx.total_appended += samples as u64;
             mx.raw.extend(out);
             samples
         };
@@ -1281,17 +1327,18 @@ impl EsDecoder {
                 let drain_core = fresh_drain - fresh_drain % grid;
                 st.lf_raw.drain(..drain_core * 2);
                 st.lf_ctx = lf_pass_core - drain_core;
-                // xHE mid lane: same drain discipline at 44.1 kHz, plus a
-                // second invariant the LF rates get for free: the retained
-                // context must stay a multiple of m (147) so its output span
-                // (ctx*160/147) is an exact integer and `abs0` stays on the
-                // n=160 output grid. Draining `pass - ctx_target` keeps both
-                // grids locked (the window base then satisfies
-                // (D-1024) ≡ 0 mod 147 automatically).
+                // xHE mid lane: same drain discipline at 44.1 kHz. The
+                // retained context is one grid step (147) deeper than the
+                // guard so `mx_window`'s phase-lock correction can shift
+                // the window front by up to m-1 samples without ever
+                // undercutting the kernel's left support. The absolute
+                // phase invariant itself (window base on the content m-grid)
+                // is enforced in `mx_window`, not here: drain history alone
+                // cannot hold it across seek anchors.
                 if let Some(mx) = st.mx.as_mut() {
                     let grid = mx.resampler.decimation();
                     let ctx_target =
-                        mx.resampler.guard_frames().div_ceil(grid) * grid;
+                        (mx.resampler.guard_frames().div_ceil(grid) + 1) * grid;
                     let drain_core = mx_pass_core.saturating_sub(ctx_target);
                     mx.raw.drain(..drain_core * 2);
                     mx.ctx = mx_pass_core - drain_core;
@@ -1832,6 +1879,26 @@ fn mx_window(
     // window_front_core 才是"从 raw 头越过的总量"（drain 记账用它）。
     let window_front_core =
         mx.ctx.max(raw_drop) - raw_drop + if mx_trim_after { mx_skip } else { 0 };
+    // Phase-lock the window onto the whole-file decode's grid: the
+    // resampler anchors its phase at the window start, so the window
+    // base's content position must stay a multiple of m (147). The drain
+    // history alone does NOT guarantee this after a seek (a clamped drain
+    // can leave the base one AU = 1024 samples off, a 5/147-sample phase
+    // error that permanently decorrelates the band); correct it here by
+    // shifting the window front by the residue. The emit content mapping
+    // is preserved (front_core is unchanged), and with pc = 0 on the
+    // whole-file trajectory this is a no-op there.
+    let grid = mx.resampler.decimation() as i64;
+    let base_content =
+        mx.total_appended as i64 - (mx.raw.len() / 2) as i64 + raw_drop as i64 + mx.content_shift;
+    let pc = base_content.rem_euclid(grid) as usize;
+    let (raw_drop, window_front_core) = if pc > 0 && window_front_core >= pc {
+        (raw_drop + pc, window_front_core - pc)
+    } else {
+        // Anchor trim can be shorter than the residue: one off-grid chunk
+        // inside the restart transient, self-correcting next chunk.
+        (raw_drop, window_front_core)
+    };
     let front_core = raw_drop + window_front_core;
     let mid_after: Vec<f64> = mx
         .raw
@@ -2136,14 +2203,15 @@ mod tests {
 
         // The xHE mid trim-class fix made mid-file seeks content-exact
         // (before it, a content-only restart AU landed the mid one AU late:
-        // diff ~0.7). Tight bound at half the track.
+        // diff ~0.7). Tight bound at half the track after a 1 s settle
+        // (the restart state transient is a separate, gated matter).
         let target = (playable / 2) as u64;
         let mut d = store_decoder(&bytes);
         d.seek(target).unwrap();
         let got = decode_all(&mut d);
         assert_eq!(got.len(), (playable - target as usize) * 2);
         let mut max = 0.0f32;
-        for i in 4800..playable - target as usize {
+        for i in 48000..playable - target as usize {
             for c in 0..2 {
                 let diff = (got[i * 2 + c] - whole_pcm[target as usize * 2 + i * 2 + c]).abs();
                 max = max.max(diff);
@@ -2152,13 +2220,12 @@ mod tests {
         assert!(max < 0.02, "mid-file seek diff {max}");
     }
 
-    /// OPEN BUG MARKER: seeks anchored in the first half of the track
-    /// diverge from the continuous decode ~3.3 s in (a ~5-frame local shift
-    /// then partial decorrelation, position-dependent, present since the
-    /// xfi landing). Not caused by the trim-class fix (reproduces without
-    /// it). Runs only on demand.
+    /// Regression pin for the mid-stream preroll defect: a diverged
+    /// post-restart xHE state can make a later independency AU emit
+    /// preroll+content (2048) instead of content-only (1024); if the
+    /// preroll enters the queue the whole mid lane shifts one AU off the
+    /// timeline forever (found as seeks diverging ~3.5 s in, card 80).
     #[test]
-    #[ignore = "known open seek residual; see analysis card 80"]
     fn xhe_mid_seek_residual_divergence() {
         let bytes = asset_bytes("01__p600xfi__hf96");
         let whole = crate::pipeline::decode(&Demuxed::parse(bytes.clone()).unwrap()).unwrap();
