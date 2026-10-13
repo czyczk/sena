@@ -201,8 +201,6 @@ struct OpusLane<'a> {
 
 /// Decode one Opus packet with PLC fallback and append the PCM to the
 /// lane's raw queue.
-
-
 fn decode_opus_packet(lane: &mut OpusLane, data: &[u8], t_ns: u64) -> Result<(), DecodeError> {
     let mut buf = vec![0.0f32; 5760 * 2];
     let mut n = match lane.dec.decode_float(Some(data), &mut buf, DecodeMode::Normal) {
@@ -1703,9 +1701,11 @@ impl EsDecoder {
         Ok(())
     }
 
-    /// Mid-lane seek settle window, in AUs (~1.0 s at the 44.1 kHz mid
-    /// rate): the mid restart transient is mild (band corr ~0.98 from
-    /// sample 0 even without it); one second is cheap insurance.
+    /// Mid-lane seek settle window, in AUs (~2.0 s at the 44.1 kHz mid
+    /// rate): long enough that a mid-stream preroll event at the first
+    /// indep AU after the anchor (max indep gap 86 AUs, mean 71) lands
+    /// inside the silent window. The mid restart transient itself is mild
+    /// (band corr ~0.98 from sample 0 even without settle).
     const XFI_MID_SETTLE_AUS: u64 = 88;
 
     /// Container seek: jump to the block covering the LF anchor and decode
@@ -2305,6 +2305,18 @@ mod tests {
                 }
             }
             assert!(max < 0.02, "seek to 1/{frac} residual diff {max}");
+            // The settle windows must place the restart transient before
+            // the target: the first 100 ms are then near-clean even at bad
+            // anchors (pre-settle values here reached 0.17-1.6).
+            let mut early = 0.0f32;
+            for i in 0..4800.min(got.len() / 2) {
+                for c in 0..2 {
+                    let diff =
+                        (got[i * 2 + c] - whole_pcm[target as usize * 2 + i * 2 + c]).abs();
+                    early = early.max(diff);
+                }
+            }
+            assert!(early < 0.05, "seek to 1/{frac} first-100ms diff {early}");
         }
     }
 

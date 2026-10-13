@@ -130,3 +130,67 @@ Two independent grid facts, don't conflate:
 
 If a future change breaks one of these, it broke the model, not the
 test.
+
+## 7. Mid-stream diverged-state preroll emissions (2026-10 seek saga)
+
+§3's pair-second preroll is not the only 2048 emission. **Any independency
+AU can emit 2048 mid-stream when the decoder's state trajectory has
+diverged from the continuous one** (i.e. after a restart whose transient
+has not fully reconverged). Observed: 30-170 AUs after a seek anchor, on
+both lanes, on real music. The extra 1024 samples entering a lane's queue
+shift every later sample one AU off the playable timeline *permanently and
+silently* (later AUs stay bit-identical, so per-AU content checks do not
+catch it — only timeline bookkeeping does).
+
+**Lane-opposite layouts, both verified by direct comparison against the
+continuous decode:**
+
+- LF lane (exhale-encoded): `[content 1024][extra 1024]` — drop the TAIL.
+  (Contrast §3's fresh-start pair-second, whose duplicate comes FIRST;
+  the two cases are both real, order differs — verify locally, never
+  assume.)
+- xHE mid lane (FhG-IIS encoded): `[preroll 1024][content 1024]` — drop
+  the HEAD.
+
+Normalization lives in `decode_lf_au` / `decode_mx_au`, gated on the
+seek-anchored path (`lf_trim_preroll_assumed` / `mx.trim_preroll_assumed`).
+The push cold-start's coverage bookkeeping predates this normalization and
+keeps legacy behavior until separately audited.
+
+## 8. The 44.1 kHz mid lane's phase grid (147/160)
+
+The mid resampler (44.1k→48k, m=147/n=160) anchors its phase at the window
+start, so the window base's *content* position must stay ≡ 0 (mod 147) or
+every later output shifts by a fraction of a sample vs the whole-file
+decode (a 1024-sample base slip = 5/147-sample phase error = permanent
+mid-band decorrelation at corr ~0.5). Drain history alone cannot hold this
+across seeks (a clamped drain slips by one AU); `mx_window` recomputes the
+residue every chunk from `total_appended + content_shift` (anchor-class
+dependent: 2048-class restarts start one AU earlier) and shifts the window
+front accordingly. On the whole-file trajectory the correction is
+identically zero (golden suite is the witness). The drain keeps one extra
+grid step of context so the correction never undercuts kernel support.
+
+## 9. Seek settle windows (2026-10)
+
+Restart transients are anchor-content-dependent and lane-specific:
+
+- LF (USAC @32k): worst measured ~2.0 s (bass band fully decorrelated);
+  bare-rxaac restarts reconverge bit-exactly by ≤8 s. seek() anchors the
+  LF lane **4 s** of core content before the target.
+- xHE mid (@44.1k): transient mild (band corr ~0.98 immediately); settle
+  **88 AUs (~2.0 s)**, chosen so a §7 preroll event at the first indep AU
+  after the anchor (max indep gap 86 AUs) lands inside the silent window.
+- Top (Opus): converges within one packet; no settle.
+
+warmup_seek shares seek() via its shadow store, so push/pull stay
+bit-identical (the warmup_seek_matches_container_seek test gates this).
+Cost: ~45-70 ms extra decode per seek (native release).
+
+Known residual: at targets with target ≢ 0 (mod 160) the mid lane can sit
+at a constant sub-sample fractional offset vs the continuous decode
+(measured 0.58 samples @44.1k; pure delay — linear phase, 0.04 rad
+residual) because the seek trim quantizes to integer 44.1k samples while
+the continuous abs0 grid is 160-locked. Perceptually transparent (no
+smearing/echo); fixing requires regridding the chunk lattice — documented
+as a bound, not done.
