@@ -264,6 +264,11 @@ struct State {
     /// one 1024-sample core frame at stream start; at a seek, the raw
     /// samples from the jump AU up to the target frame.
     lf_trim: usize,
+    /// The pending LF trim was computed by seek() against the AU grid
+    /// (preroll-emitting restart assumed); decode_lf_au corrects it when
+    /// the anchor proves content-only. False on the push/ramp paths whose
+    /// trims are content-referenced.
+    lf_trim_preroll_assumed: bool,
     hf_trim: usize,
     /// xHE mid lane (v3, 44.1 kHz): mirrors the LF lane (same warmup model:
     /// AU0 = 2048, trim 1024 core, steady 1024/AU; measured on Fraunhofer
@@ -518,6 +523,7 @@ impl EsDecoder {
         Ok(State {
             lf_rate: self.params.init.lf_rate,
             lf_trim: crate::pipeline::XHE_TRIM_CORE_SAMPLES,
+            lf_trim_preroll_assumed: false,
             hf_trim: self.params.mid_head.as_ref().map_or(0, |h| h.pre_skip as usize),
             mx,
             tf_trim: self.params.tf_head.as_ref().map_or(0, |h| h.pre_skip as usize),
@@ -825,7 +831,7 @@ impl EsDecoder {
                     }
                 }
                 st.lf_bytes += au.len() as u64;
-                Self::decode_lf_au(st, au, t_ns)?;
+                Self::decode_lf_au(st, au_idx, au, t_ns)?;
             }
         }
         for pkt in block.hf.iter() {
@@ -849,7 +855,7 @@ impl EsDecoder {
         Ok(())
     }
 
-    fn decode_lf_au(st: &mut State, data: &[u8], t_ns: u64) -> Result<(), DecodeError> {
+    fn decode_lf_au(st: &mut State, au_idx: u64, data: &[u8], t_ns: u64) -> Result<(), DecodeError> {
         // Decode into a scratch buffer so a panicking decoder can never
         // leave partial samples in the stream queue.
         let mut out: Vec<f32> = Vec::new();
@@ -881,6 +887,34 @@ impl EsDecoder {
             let n = st.lf_zero_prefix.min(samples);
             out[..n * 2].fill(0.0);
             st.lf_zero_prefix -= n;
+        }
+        // Anchor restart class (same as the mid lane's trim-class fix):
+        // the *seek* LF trim formula assumes a preroll-emitting (2048)
+        // restart; a content-only (1024) anchor means the queue holds one
+        // AU less than the formula accounts for, so the trim must skip one
+        // less. Only the seek formula carries the preroll assumption — the
+        // push/ramp anchoring trims are content-referenced already, so the
+        // fix is gated on `lf_trim_preroll_assumed`.
+        if au_idx == st.lf_decode_from
+            && au_idx != 0
+            && st.lf_trim_pending
+            && st.lf_trim_preroll_assumed
+            && samples == crate::pipeline::XHE_TRIM_CORE_SAMPLES
+        {
+            st.lf_trim = st.lf_trim.saturating_sub(crate::pipeline::XHE_TRIM_CORE_SAMPLES);
+        }
+        // Mid-stream preroll hazard, same class as the xHE mid lane but
+        // OPPOSITE layout: on a diverged post-restart trajectory the FhG
+        // decoder emits [content 1024][extra 1024] here (verified by direct
+        // comparison against the continuous decode's same AU), so the tail
+        // is dropped. (The mid lane's 2048 emission is [preroll][content]
+        // and drops the head — the two lanes' restart paths differ.)
+        let mut out = out;
+        if au_idx != st.lf_decode_from
+            && samples == 2 * crate::pipeline::XHE_TRIM_CORE_SAMPLES
+            && st.lf_trim_preroll_assumed
+        {
+            out.truncate(crate::pipeline::XHE_TRIM_CORE_SAMPLES * 2);
         }
         st.lf_raw.extend(out);
         Ok(())
@@ -955,10 +989,13 @@ impl EsDecoder {
             // samples enter the queue, every later sample shifts one AU
             // off the playable timeline (permanently, silently). Drop the
             // preroll; the anchor AU itself is handled by the trim/class
-            // logic above.
+            // logic above. Gated on the seek path (trim_preroll_assumed):
+            // the push cold-start's coverage bookkeeping predates this
+            // normalization and needs its own audit first.
             let mut out = out;
             let mut samples = samples;
             if au_idx != mx.decode_from
+                && mx.trim_preroll_assumed
                 && samples == 2 * crate::pipeline::XHE_TRIM_CORE_SAMPLES
             {
                 out.drain(..crate::pipeline::XHE_TRIM_CORE_SAMPLES * 2);
@@ -1666,6 +1703,11 @@ impl EsDecoder {
         Ok(())
     }
 
+    /// Mid-lane seek settle window, in AUs (~1.0 s at the 44.1 kHz mid
+    /// rate): the mid restart transient is mild (band corr ~0.98 from
+    /// sample 0 even without it); one second is cheap insurance.
+    const XFI_MID_SETTLE_AUS: u64 = 88;
+
     /// Container seek: jump to the block covering the LF anchor and decode
     /// forward with per-lane skip counters. LF jumps to the previous USAC
     /// independency AU (not sample-exact — LPD prev-frame state and
@@ -1687,7 +1729,14 @@ impl EsDecoder {
         // is c + 1024 (one warmup AU was trimmed at the stream start).
         let c = (frame as u128 * lf_rate as u128 / 48_000) as u64;
         let target_raw_core = c + crate::pipeline::XHE_TRIM_CORE_SAMPLES as u64;
-        let au = target_raw_core / crate::pipeline::XHE_TRIM_CORE_SAMPLES as u64;
+        // LF settle: the LF (USAC) lane's restart transient is
+        // anchor-content-dependent and runs up to ~2 s at bad anchors (the
+        // <600 Hz band fully decorrelated meanwhile); anchor 4 s of core
+        // content before the target so the transient decays inside the
+        // silent trim. Cost: ~60 ms of extra decode per seek (native).
+        let lf_settle_aus = (lf_rate as u64 * 4).div_ceil(1024);
+        let settle_raw = target_raw_core.saturating_sub(lf_settle_aus * 1024);
+        let au = settle_raw / crate::pipeline::XHE_TRIM_CORE_SAMPLES as u64;
         let mut start_au = self.prev_indep_au(au);
         // The LF resampler needs ~1000 core samples of context before the
         // target; step one independency further back when needed.
@@ -1698,12 +1747,22 @@ impl EsDecoder {
 
         let xhe_mid = self.params.mid_xhe_asc.is_some();
         let ps_mid = self.params.mid_head.as_ref().map_or(0, |h| h.pre_skip as u64);
-        // xHE mid lane: the LF AU math at the 44.1 kHz mid rate.
+        // xHE mid lane: the LF AU math at the 44.1 kHz mid rate, plus a
+        // settle window: the restart transient after a cold AU anchor needs
+        // up to ~1.5 s to reconverge (worst measured anchor: corr 0.18 in
+        // the first 0.5 s), so the lane anchors ~2 s of content before the
+        // target and the transient plays out silently inside the trim. The
+        // LF and top lanes need no settle (bit-exact / one-packet
+        // convergence respectively) and simply skip the earlier blocks.
+        // warmup_seek shares this seek via its shadow store, so push-mode
+        // hosts get the identical window.
         let (mx_start_au, mx_trim) = if xhe_mid {
             let rate = sena_core::XFI_MID_RATE as u64;
             let c = (frame as u128 * rate as u128 / 48_000) as u64;
             let target_raw = c + crate::pipeline::XHE_TRIM_CORE_SAMPLES as u64;
-            let au = target_raw / crate::pipeline::XHE_TRIM_CORE_SAMPLES as u64;
+            let settle_raw = target_raw
+                .saturating_sub(Self::XFI_MID_SETTLE_AUS * crate::pipeline::XHE_TRIM_CORE_SAMPLES as u64);
+            let au = settle_raw / crate::pipeline::XHE_TRIM_CORE_SAMPLES as u64;
             let mut start_au = self.prev_indep_mx_au(au);
             if start_au == au && start_au > 0 {
                 start_au = self.prev_indep_mx_au(start_au - 1);
@@ -1751,6 +1810,7 @@ impl EsDecoder {
         self.state = None;
         let mut st = self.make_state()?;
         st.lf_trim = lf_trim;
+        st.lf_trim_preroll_assumed = true;
         st.hf_trim = hf_trim;
         st.tf_trim = tf_trim;
         st.tf_seek_base = frame;
