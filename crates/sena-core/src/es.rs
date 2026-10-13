@@ -108,10 +108,7 @@ impl Init {
         let mut b = Vec::new();
         b.extend_from_slice(&ES_MAGIC);
         b.extend_from_slice(&ES_VERSION.to_le_bytes());
-        b.push(match self.profile {
-            Profile::At300 => 0,
-            Profile::At600 => 1,
-        });
+        b.push(self.profile.to_byte());
         b.push(if self.three_track { 1 } else { 0 });
         b.push(self.mid_codec.to_byte());
         b.extend_from_slice(&self.lf_rate.to_le_bytes());
@@ -141,11 +138,8 @@ impl Init {
         if !(ES_VERSION_MIN..=ES_VERSION).contains(&version) {
             return Err(EsError::UnsupportedVersion(version));
         }
-        let profile = match take(&mut b, 1)?[0] {
-            0 => Profile::At300,
-            1 => Profile::At600,
-            p => return Err(EsError::BadProfile(p)),
-        };
+        let pb = take(&mut b, 1)?[0];
+        let profile = Profile::from_byte(pb).ok_or(EsError::BadProfile(pb))?;
         let three_track = take(&mut b, 1)?[0] & 1 != 0;
         let mid_codec = if version >= 3 {
             crate::MidCodec::from_byte(take(&mut b, 1)?[0]).ok_or(EsError::BadMidCodec)?
@@ -186,8 +180,19 @@ impl Init {
 }
 
 fn push16(b: &mut Vec<u8>, data: &[u8]) {
+    debug_assert!(
+        data.len() <= u16::MAX as usize,
+        "section of {} bytes does not fit the 16-bit wire field",
+        data.len()
+    );
     b.extend_from_slice(&(data.len() as u16).to_le_bytes());
     b.extend_from_slice(data);
+}
+
+/// 24-bit wire field (AU indices and AU payload lengths in a block).
+fn push24(b: &mut Vec<u8>, v: u32) {
+    debug_assert!(v < (1 << 24), "value {v} does not fit the 24-bit wire field");
+    b.extend_from_slice(&v.to_le_bytes()[..3]);
 }
 
 fn take<'a>(b: &mut &'a [u8], n: usize) -> Result<&'a [u8], EsError> {
@@ -204,39 +209,60 @@ fn take16<'a>(b: &mut &'a [u8]) -> Result<&'a [u8], EsError> {
     take(b, n)
 }
 
+/// 24-bit wire field read (see [`push24`]).
+fn take24(b: &mut &[u8]) -> Result<u32, EsError> {
+    let mut i3 = [0u8; 4];
+    i3[..3].copy_from_slice(take(b, 3)?);
+    Ok(u32::from_le_bytes(i3))
+}
+
 /// Build the CodecPrivate: WAVEFORMATEX (18 bytes) + SENA-INIT blob.
 pub fn build_codec_private(init: &Init, avg_bytes_per_sec: u32) -> Vec<u8> {
     let blob = init.encode();
-    let mut w = Vec::with_capacity(18 + blob.len());
+    let mut w = Vec::with_capacity(WAVEFORMATEX_LEN + blob.len());
     w.extend_from_slice(&WAVE_FORMAT_SENA.to_le_bytes());
     w.extend_from_slice(&CHANNELS.to_le_bytes());
     w.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
     w.extend_from_slice(&avg_bytes_per_sec.to_le_bytes());
-    w.extend_from_slice(&1u16.to_le_bytes()); // nBlockAlign
+    w.extend_from_slice(&WAVE_BLOCK_ALIGN.to_le_bytes());
     w.extend_from_slice(&BITS_PER_SAMPLE.to_le_bytes());
     w.extend_from_slice(&(blob.len() as u16).to_le_bytes());
     w.extend_from_slice(&blob);
     w
 }
 
+/// WAVEFORMATEX header length prepended to the INIT blob in CodecPrivate.
+const WAVEFORMATEX_LEN: usize = 18;
+
+/// nBlockAlign the encoder writes (and the parser requires): the Sena
+/// track's blocks are not PCM-aligned.
+const WAVE_BLOCK_ALIGN: u16 = 1;
+
 /// Parse a CodecPrivate WAVEFORMATEX wrapper; returns the INIT blob and the
 /// declared nAvgBytesPerSec.
 pub fn parse_codec_private(w: &[u8]) -> Result<(Init, u32), EsError> {
-    if w.len() < 18 {
+    if w.len() < WAVEFORMATEX_LEN {
         return Err(EsError::Truncated);
     }
     let tag = u16::from_le_bytes(w[0..2].try_into().unwrap());
     let channels = u16::from_le_bytes(w[2..4].try_into().unwrap());
     let rate = u32::from_le_bytes(w[4..8].try_into().unwrap());
     let avg = u32::from_le_bytes(w[8..12].try_into().unwrap());
+    let block_align = u16::from_le_bytes(w[12..14].try_into().unwrap());
+    let bits = u16::from_le_bytes(w[14..16].try_into().unwrap());
     let cb_size = u16::from_le_bytes(w[16..18].try_into().unwrap()) as usize;
-    if tag != WAVE_FORMAT_SENA || channels != CHANNELS || rate != SAMPLE_RATE {
+    if tag != WAVE_FORMAT_SENA
+        || channels != CHANNELS
+        || rate != SAMPLE_RATE
+        || block_align != WAVE_BLOCK_ALIGN
+        || bits != BITS_PER_SAMPLE
+    {
         return Err(EsError::BadWaveFormat);
     }
-    if w.len() - 18 != cb_size {
+    if w.len() - WAVEFORMATEX_LEN != cb_size {
         return Err(EsError::BadWaveFormat);
     }
-    Ok((Init::decode(&w[18..])?, avg))
+    Ok((Init::decode(&w[WAVEFORMATEX_LEN..])?, avg))
 }
 
 /// 48 kHz frames covered by one LF AU (1024 samples at lf_rate).
@@ -328,9 +354,9 @@ pub fn encode_block(p: &BlockParts) -> Vec<u8> {
         MidSection::Xhe { au_index, aus } => {
             b.push(aus.len() as u8);
             if !aus.is_empty() {
-                b.extend_from_slice(&au_index.to_le_bytes()[..3]);
+                push24(&mut b, *au_index);
                 for au in aus {
-                    b.extend_from_slice(&(au.len() as u32).to_le_bytes()[..3]);
+                    push24(&mut b, au.len() as u32);
                     b.extend_from_slice(au);
                 }
             }
@@ -339,9 +365,9 @@ pub fn encode_block(p: &BlockParts) -> Vec<u8> {
     let (au_index, aus) = p.lf;
     b.push(aus.len() as u8);
     if !aus.is_empty() {
-        b.extend_from_slice(&au_index.to_le_bytes()[..3]);
+        push24(&mut b, au_index);
         for au in aus {
-            b.extend_from_slice(&(au.len() as u32).to_le_bytes()[..3]);
+            push24(&mut b, au.len() as u32);
             b.extend_from_slice(au);
         }
     }
@@ -369,18 +395,10 @@ pub fn decode_block(mut b: &[u8], mid_codec: crate::MidCodec) -> Result<Block<'_
         }
         crate::MidCodec::Xhe => {
             let count = take(&mut b, 1)?[0] as usize;
-            let au_index = if count > 0 {
-                let mut i3 = [0u8; 4];
-                i3[..3].copy_from_slice(take(&mut b, 3)?);
-                u32::from_le_bytes(i3)
-            } else {
-                0
-            };
+            let au_index = if count > 0 { take24(&mut b)? } else { 0 };
             let mut aus = Vec::with_capacity(count);
             for _ in 0..count {
-                let mut l3 = [0u8; 4];
-                l3[..3].copy_from_slice(take(&mut b, 3)?);
-                let n = u32::from_le_bytes(l3) as usize;
+                let n = take24(&mut b)? as usize;
                 aus.push(take(&mut b, n)?);
             }
             MidSection::Xhe { au_index, aus }
@@ -388,17 +406,13 @@ pub fn decode_block(mut b: &[u8], mid_codec: crate::MidCodec) -> Result<Block<'_
     };
     let lf_count = take(&mut b, 1)?[0] as usize;
     let lf_au_index = if lf_count > 0 {
-        let mut i3 = [0u8; 4];
-        i3[..3].copy_from_slice(take(&mut b, 3)?);
-        Some(u32::from_le_bytes(i3))
+        Some(take24(&mut b)?)
     } else {
         None
     };
     let mut lf = Vec::with_capacity(lf_count);
     for _ in 0..lf_count {
-        let mut l3 = [0u8; 4];
-        l3[..3].copy_from_slice(take(&mut b, 3)?);
-        let n = u32::from_le_bytes(l3) as usize;
+        let n = take24(&mut b)? as usize;
         lf.push(take(&mut b, n)?);
     }
     let hf_count = take(&mut b, 1)?[0] as usize;

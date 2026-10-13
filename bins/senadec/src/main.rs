@@ -181,26 +181,26 @@ fn run() -> Result<(), String> {
 
     if let Some(prefix) = &args.dump_prefix {
         let lf_name = prefix.with_extension("lf.wav");
-        let hf_name = prefix.with_extension("hf.wav");
-        let hf2_name = prefix.with_extension("hf2.wav");
+        let mid_name = prefix.with_extension("mid.wav");
+        let top_name = prefix.with_extension("top.wav");
         let lf = output::encode_wav(decoded.lf_track_pcm(), SampleFormat::F32, Dither::None)
             .map_err(|e| e.to_string())?;
-        let hf = output::encode_wav(decoded.hf_track_pcm(), SampleFormat::F32, Dither::None)
+        let mid = output::encode_wav(decoded.mid_track_pcm(), SampleFormat::F32, Dither::None)
             .map_err(|e| e.to_string())?;
         std::fs::write(&lf_name, lf).map_err(|e| format!("{}: {e}", lf_name.display()))?;
-        std::fs::write(&hf_name, hf).map_err(|e| format!("{}: {e}", hf_name.display()))?;
+        std::fs::write(&mid_name, mid).map_err(|e| format!("{}: {e}", mid_name.display()))?;
         if info.three_track {
-            let hf2 = output::encode_wav(decoded.hf2_track_pcm(), SampleFormat::F32, Dither::None)
+            let top = output::encode_wav(decoded.top_track_pcm(), SampleFormat::F32, Dither::None)
                 .map_err(|e| e.to_string())?;
-            std::fs::write(&hf2_name, hf2).map_err(|e| format!("{}: {e}", hf2_name.display()))?;
+            std::fs::write(&top_name, top).map_err(|e| format!("{}: {e}", top_name.display()))?;
             eprintln!(
                 "wrote {}, {} and {}",
                 lf_name.display(),
-                hf_name.display(),
-                hf2_name.display()
+                mid_name.display(),
+                top_name.display()
             );
         } else {
-            eprintln!("wrote {} and {}", lf_name.display(), hf_name.display());
+            eprintln!("wrote {} and {}", lf_name.display(), mid_name.display());
         }
         if !args.output_explicit {
             return Ok(());

@@ -574,13 +574,13 @@ pub struct BlockRef {
     pub lf_count: u8,
     /// First payload byte of each LF AU (the USAC independency flag lives
     /// in bit 7); the first `lf_count` entries are valid.
-    pub lf_first: [u8; 4],
+    pub lf_first: [u8; 8],
     /// xHE mid (v3): absolute AU index of the first mid AU in the block.
     pub mx_au_index: Option<u32>,
     /// Number of mid AUs in the block (0..=8).
     pub mx_count: u8,
     /// First payload byte of each mid AU (independency flags).
-    pub mx_first: [u8; 4],
+    pub mx_first: [u8; 8],
 }
 
 /// Container metadata + block index produced by [`index_container`].
@@ -715,7 +715,7 @@ fn es_block_meta<R: FnMut(u64, usize) -> Result<Vec<u8>, String>>(
         if 3 + mid_len + 1 > len {
             return Err("malformed container: mid section overruns its block".into());
         }
-        (offset + 3 + mid_len, len - 3 - mid_len, None, 0, [0; 4])
+        (offset + 3 + mid_len, len - 3 - mid_len, None, 0, [0; 8])
     };
     let head1 = get(lf_off, avail.min(1) as usize)?;
     if head1.is_empty() {
@@ -723,7 +723,7 @@ fn es_block_meta<R: FnMut(u64, usize) -> Result<Vec<u8>, String>>(
     }
     let lf_count = head1[0];
     let (au_index, _, first, _) = if lf_count == 0 {
-        (None, 0, [0; 4], 1u64)
+        (None, 0, [0; 8], 1u64)
     } else {
         let (ai, c, f, rel) = au_list_meta(get, lf_off, avail, 4, "LF")?;
         (ai, c, f, rel)
@@ -743,29 +743,29 @@ fn es_block_meta<R: FnMut(u64, usize) -> Result<Vec<u8>, String>>(
 struct BlockMeta {
     lf_au_index: Option<u32>,
     lf_count: u8,
-    lf_first: [u8; 4],
+    lf_first: [u8; 8],
     mx_au_index: Option<u32>,
     mx_count: u8,
-    mx_first: [u8; 4],
+    mx_first: [u8; 8],
 }
 
 /// Parse a counted AU list section: count(1) au_index(3) [len(3) +
 /// payload]*. Returns (first au_index, count, first payload bytes (up to
-/// 4), section length in bytes). `max_count` is the sanity bound.
+/// `max_count`), section length in bytes). `max_count` is the sanity bound.
 fn au_list_meta<R: FnMut(u64, usize) -> Result<Vec<u8>, String>>(
     get: &mut R,
     off: u64,
     avail: u64,
     max_count: u8,
     what: &str,
-) -> Result<(Option<u32>, u8, [u8; 4], u64), String> {
+) -> Result<(Option<u32>, u8, [u8; 8], u64), String> {
     let head1 = get(off, avail.min(1) as usize)?;
     if head1.is_empty() {
         return Err(format!("malformed container: {what} count truncated"));
     }
     let count = head1[0];
     if count == 0 {
-        return Ok((None, 0, [0; 4], 1));
+        return Ok((None, 0, [0; 8], 1));
     }
     if count > max_count {
         return Err(format!("malformed container: {what} AU count exceeds sanity bound"));
@@ -777,7 +777,7 @@ fn au_list_meta<R: FnMut(u64, usize) -> Result<Vec<u8>, String>>(
     let mut i3 = [0u8; 4];
     i3[..3].copy_from_slice(&idx);
     let au_index = u32::from_le_bytes(i3);
-    let mut first = [0u8; 4];
+    let mut first = [0u8; 8];
     let mut rel = 4u64; // past count + au_index
     for i in 0..count as usize {
         let h = get(off + rel, 4u64.min(avail.saturating_sub(rel)) as usize)?;
@@ -787,9 +787,7 @@ fn au_list_meta<R: FnMut(u64, usize) -> Result<Vec<u8>, String>>(
         let mut l3 = [0u8; 4];
         l3[..3].copy_from_slice(&h[..3]);
         let au_len = u32::from_le_bytes(l3) as u64;
-        if i < 4 {
-            first[i] = h[3];
-        }
+        first[i] = h[3];
         rel += 3 + au_len;
         if rel > avail {
             return Err(format!("malformed container: {what} AU overruns its block"));

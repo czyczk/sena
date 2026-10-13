@@ -378,11 +378,11 @@ dependencies = [
 
 [[package]]
 name = "sena-core"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "sena-dec"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "opus-decoder",
  "rxaac-dec-lib",
@@ -395,21 +395,21 @@ dependencies = [
 
 [[package]]
 name = "sena-dec-capi"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "sena-dec",
 ]
 
 [[package]]
 name = "sena-dsp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rustfft",
 ]
 
 [[package]]
 name = "sena-enc"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "fs2",
  "sena-core",
@@ -420,14 +420,14 @@ dependencies = [
 
 [[package]]
 name = "sena-mux"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "sena-core",
 ]
 
 [[package]]
 name = "senadec"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "sena-core",
  "sena-dec",
@@ -435,7 +435,7 @@ dependencies = [
 
 [[package]]
 name = "senaenc"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "ctrlc",

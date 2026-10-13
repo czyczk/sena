@@ -13,6 +13,8 @@ use crate::demux::Demuxed;
 
 pub const SAMPLE_RATE: u32 = 48000;
 pub const XHE_TRIM_CORE_SAMPLES: usize = 1024;
+/// Maximum Opus frame size (120 ms at 48 kHz, RFC 6716 §2).
+pub(crate) const MAX_OPUS_FRAME_SAMPLES: usize = 5760;
 
 #[derive(Debug)]
 pub enum DecodeError {
@@ -96,10 +98,10 @@ pub struct Decoded {
     info: DecodedInfo,
     pcm: Vec<f64>,
     lf_track_pcm: Vec<f64>,
-    hf_track_pcm: Vec<f64>,
+    mid_track_pcm: Vec<f64>,
     /// A_OPUSHF (12 kHz+ band, restored from the shifted 16 kHz stream)
     /// track, upmixed by 1/PRE_GAIN; empty in the two-track layout.
-    hf2_track_pcm: Vec<f64>,
+    top_track_pcm: Vec<f64>,
     bits_total: Vec<f64>,
     pub warnings: Vec<String>,
 }
@@ -261,7 +263,7 @@ fn decode_opus(
     let scale = (SAMPLE_RATE / rate) as i128;
     assert_eq!(rate * scale as u32, SAMPLE_RATE, "opus rate must divide 48k");
     let mut pcm: Vec<f32> = Vec::new();
-    let mut buf = vec![0.0f32; 5760 * 2];
+    let mut buf = vec![0.0f32; MAX_OPUS_FRAME_SAMPLES * 2];
     let mut infos = Vec::with_capacity(frames.len());
     let mut errors = 0usize;
     for frame in frames {
@@ -277,7 +279,7 @@ fn decode_opus(
                 dec.decode_float(None, &mut buf, DecodeMode::Normal)
             })
             .map_err(|e| DecodeError::Codec(format!("opus decode: {e}")))?;
-        n = n.min(5760);
+        n = n.min(MAX_OPUS_FRAME_SAMPLES);
         pcm.extend_from_slice(&buf[..n * 2]);
         infos.push(OpusPacketInfo {
             start_48k: (before / 2) as i128 * scale,
@@ -287,6 +289,17 @@ fn decode_opus(
     }
     let _ = errors;
     Ok((pcm, infos))
+}
+
+/// Gate a raw stereo lane buffer on covering `trim` leading frames.
+fn require_covered<T>(raw: &[T], trim: usize) -> Result<(), DecodeError> {
+    if raw.len() < trim * 2 {
+        return Err(DecodeError::ShortOutput {
+            have: (raw.len() / 2) as u64,
+            need: trim as u64,
+        });
+    }
+    Ok(())
 }
 
 pub(crate) fn add_bits_interval(
@@ -316,8 +329,8 @@ fn build_bit_accounting(
     lf_rate: usize,
     opus_infos: &[OpusPacketInfo],
     pre_skip: usize,
-    hf2_infos: &[OpusPacketInfo],
-    hf2_skip: usize,
+    top_infos: &[OpusPacketInfo],
+    top_skip: usize,
 ) -> (Vec<f64>, Vec<f64>) {
     let n = playable as usize;
     let mut delta = vec![0.0f64; n + 1];
@@ -327,7 +340,7 @@ fn build_bit_accounting(
         let end48 = (start_core + info.samples_core) * 48_000 / lf_rate as i128;
         add_bits_interval(&mut delta, n as i128, start48, end48, info.bits as f64);
     }
-    for (infos, skip) in [(opus_infos, pre_skip), (hf2_infos, hf2_skip)] {
+    for (infos, skip) in [(opus_infos, pre_skip), (top_infos, top_skip)] {
         for info in infos {
             let start = info.start_48k - skip as i128;
             let end = start + info.samples_48k;
@@ -418,16 +431,11 @@ pub fn decode(demux: &Demuxed) -> Result<Decoded, DecodeError> {
     // whole-file path overlaps the DSP with the codec decodes instead of
     // serializing it after them (the ES core consumes blocks interleaved
     // instead).
-    let (lf_res, mid_res, hf2_res) = std::thread::scope(|s| {
+    let (lf_res, mid_res, top_res) = std::thread::scope(|s| {
         let hlf = s.spawn(|| -> Result<(Vec<f64>, Vec<LfAuInfo>, usize, usize), DecodeError> {
             let (lf_raw, lf_infos, core_rate, lf_errors) = decode_lf(lf_rate, &lf_frames, asc)?;
             let lf_trim = XHE_TRIM_CORE_SAMPLES;
-            if lf_raw.len() < lf_trim * 2 {
-                return Err(DecodeError::ShortOutput {
-                    have: (lf_raw.len() / 2) as u64,
-                    need: lf_trim as u64,
-                });
-            }
+            require_covered(&lf_raw, lf_trim)?;
             let lf_after: Vec<f64> = lf_raw[lf_trim * 2..]
                 .iter()
                 .map(|&s| f64::from(s))
@@ -446,12 +454,7 @@ pub fn decode(demux: &Demuxed) -> Result<Decoded, DecodeError> {
                         eprintln!("warning: {errs} mid AU decode errors replaced by silence");
                     }
                     let trim = XHE_TRIM_CORE_SAMPLES;
-                    if raw.len() < trim * 2 {
-                        return Err(DecodeError::ShortOutput {
-                            have: (raw.len() / 2) as u64,
-                            need: trim as u64,
-                        });
-                    }
+                    require_covered(&raw, trim)?;
                     let after: Vec<f64> = raw[trim * 2..].iter().map(|&s| f64::from(s)).collect();
                     let up = if rate == sena_core::XFI_MID_RATE {
                         Resampler::new_with_passband(
@@ -478,19 +481,14 @@ pub fn decode(demux: &Demuxed) -> Result<Decoded, DecodeError> {
                         .collect();
                     return Ok((up, oinfos));
                 }
-                let (hf_raw, opus_infos) = decode_opus(&mid_frames, &opus_head, SAMPLE_RATE)?;
-                let hf_skip = opus_head.pre_skip as usize;
-                if hf_raw.len() < hf_skip * 2 {
-                    return Err(DecodeError::ShortOutput {
-                        have: (hf_raw.len() / 2) as u64,
-                        need: hf_skip as u64,
-                    });
-                }
-                let hf_after: Vec<f64> = hf_raw[hf_skip * 2..]
+                let (mid_raw, opus_infos) = decode_opus(&mid_frames, &opus_head, SAMPLE_RATE)?;
+                let mid_skip = opus_head.pre_skip as usize;
+                require_covered(&mid_raw, mid_skip)?;
+                let mid_after: Vec<f64> = mid_raw[mid_skip * 2..]
                     .iter()
                     .map(|&s| f64::from(s))
                     .collect();
-                Ok((hf_after, opus_infos))
+                Ok((mid_after, opus_infos))
             });
         let htop = s.spawn(
             || -> Result<(Vec<f64>, Vec<OpusPacketInfo>), DecodeError> {
@@ -502,24 +500,19 @@ pub fn decode(demux: &Demuxed) -> Result<Decoded, DecodeError> {
                         // 48 kHz (zero-phase, grid-exact x3), shift the
                         // baseband content back up to the 12 kHz+ band,
                         // then drop the pre-skip (48 kHz units).
-                        let hf2_skip = head.pre_skip as usize;
+                        let top_skip = head.pre_skip as usize;
                         let raw: Vec<f64> = raw16.iter().map(|&s| f64::from(s)).collect();
                         let up =
                             Resampler::new(sena_core::HF_TRACK_RATE, SAMPLE_RATE).process(&raw, 2);
-                        if up.len() < hf2_skip * 2 {
-                            return Err(DecodeError::ShortOutput {
-                                have: (up.len() / 2) as u64,
-                                need: hf2_skip as u64,
-                            });
-                        }
+                        require_covered(&up, top_skip)?;
                         let shifted = sena_dsp::shift_up_offset(
                             &up,
                             2,
                             sena_core::HF_SPLIT_HZ,
                             SAMPLE_RATE,
-                            -(hf2_skip as i64),
+                            -(top_skip as i64),
                         );
-                        Ok((shifted[hf2_skip * 2..].to_vec(), infos))
+                        Ok((shifted[top_skip * 2..].to_vec(), infos))
                     }
                     None => Ok((Vec::new(), Vec::new())),
                 }
@@ -535,16 +528,16 @@ pub fn decode(demux: &Demuxed) -> Result<Decoded, DecodeError> {
         )
     });
     let (lf48, lf_infos, core_rate, lf_errors) = lf_res?;
-    let (hf48, opus_infos) = mid_res?;
-    let (hf2_after, hf2_infos) = hf2_res?;
+    let (mid48, opus_infos) = mid_res?;
+    let (top_after, top_infos) = top_res?;
     if lf_errors != 0 {
         warnings.push(format!(
             "{lf_errors} LF AU decode errors replaced by silence"
         ));
     }
 
-    let n = (lf48.len() / 2).min(hf48.len() / 2).min(if three_track {
-        hf2_after.len() / 2
+    let n = (lf48.len() / 2).min(mid48.len() / 2).min(if three_track {
+        top_after.len() / 2
     } else {
         usize::MAX
     });
@@ -557,15 +550,17 @@ pub fn decode(demux: &Demuxed) -> Result<Decoded, DecodeError> {
     let gain = 1.0 / PRE_GAIN;
     let mut pcm = Vec::with_capacity(playable as usize * 2);
     let mut lf_track_pcm = Vec::with_capacity(playable as usize * 2);
-    let mut hf_track_pcm = Vec::with_capacity(playable as usize * 2);
-    let mut hf2_track_pcm = Vec::with_capacity(playable as usize * 2);
+    let mut mid_track_pcm = Vec::with_capacity(playable as usize * 2);
+    let mut top_track_pcm = Vec::with_capacity(playable as usize * 2);
     for i in 0..(playable as usize * 2) {
         lf_track_pcm.push(lf48[i] * gain);
-        hf_track_pcm.push(hf48[i] * gain);
+        mid_track_pcm.push(mid48[i] * gain);
         if three_track {
-            hf2_track_pcm.push(hf2_after[i] * gain);
+            top_track_pcm.push(top_after[i] * gain);
         }
-        pcm.push(lf_track_pcm[i] + hf_track_pcm[i] + hf2_track_pcm.get(i).copied().unwrap_or(0.0));
+        pcm.push(
+            lf_track_pcm[i] + mid_track_pcm[i] + top_track_pcm.get(i).copied().unwrap_or(0.0),
+        );
     }
 
     let (_rate_per_frame, bits_total) = build_bit_accounting(
@@ -574,7 +569,7 @@ pub fn decode(demux: &Demuxed) -> Result<Decoded, DecodeError> {
         core_rate,
         &opus_infos,
         opus_head.pre_skip as usize,
-        &hf2_infos,
+        &top_infos,
         tf_head.as_ref().map_or(0, |h| h.pre_skip) as usize,
     );
 
@@ -592,16 +587,16 @@ pub fn decode(demux: &Demuxed) -> Result<Decoded, DecodeError> {
         },
         pcm,
         lf_track_pcm,
-        hf_track_pcm,
-        hf2_track_pcm,
+        mid_track_pcm,
+        top_track_pcm,
         bits_total,
         warnings,
     })
 }
 
 impl Decoded {
-    pub fn info(&self) -> DecodedInfo {
-        self.info.clone()
+    pub fn info(&self) -> &DecodedInfo {
+        &self.info
     }
     pub fn pcm_f64(&self) -> &[f64] {
         &self.pcm
@@ -609,13 +604,13 @@ impl Decoded {
     pub fn lf_track_pcm(&self) -> &[f64] {
         &self.lf_track_pcm
     }
-    pub fn hf_track_pcm(&self) -> &[f64] {
-        &self.hf_track_pcm
+    pub fn mid_track_pcm(&self) -> &[f64] {
+        &self.mid_track_pcm
     }
     /// A_OPUSHF (12 kHz+ band) track PCM; empty slice in the two-track
     /// layout.
-    pub fn hf2_track_pcm(&self) -> &[f64] {
-        &self.hf2_track_pcm
+    pub fn top_track_pcm(&self) -> &[f64] {
+        &self.top_track_pcm
     }
     pub fn warnings(&self) -> &[String] {
         &self.warnings
@@ -632,8 +627,8 @@ impl Decoder {
         })
     }
 
-    pub fn info(&self) -> DecodedInfo {
-        self.decoded.info.clone()
+    pub fn info(&self) -> &DecodedInfo {
+        &self.decoded.info
     }
 
     pub fn warnings(&self) -> &[String] {
@@ -758,16 +753,21 @@ mod tests {
         let decoded = decode(&demux).unwrap();
         assert!(decoded.info().three_track);
         assert_eq!(decoded.pcm_f64().len(), 960000 * 2);
-        assert_eq!(decoded.hf2_track_pcm().len(), 960000 * 2);
-        let hf2_peak = decoded
-            .hf2_track_pcm()
+        assert_eq!(decoded.top_track_pcm().len(), 960000 * 2);
+        let top_peak = decoded
+            .top_track_pcm()
             .iter()
             .fold(0.0f64, |a, &v| a.max(v.abs()));
-        assert!(hf2_peak > 1e-4, "top layer is silent (peak {hf2_peak})");
+        assert!(top_peak > 1e-4, "top layer is silent (peak {top_peak})");
         let mix_peak = decoded
             .pcm_f64()
             .iter()
-            .zip(decoded.lf_track_pcm().iter().zip(decoded.hf_track_pcm().iter().zip(decoded.hf2_track_pcm().iter())))
+            .zip(
+                decoded
+                    .lf_track_pcm()
+                    .iter()
+                    .zip(decoded.mid_track_pcm().iter().zip(decoded.top_track_pcm().iter())),
+            )
             .map(|(m, (l, (h, t)))| (m - l - h - t).abs())
             .fold(0.0f64, f64::max);
         assert!(mix_peak < 1e-9, "pcm != lf+mid+top (max {mix_peak})");

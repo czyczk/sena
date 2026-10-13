@@ -31,7 +31,7 @@ pub fn write_element(out: &mut Vec<u8>, id: &[u8], payload: &[u8]) {
 /// Element with size forced to a given byte length (for clusters/segment).
 pub fn write_element_sized(out: &mut Vec<u8>, id: &[u8], size_len: usize, payload: &[u8]) {
     out.extend_from_slice(id);
-    assert!(size_len >= 1 && size_len <= 8);
+    assert!((1..=8).contains(&size_len));
     assert!(vint_size(payload.len() as u64) <= size_len);
     // pad the size vint to size_len bytes by using a larger marker
     let first_marker = 1 << (8 - size_len);

@@ -41,7 +41,7 @@ fn main() {
             dec.decode_au(au2, &mut out).unwrap();
             out_all.extend_from_slice(&out);
         }
-        let first_len = out_all.len() / 2; // includes the restart AU's emission
+        let _first_len = out_all.len() / 2; // includes the restart AU's emission
         let fl0 = {
             let mut d2 = rxaac_dec_lib::usac::UsacDecoder::new(&parse()).unwrap();
             let mut o = Vec::new();

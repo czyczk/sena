@@ -6,9 +6,22 @@ use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::process::Command;
 
+mod m4a;
 pub mod ogg;
+mod timing;
+pub mod tools;
 pub mod wav;
 pub mod workdir;
+
+pub use m4a::{extract_m4a, m4a_stream_rate};
+pub use timing::StageTimes;
+pub use tools::{
+    SENAV_MIN_MILESTONE, check_exhale, check_senav_version, check_version, exhale_version,
+    opusenc_version, parse_exhale_version, version_ge,
+};
+
+use timing::end_tick;
+use tools::{apply_senav_env, cli_path, needs_windows_paths};
 
 /// Errors surfaced to the CLI.
 #[derive(Debug)]
@@ -28,6 +41,14 @@ impl std::fmt::Display for Error {
             Error::Io(e) => write!(f, "io: {e}"),
             Error::Subprocess(s) => write!(f, "subprocess: {s}"),
             Error::Format(s) => write!(f, "format: {s}"),
+        }
+    }
+}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Io(e) => Some(e),
+            _ => None,
         }
     }
 }
@@ -79,21 +100,20 @@ pub struct EncodeOutcome {
     pub spill_dir: Option<std::path::PathBuf>,
 }
 
-/// Streams of one encoded Sena file (codec payloads exactly as muxed).
-pub struct Encoded {
-    /// A_OPUS track (600 Hz - 15.6 kHz in the three-track layout).
-    pub hf_packets: Vec<Vec<u8>>,
-    pub hf_head: Vec<u8>,
-    pub hf_preskip: u16,
-    pub lf_aus: Vec<Vec<u8>>,
-    pub lf_asc: Vec<u8>,
-    /// A_OPUSHF track (the 12 kHz+ band, shifted to baseband and carried
-    /// at 16 kHz); empty in the two-track layout.
-    pub hf2_packets: Vec<Vec<u8>>,
-    pub hf2_head: Vec<u8>,
-    pub hf2_preskip: u16,
-    pub lf_frame_ns: u64,
-    pub hf_frame_ns: u64,
+/// Streaming input read size.
+const READ_CHUNK_BYTES: usize = 256 * 1024;
+/// Frames pulled from the WAV stream per iteration (1 s at 48 kHz).
+const PIPELINE_CHUNK_FRAMES: usize = 48_000;
+/// Zero-pad quantum for the xfi mid rail tail (0.1 s at 48 kHz).
+const PAD_QUANTUM_FRAMES: usize = 4800;
+/// Bail-out guard for the xfi tail pad loop.
+const MAX_PAD_ITERS: u32 = 16;
+/// Container cluster target (the muxer writes ~1 s clusters).
+const MKA_CLUSTER_MS: u64 = 1000;
+
+/// Apply the codec-domain PRE_GAIN to interleaved samples.
+fn pre_gained<'a>(x: impl IntoIterator<Item = &'a f64>) -> Vec<f64> {
+    x.into_iter().map(|v| v * PRE_GAIN).collect()
 }
 
 /// Run encoder subprocesses concurrently, waiting for all (their
@@ -150,223 +170,6 @@ fn run_parallel(cmds: &mut [(&str, &mut Command)]) -> Option<Error> {
     err
 }
 
-/// Minimum accepted SenaV milestone in the opusenc-senav version string.
-pub const SENAV_MIN_MILESTONE: u32 = 3;
-
-/// SenaV build check: the `--version` output must carry a
-/// `Opus SenaV m<N>` marker with N >= [`SENAV_MIN_MILESTONE`] (older builds
-/// lack the knob semantics Sena relies on). The trailing `@<commit>` id is
-/// informational only and never enforced.
-pub fn check_senav_version(path: &str) -> Result<(), Error> {
-    let out = Command::new(path)
-        .arg("--version")
-        .output()
-        .map_err(|e| Error::Subprocess(format!("cannot run opusenc-senav at {path}: {e}")))?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    if !out.status.success() && text.is_empty() {
-        return Err(Error::Subprocess(format!("opusenc-senav --version failed at {path}")));
-    }
-    let Some(pos) = text.find("Opus SenaV m") else {
-        return Err(Error::Subprocess(format!(
-            "opusenc-senav lacks a \"Opus SenaV m<N>\" marker (need m{SENAV_MIN_MILESTONE}+): {text}"
-        )));
-    };
-    let rest = &text[pos + "Opus SenaV m".len()..];
-    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-    let n: u32 = digits.parse().unwrap_or(0);
-    if n < SENAV_MIN_MILESTONE {
-        return Err(Error::Subprocess(format!(
-            "opusenc-senav is SenaV m{n}, need m{SENAV_MIN_MILESTONE} or newer: {text}"
-        )));
-    }
-    Ok(())
-}
-
-pub fn check_version(path: &str, marker: Option<&str>, what: &str) -> Result<(), Error> {
-    let out = Command::new(path)
-        .arg("--version")
-        .output()
-        .map_err(|e| Error::Subprocess(format!("cannot run {what} at {path}: {e}")))?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    if !out.status.success() && text.is_empty() {
-        return Err(Error::Subprocess(format!("{what} --version failed")));
-    }
-    if let Some(m) = marker {
-        if !text.contains(m) {
-            return Err(Error::Subprocess(format!(
-                "{what} lacks marker {m:?} in version output: {text}"
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// First non-empty line of `tool --version` (for display in `senaenc doctor`).
-pub fn opusenc_version(path: &str) -> Result<String, Error> {
-    let out = Command::new(path)
-        .arg("--version")
-        .output()
-        .map_err(|e| Error::Subprocess(format!("cannot run opusenc at {path}: {e}")))?;
-    for text in [
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    ] {
-        for line in text.lines() {
-            let l = line.trim();
-            if !l.is_empty() {
-                return Ok(l.to_string());
-            }
-        }
-    }
-    Err(Error::Subprocess(format!(
-        "opusenc --version produced no output"
-    )))
-}
-
-/// Leading dotted-numeric prefix of a version token, e.g. `1.2.2RC` -> `1.2.2`.
-fn version_token(tok: &str) -> Option<String> {
-    let mut out = String::new();
-    let mut dots = 0u32;
-    for c in tok.chars() {
-        if c.is_ascii_digit() {
-            out.push(c);
-        } else if c == '.' && !out.is_empty() && dots < 3 {
-            out.push('.');
-            dots += 1;
-        } else {
-            break;
-        }
-    }
-    while out.ends_with('.') {
-        out.pop();
-    }
-    if out.is_empty() { None } else { Some(out) }
-}
-
-/// Parse an exhale version out of its output. Handles both forms:
-/// `-V`:  "exhale 1.2.2 (x64, ...)"
-/// banner (argument-less run): "| version 1.2.2 (x64, built on ...) |"
-pub fn parse_exhale_version(text: &str) -> Option<String> {
-    let mut it = text.split_whitespace();
-    while let Some(tok) = it.next() {
-        let intro = tok.eq_ignore_ascii_case("exhale")
-            || tok.eq_ignore_ascii_case("version")
-            || tok.starts_with("version");
-        if !intro {
-            continue;
-        }
-        if let Some(v) = it.next().and_then(version_token) {
-            return Some(v);
-        }
-    }
-    None
-}
-
-/// Dotted version comparison (`1.2.2` >= `1.2.2`, `1.10` > `1.9`).
-pub fn version_ge(a: &str, b: &str) -> bool {
-    fn nums(v: &str) -> Vec<u64> {
-        v.split('.').map(|p| p.parse().unwrap_or(0)).collect()
-    }
-    let (a, b) = (nums(a), nums(b));
-    for i in 0..a.len().max(b.len()) {
-        let x = a.get(i).copied().unwrap_or(0);
-        let y = b.get(i).copied().unwrap_or(0);
-        if x != y {
-            return x > y;
-        }
-    }
-    true
-}
-
-/// ezcd-cli invocation: on WSL (Linux host, Windows .exe payload) file path
-/// arguments must be translated to Windows paths via wslpath.
-fn cli_path(p: &Path, windows_host: bool) -> Result<String, Error> {
-    if !windows_host {
-        return Ok(p.to_string_lossy().into_owned());
-    }
-    let out = Command::new("wslpath")
-        .arg("-w")
-        .arg(p)
-        .output()
-        .map_err(|e| Error::Subprocess(format!("cannot run wslpath (needed by the WSL ezcd-cli bridge): {e}")))?;
-    if !out.status.success() {
-        return Err(Error::Subprocess(format!(
-            "wslpath -w {} failed",
-            p.display()
-        )));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
-
-/// Pinned semantics: translation is a WSL-only bridge concern.
-#[cfg(test)]
-mod windows_paths_tests {
-    #[test]
-    fn translation_only_on_linux_host_with_exe_payload() {
-        #[cfg(target_os = "linux")]
-        {
-            assert!(super::needs_windows_paths("/tools/ezcd-cli.exe"));
-            assert!(super::needs_windows_paths("/tools/EZCD-CLI.EXE"));
-            assert!(!super::needs_windows_paths("/usr/bin/ezcd-cli"));
-        }
-        #[cfg(windows)]
-        {
-            assert!(!super::needs_windows_paths("C:\\tools\\ezcd-cli.exe"));
-            assert!(!super::needs_windows_paths("C:\\tools\\ezcd-cli"));
-        }
-    }
-}
-
-/// True when path arguments handed to this tool need Windows translation:
-/// only on a Linux host (WSL) with a Windows `.exe` payload. On native
-/// Windows every tool is a Windows program and paths are already native —
-/// translating there would (a) be wrong and (b) fail, because wslpath does
-/// not exist off WSL.
-fn needs_windows_paths(path: &str) -> bool {
-    cfg!(target_os = "linux") && path.to_ascii_lowercase().ends_with(".exe")
-}
-
-/// Run exhale and return its version. `exhale -V` prints the version and
-/// exits 0; older builds fall back to the argument-less banner, which also
-/// contains "version x.y.z".
-pub fn exhale_version(path: &str) -> Result<String, Error> {
-    let all = |out: &std::process::Output| {
-        format!(
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        )
-    };
-    let out = Command::new(path)
-        .arg("-V")
-        .output()
-        .map_err(|e| Error::Subprocess(format!("cannot run exhale at {path}: {e}")))?;
-    if let Some(v) = parse_exhale_version(&all(&out)) {
-        return Ok(v);
-    }
-    let out = Command::new(path)
-        .output()
-        .map_err(|e| Error::Subprocess(format!("cannot run exhale at {path}: {e}")))?;
-    if let Some(v) = parse_exhale_version(&all(&out)) {
-        return Ok(v);
-    }
-    Err(Error::Subprocess(format!(
-        "cannot determine exhale version at {path}"
-    )))
-}
-
-/// Require exhale >= 1.2.2 (the version baseline the encoder needs).
-pub fn check_exhale(path: &str) -> Result<(), Error> {
-    let v = exhale_version(path)?;
-    if version_ge(&v, "1.2.2") {
-        Ok(())
-    } else {
-        Err(Error::Subprocess(format!(
-            "exhale {v} at {path} is older than the required 1.2.2"
-        )))
-    }
-}
-
 pub fn encode(cfg: &EncoderConfig, input: &Path, output: &Path) -> Result<EncodeOutcome, Error> {
     let mut f = std::fs::File::open(input)?;
     encode_stream(cfg, &mut f, output)
@@ -407,7 +210,6 @@ pub fn encoded_audio_sha256_es(init_zeroed_blob: &[u8], blocks: &[Vec<u8>]) -> [
 /// memory via pipe backpressure, nothing touches disk).
 enum RailSink {
     File(wav::WavWriter),
-    Spool(SpoolWriter),
     Pipe(&'static str, wav::PipeWavWriter<std::process::ChildStdin>),
 }
 
@@ -415,7 +217,6 @@ impl RailSink {
     fn push(&mut self, x: &[f64]) -> Result<(), Error> {
         match self {
             RailSink::File(w) => w.push(x),
-            RailSink::Spool(w) => w.push(x),
             RailSink::Pipe(name, w) => w.push(x).map_err(|e| match e {
                 Error::Io(io) if io.kind() == std::io::ErrorKind::BrokenPipe => {
                     Error::Subprocess(format!("encoder {name} closed its input pipe early: {io}"))
@@ -428,7 +229,6 @@ impl RailSink {
     fn finish(self) -> Result<(), Error> {
         match self {
             RailSink::File(w) => w.finish(),
-            RailSink::Spool(w) => w.finish(),
             RailSink::Pipe(_, w) => {
                 // Dropping the returned ChildStdin closes the pipe (EOF).
                 w.finish().map(|_| ())
@@ -464,9 +264,20 @@ enum RailRole {
 }
 
 /// ENOSPC (unix) / ERROR_DISK_FULL / ERROR_HANDLE_DISK_FULL (Windows).
+const ENOSPC_UNIX: i32 = 28;
+const ERROR_DISK_FULL: i32 = 112;
+const ERROR_HANDLE_DISK_FULL: i32 = 39;
+
 fn is_disk_full(e: &std::io::Error) -> bool {
-    matches!(e.raw_os_error(), Some(28) | Some(112) | Some(39))
+    matches!(
+        e.raw_os_error(),
+        Some(ENOSPC_UNIX) | Some(ERROR_DISK_FULL) | Some(ERROR_HANDLE_DISK_FULL)
+    )
 }
+
+/// Free-space floor when the input length is unknown (streaming input):
+/// proceed only if the volume clearly has room for a typical encode.
+const MIN_FREE_UNKNOWN_INPUT: u64 = 512 * 1024 * 1024;
 
 /// Pick and create the workdir, now that the input header gave us the
 /// track length: preflight the primary base's free space against the
@@ -479,12 +290,12 @@ fn choose_workdir(cfg: &EncoderConfig, ws: &wav::WavStream) -> Result<std::path:
     let fits = |base: &Path| -> bool {
         match (workdir::free_space(base), est) {
             (Some(free), Some(need)) => free >= need,
-            (Some(free), None) => free >= 512 * 1024 * 1024,
+            (Some(free), None) => free >= MIN_FREE_UNKNOWN_INPUT,
             (None, _) => true, // space not measurable: proceed optimistically
         }
     };
     let primary = cfg.workdir;
-    let mut chosen = if fits(primary) {
+    let chosen = if fits(primary) {
         match workdir::create_unique_dir(primary) {
             Ok(d) => d,
             Err(_) if cfg.workdir_fallback.is_some() => {
@@ -513,7 +324,7 @@ fn choose_workdir(cfg: &EncoderConfig, ws: &wav::WavStream) -> Result<std::path:
     if let Some(c) = &cfg.cleanup {
         c.register(chosen.clone());
     }
-    Ok(std::mem::take(&mut chosen))
+    Ok(chosen)
 }
 
 /// The LF rail's file sink (exhale input): a WavWriter that relocates to
@@ -529,8 +340,8 @@ impl SpoolWriter {
     fn push(&mut self, x: &[f64]) -> Result<(), Error> {
         match self.w.push(x) {
             Err(Error::Io(e)) if is_disk_full(&e) && self.spill_base.is_some() => {
-                let base = self.spill_base.clone().unwrap();
-                let dir = workdir::create_unique_dir(&base)?;
+                let base = self.spill_base.as_ref().expect("guarded by is_some");
+                let dir = workdir::create_unique_dir(base)?;
                 let newp = dir.join("lf.wav");
                 eprintln!(
                     "senaenc: workdir volume full; relocating the LF spool to {}",
@@ -607,48 +418,385 @@ impl Drop for PipedSet {
 /// work, so a feeding host (foobar2000 converter) drives its progress bar
 /// with the real pipeline instead of racing to 100% while senaenc then
 /// does all the work.
+/// Three-track top-band chain: the 12000 Hz second split, the SSB
+/// down-shift to baseband and the 48k->16k downsample exist together or
+/// not at all.
+struct TopChain {
+    split: sena_dsp::CrossoverStream,
+    shift: sena_dsp::ShiftStream,
+    rs: sena_dsp::StreamResampler,
+}
+
+/// The streaming DSP + rail-delivery state, built once the WAV header is
+/// parsed (see [`encode_stream`]). `piped` is declared first so an
+/// error-path drop kills the encoders before their stdin pipes close.
+struct Pipeline {
+    piped: PipedSet,
+    norm: sena_dsp::StreamResampler,
+    split_main: sena_dsp::CrossoverStream,
+    top: Option<TopChain>,
+    lf_rs: sena_dsp::StreamResampler,
+    tilt: Option<sena_dsp::FirStream>,
+    mid44_rs: Option<sena_dsp::StreamResampler>,
+    mid_wr: Option<RailSink>,
+    hf_wr: RailSink,
+    /// LF is always the spooled s16 file: exhale's WAV reader lseeks, so
+    /// no pipe.
+    lf_wr: SpoolWriter,
+    wd: std::path::PathBuf,
+    dump_rails: bool,
+}
+
+impl Pipeline {
+    /// Build the DSP chain and spawn the rail encoders (or open the rail
+    /// dump files). Statement order is load-bearing: the tool checks run
+    /// before any child is spawned, children are spawned in rail order,
+    /// and the LF spool is created last.
+    fn build(cfg: &EncoderConfig, ws: &wav::WavStream, st: &mut StageTimes) -> Result<Self, Error> {
+        let lf_rate = cfg.profile.lf_rate();
+        let norm = sena_dsp::StreamResampler::new(ws.rate().unwrap(), SAMPLE_RATE);
+        let split_main = sena_dsp::CrossoverStream::new(cfg.profile.crossover_hz());
+        // Three-track layout: split the 600 Hz-high band again at 12000 Hz
+        // and carry the top band as A_OPUSHF, SSB-shifted down to baseband
+        // and resampled to 16 kHz.
+        let top = cfg.three_track.then(|| TopChain {
+            split: sena_dsp::CrossoverStream::new(sena_core::HF_SPLIT_HZ),
+            shift: sena_dsp::ShiftStream::down(sena_core::HF_SPLIT_HZ, SAMPLE_RATE),
+            rs: sena_dsp::StreamResampler::new(SAMPLE_RATE, sena_core::HF_TRACK_RATE),
+        });
+        let lf_rs = sena_dsp::StreamResampler::new(SAMPLE_RATE, lf_rate);
+        let tilt = cfg
+            .hf_tilt_pct
+            .filter(|&s| s > 0.0)
+            .map(|s| sena_dsp::FirStream::new(sena_dsp::tilt_taps(s)));
+        // Delivery: exhale is fed a spooled s16 file (its WAV reader
+        // seeks); the piped encoders stream f32 over stdin. The
+        // SENAENC_DUMP_RAILS knob writes every rail to a workdir file
+        // instead of spawning encoders (DSP regression tests).
+        let dump_rails = std::env::var_os("SENAENC_DUMP_RAILS").is_some();
+        let wd = choose_workdir(cfg, ws)?;
+        let wd_path: &Path = &wd;
+        let hf_rate = if cfg.three_track {
+            sena_core::HF_TRACK_RATE
+        } else {
+            SAMPLE_RATE
+        };
+        let mut piped = PipedSet { children: Vec::new() };
+        let mut mid_wr = None;
+        let mut hf_wr = None;
+        let mut mid44_rs = None;
+        if !dump_rails {
+            let pipe_cmds = build_codec_commands(cfg, wd_path, st)?;
+            for (role, name, mut cmd) in pipe_cmds {
+                let mut child = cmd
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .map_err(|e| {
+                        Error::Subprocess(format!(
+                            "cannot start encoder {name} ({}): {e}",
+                            cmd.get_program().to_string_lossy()
+                        ))
+                    })?;
+                let stdin = child.stdin.take().expect("piped stdin");
+                piped.children.push(PipedChild { name, child });
+
+                match role {
+                    RailRole::Mid => {
+                        mid_wr = Some(RailSink::Pipe(
+                            name,
+                            wav::PipeWavWriter::new(stdin, SAMPLE_RATE, 2, false)?,
+                        ));
+                    }
+
+                    RailRole::MidXhe44 => {
+                        mid44_rs = Some(sena_dsp::StreamResampler::new_with_passband(
+                            SAMPLE_RATE,
+                            sena_core::XFI_MID_RATE,
+                            sena_core::XFI_MID_RESAMPLE_PASS_HZ,
+                        ));
+                        mid_wr = Some(RailSink::Pipe(
+                            name,
+                            wav::PipeWavWriter::new(stdin, sena_core::XFI_MID_RATE, 2, true)?,
+                        ));
+                    }
+
+                    RailRole::Hf => {
+                        hf_wr = Some(RailSink::Pipe(
+                            name,
+                            wav::PipeWavWriter::new(stdin, hf_rate, 2, false)?,
+                        ));
+                    }
+                }
+            }
+        } else {
+            for role in rail_layout(cfg) {
+                match role {
+                    RailRole::Mid => {
+                        mid_wr = Some(RailSink::File(wav::WavWriter::create(
+                            &wd_path.join("mid.wav"),
+                            SAMPLE_RATE,
+                            32,
+                            2,
+                        )?));
+                    }
+
+                    RailRole::MidXhe44 => {
+                        mid44_rs = Some(sena_dsp::StreamResampler::new_with_passband(
+                            SAMPLE_RATE,
+                            sena_core::XFI_MID_RATE,
+                            sena_core::XFI_MID_RESAMPLE_PASS_HZ,
+                        ));
+                        mid_wr = Some(RailSink::File(wav::WavWriter::create(
+                            &wd_path.join("mid44.wav"),
+                            sena_core::XFI_MID_RATE,
+                            32,
+                            2,
+                        )?));
+                    }
+
+                    RailRole::Hf => {
+                        hf_wr = Some(RailSink::File(wav::WavWriter::create(
+                            &wd_path.join("hf.wav"),
+                            hf_rate,
+                            32,
+                            2,
+                        )?));
+                    }
+                }
+            }
+        }
+        // exhale stays on s16: its internal domain is 24-bit, but its
+        // rate-distortion operating point was tuned and validated with
+        // s16 input — feeding s24 consistently cut VBR allocation
+        // 11-16% and worsened the 24-144 Hz envelope sigma on the
+        // golden clip and all three real tracks (measured, card 80);
+        // keep the frozen encoder's input distribution.
+        let lf_wr = SpoolWriter {
+            w: wav::WavWriter::create(&wd_path.join("lf.wav"), lf_rate, 16, 2)?,
+            spill_base: cfg.workdir_fallback.map(|p| p.to_path_buf()),
+            cleanup: cfg.cleanup.clone(),
+            spilled_to: None,
+        };
+        let hf_wr = hf_wr.expect("the rail layout always creates the hf sink");
+        Ok(Pipeline {
+            piped,
+            norm,
+            split_main,
+            top,
+            lf_rs,
+            tilt,
+            mid44_rs,
+            mid_wr,
+            hf_wr,
+            lf_wr,
+            wd,
+            dump_rails,
+        })
+    }
+
+    /// One chunk through normalize -> split -> branches -> writers. In the
+    /// three-track layout the LF branch (downsample + LF write) and the HF
+    /// branch (12000 Hz split + tilt + mid write + top-band
+    /// shift/downsample/write) are independent and run concurrently; their
+    /// stage timers overlap, so the SENAENC_TIME sum can exceed the wall
+    /// time.
+    fn push_chunk(&mut self, x: &[f64], ch: usize, st: &mut StageTimes) -> Result<(), Error> {
+        st.begin();
+        let n48 = self.norm.push(x, ch);
+        end_tick(&mut st.t, &mut st.norm);
+        st.begin();
+        let (low, high) = self.split_main.push(&n48, ch);
+        end_tick(&mut st.t, &mut st.split);
+
+        if let Some(top) = self.top.as_mut() {
+            // Three-track: the two band branches are independent; run them
+            // concurrently so the p600 LF downsample overlaps the second
+            // crossover and the mid/top writes.
+            let Pipeline { lf_rs, lf_wr, tilt, mid44_rs, mid_wr, hf_wr, .. } = self;
+            let mut lf_times = (0.0f64, 0.0f64); // (lf, write)
+            let mut hf_times = (0.0f64, 0.0f64); // (split, write)
+            let (ra, rb) = std::thread::scope(|s| {
+                let ha = s.spawn(|| lf_branch(&low, ch, lf_rs, lf_wr, &mut lf_times));
+                let hb = s.spawn(|| {
+                    hf_branch3(
+                        &high,
+                        ch,
+                        &mut top.split,
+                        &mut top.shift,
+                        &mut top.rs,
+                        tilt,
+                        mid_wr.as_mut().unwrap(),
+                        mid44_rs.as_mut(),
+                        hf_wr,
+                        &mut hf_times,
+                    )
+                });
+                (
+                    ha.join().unwrap_or_else(|e| std::panic::resume_unwind(e)),
+                    hb.join().unwrap_or_else(|e| std::panic::resume_unwind(e)),
+                )
+            });
+            st.lf += lf_times.0;
+            st.write += lf_times.1 + hf_times.1;
+            st.split += hf_times.0;
+            ra?;
+            rb?;
+            return Ok(());
+        }
+
+        if !low.is_empty() {
+            let low_p: Vec<f64> = pre_gained(&low);
+            st.begin();
+            let lf16 = self.lf_rs.push(&low_p, ch);
+            end_tick(&mut st.t, &mut st.lf);
+            st.begin();
+            self.lf_wr.push(&lf16)?;
+            end_tick(&mut st.t, &mut st.write);
+        }
+        let high = if let Some(t) = self.tilt.as_mut() {
+            t.push(&high, ch)
+        } else {
+            high
+        };
+        if !high.is_empty() {
+            let high_p: Vec<f64> = pre_gained(&high);
+            st.begin();
+            self.hf_wr.push(&high_p)?;
+            end_tick(&mut st.t, &mut st.write);
+        }
+        Ok(())
+    }
+
+    /// Flush the pipeline latencies (normalize tail -> split tails -> LF
+    /// tail) and push the final rail frames. Returns the playable frame
+    /// count.
+    fn flush_tail(&mut self, ch: usize, st: &mut StageTimes) -> Result<usize, Error> {
+        let playable = self.norm.output_frames_total();
+        st.begin();
+        let n48_tail = self.norm.finish(ch);
+        end_tick(&mut st.t, &mut st.norm);
+        st.begin();
+        let (low_a, high_a) = self.split_main.push(&n48_tail, ch);
+        let (low_b, high_b) = self.split_main.finish(ch);
+        end_tick(&mut st.t, &mut st.split);
+
+        let low_p: Vec<f64> = pre_gained(low_a.iter().chain(low_b.iter()));
+        st.begin();
+        let lf16 = self.lf_rs.push(&low_p, ch);
+        end_tick(&mut st.t, &mut st.lf);
+        self.lf_wr.push(&lf16)?;
+        st.begin();
+        let lf16b = self.lf_rs.finish(ch);
+        end_tick(&mut st.t, &mut st.lf);
+        self.lf_wr.push(&lf16b)?;
+
+        let high_in: Vec<f64> = high_a.iter().chain(high_b.iter()).cloned().collect();
+        if let Some(top) = self.top.as_mut() {
+            // Three-track tail: split the high band at 12000 Hz, tilt and
+            // pad the mid band; shift the top band to baseband, resample
+            // to 16 kHz and pad.
+            st.begin();
+            let (mid_a, top_a) = top.split.push(&high_in, ch);
+            let (mid_b, top_b) = top.split.finish(ch);
+            let top_s = {
+                let mut v = top.shift.push(&top_a, ch);
+                v.extend(top.shift.push(&top_b, ch));
+                v.extend(top.shift.finish(ch));
+                v
+            };
+            let top16 = {
+                let mut v = top.rs.push(&top_s, ch);
+                v.extend(top.rs.finish(ch));
+                v
+            };
+            end_tick(&mut st.t, &mut st.split);
+
+            let mid_in: Vec<f64> = mid_a.iter().chain(mid_b.iter()).cloned().collect();
+            let mid_f = if let Some(t) = self.tilt.as_mut() {
+                let mut v = t.push(&mid_in, ch);
+                v.extend(t.finish(ch));
+                v
+            } else {
+                mid_in
+            };
+            let mid_p: Vec<f64> = pre_gained(&mid_f);
+            let top_p: Vec<f64> = pre_gained(&top16);
+
+            st.begin();
+            if let Some(rs) = self.mid44_rs.as_mut() {
+                // xfi mid: flush the 44.1k resampler tail, then zero-pad
+                // until (a) the FhG finalize floor (one 0.4 s BS.1770
+                // gating block) and (b) full playable coverage after the
+                // 1024-sample warmup trim + AU quantization are both met
+                // (the streaming finish tail alone was 7.6 ms short of the
+                // playable end on the golden clip).
+                let m = rs.push(&mid_p, ch);
+                self.mid_wr.as_mut().unwrap().push(&m)?;
+                // + 4 warmup frames of slack: the coverage gate needs
+                // playable + warmup + AU quantization, and a seek into the
+                // tail additionally needs the decode-side resampler guard
+                // (a 2-AU pad left the tail 5.5 ms short on tail seeks).
+                let min_frames = (sena_core::XFI_MID_RATE as usize * 2 / 5).max(
+                    playable * sena_core::XFI_MID_RATE as usize / SAMPLE_RATE as usize
+                        + 4 * sena_core::XHE_WARMUP_CORE,
+                );
+                let mut pad_iters = 0;
+                while rs.output_frames_total() < min_frames {
+                    pad_iters += 1;
+                    if pad_iters > MAX_PAD_ITERS {
+                        return Err(Error::Format(
+                            "mid 44.1k resampler produced no output while padding".into(),
+                        ));
+                    }
+                    let m = rs.push(&vec![0.0f64; PAD_QUANTUM_FRAMES * ch], ch);
+                    self.mid_wr.as_mut().unwrap().push(&m)?;
+                }
+
+                let m = rs.finish(ch);
+                self.mid_wr.as_mut().unwrap().push(&m)?;
+            } else {
+                self.mid_wr.as_mut().unwrap().push(&mid_p)?;
+            }
+            self.hf_wr.push(&top_p)?;
+            end_tick(&mut st.t, &mut st.write);
+        } else {
+            let high_f = if let Some(t) = self.tilt.as_mut() {
+                let mut v = t.push(&high_in, ch);
+                v.extend(t.finish(ch));
+                v
+            } else {
+                high_in
+            };
+            let high_p: Vec<f64> = pre_gained(&high_f);
+            st.begin();
+            self.hf_wr.push(&high_p)?;
+            end_tick(&mut st.t, &mut st.write);
+        }
+        Ok(playable)
+    }
+}
+
+/// Full encode pipeline over a streaming input (stdin-safe).
+///
+/// The WAV is parsed incrementally and pushed through the streaming DSP
+/// ([`Pipeline`]); the WAV is read in PIPELINE_CHUNK_FRAMES chunks once the
+/// header gives the channel count.
 pub fn encode_stream<R: std::io::Read>(
     cfg: &EncoderConfig,
     input: &mut R,
     output: &Path,
 ) -> Result<EncodeOutcome, Error> {
-    use sena_dsp::{CrossoverStream, StreamResampler};
-
     let mut st = StageTimes::new();
-    let mut wd: Option<std::path::PathBuf> = None;
-    let mut spill_dir: Option<std::path::PathBuf> = None;
-
     let mut ws = wav::WavStream::new();
-    let mut norm: Option<StreamResampler> = None;
-    let mut split_s: Option<CrossoverStream> = None;
-    // Second split (three-track layout): 12000 Hz on the 600 Hz-high band,
-    // then the top band is SSB-shifted down to baseband and resampled to
-    // 16 kHz for the A_OPUSHF encode.
-    let mut split_hf: Option<CrossoverStream> = None;
-    let mut shift_hf: Option<sena_dsp::ShiftStream> = None;
-    let mut tf_rs: Option<StreamResampler> = None;
-    let mut tilt: Option<sena_dsp::FirStream> = cfg
-        .hf_tilt_pct
-        .filter(|&s| s > 0.0)
-        .map(|s| sena_dsp::FirStream::new(sena_dsp::tilt_taps(s)));
-    let mut lf_rs: Option<StreamResampler> = None;
-    let mut lf_wr: Option<RailSink> = None;
-    let mut mid_wr: Option<RailSink> = None;
-    let mut hf_wr: Option<RailSink> = None;
-    let mut mid44_rs: Option<StreamResampler> = None;
-    let mut piped = PipedSet { children: Vec::new() };
-    let mut dump_rails = false;
-    let hf_rate = if cfg.three_track {
-        sena_core::HF_TRACK_RATE
-    } else {
-        SAMPLE_RATE
-    };
+    let mut pipe: Option<Pipeline> = None;
     let mut ch = 2usize;
-    let mut byte_buf = [0u8; 262_144];
+    let mut byte_buf = [0u8; READ_CHUNK_BYTES];
     let mut eof = false;
 
     loop {
-        if norm.is_none() {
+        if pipe.is_none() {
             if !ws.parsed() {
                 if eof {
                     return Err(Error::Format("no WAV header".into()));
@@ -661,144 +809,19 @@ pub fn encode_stream<R: std::io::Read>(
                 ws.feed(&byte_buf[..n])?;
                 continue;
             }
-            // header is parsed: initialize the pipeline
-            let in_rate = ws.rate().unwrap();
+            // header is parsed: build the pipeline
             ch = ws.channels().unwrap();
             if ch != 2 {
                 return Err(Error::Format(format!("expected stereo input, got {ch} ch")));
             }
-            let lf_rate = cfg.profile.lf_rate();
-            norm = Some(StreamResampler::new(in_rate, SAMPLE_RATE));
-            split_s = Some(CrossoverStream::new(cfg.profile.crossover_hz()));
-            split_hf = cfg
-                .three_track
-                .then(|| CrossoverStream::new(sena_core::HF_SPLIT_HZ));
-            shift_hf = cfg
-                .three_track
-                .then(|| sena_dsp::ShiftStream::down(sena_core::HF_SPLIT_HZ, SAMPLE_RATE));
-            tf_rs = cfg
-                .three_track
-                .then(|| StreamResampler::new(SAMPLE_RATE, sena_core::HF_TRACK_RATE));
-            lf_rs = Some(StreamResampler::new(SAMPLE_RATE, lf_rate));
-            // Delivery: exhale is fed a spooled s16 file (its WAV reader
-            // seeks); the piped encoders stream f32 over stdin. The
-            // SENAENC_DUMP_RAILS knob writes every rail to a workdir file
-            // instead of spawning encoders (DSP regression tests).
-            dump_rails = std::env::var_os("SENAENC_DUMP_RAILS").is_some();
-            let chosen = choose_workdir(cfg, &ws)?;
-            wd = Some(chosen);
-            let wdp: &Path = wd.as_ref().unwrap();
-            if !dump_rails {
-                let eps = build_codec_commands(cfg, wdp, &mut st)?;
-                for (role, name, mut cmd) in eps {
-                    let mut child = cmd
-                        .stdin(std::process::Stdio::piped())
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::piped())
-                        .spawn()
-                        .map_err(|e| {
-                            Error::Subprocess(format!(
-                                "cannot start encoder {name} ({}): {e}",
-                                cmd.get_program().to_string_lossy()
-                            ))
-                        })?;
-                    let stdin = child.stdin.take().expect("piped stdin");
-                    piped.children.push(PipedChild { name, child });
-                    match role {
-                        RailRole::Mid => {
-                            mid_wr = Some(RailSink::Pipe(
-                                name,
-                                wav::PipeWavWriter::new(stdin, SAMPLE_RATE, 2, false)?,
-                            ));
-                        }
-                        RailRole::MidXhe44 => {
-                            mid44_rs = Some(StreamResampler::new_with_passband(
-                                SAMPLE_RATE,
-                                sena_core::XFI_MID_RATE,
-                                sena_core::XFI_MID_RESAMPLE_PASS_HZ,
-                            ));
-                            mid_wr = Some(RailSink::Pipe(
-                                name,
-                                wav::PipeWavWriter::new(stdin, sena_core::XFI_MID_RATE, 2, true)?,
-                            ));
-                        }
-                        RailRole::Hf => {
-                            hf_wr = Some(RailSink::Pipe(
-                                name,
-                                wav::PipeWavWriter::new(stdin, hf_rate, 2, false)?,
-                            ));
-                        }
-                    }
-                }
-            } else {
-                for role in rail_layout(cfg) {
-                    match role {
-                        RailRole::Mid => {
-                            mid_wr = Some(RailSink::File(wav::WavWriter::create(
-                                &wdp.join("mid.wav"),
-                                SAMPLE_RATE,
-                                32,
-                                2,
-                            )?));
-                        }
-                        RailRole::MidXhe44 => {
-                            mid44_rs = Some(StreamResampler::new_with_passband(
-                                SAMPLE_RATE,
-                                sena_core::XFI_MID_RATE,
-                                sena_core::XFI_MID_RESAMPLE_PASS_HZ,
-                            ));
-                            mid_wr = Some(RailSink::File(wav::WavWriter::create(
-                                &wdp.join("mid44.wav"),
-                                sena_core::XFI_MID_RATE,
-                                32,
-                                2,
-                            )?));
-                        }
-                        RailRole::Hf => {
-                            hf_wr = Some(RailSink::File(wav::WavWriter::create(
-                                &wdp.join("hf.wav"),
-                                hf_rate,
-                                32,
-                                2,
-                            )?));
-                        }
-                    }
-                }
-            }
-            // exhale stays on s16: its internal domain is 24-bit, but its
-            // rate-distortion operating point was tuned and validated with
-            // s16 input — feeding s24 consistently cut VBR allocation
-            // 11-16% and worsened the 24-144 Hz envelope sigma on the
-            // golden clip and all three real tracks (measured, card 80);
-            // keep the frozen encoder's input distribution. Its reader
-            // lseeks, so no pipe.
-            lf_wr = Some(RailSink::Spool(SpoolWriter {
-                w: wav::WavWriter::create(&wdp.join("lf.wav"), lf_rate, 16, 2)?,
-                spill_base: cfg.workdir_fallback.map(|p| p.to_path_buf()),
-                cleanup: cfg.cleanup.clone(),
-                spilled_to: None,
-            }));
+            pipe = Some(Pipeline::build(cfg, &ws, &mut st)?);
             continue;
         }
 
-        match ws.take(48_000)? {
+        match ws.take(PIPELINE_CHUNK_FRAMES)? {
             Some(x) => {
-                push_chunk(
-                    &x,
-                    ch,
-                    norm.as_mut().unwrap(),
-                    split_s.as_mut().unwrap(),
-                    split_hf.as_mut(),
-                    shift_hf.as_mut(),
-                    tf_rs.as_mut(),
-                    lf_rs.as_mut().unwrap(),
-                    lf_wr.as_mut().unwrap(),
-                    mid_wr.as_mut(),
-                    hf_wr.as_mut().unwrap(),
-                    mid44_rs.as_mut(),
-                    &mut tilt,
-                    &mut st,
-                )?;
+                let p = pipe.as_mut().expect("pipeline built above");
+                p.push_chunk(&x, ch, &mut st)?;
             }
             None => {
                 if eof {
@@ -815,137 +838,21 @@ pub fn encode_stream<R: std::io::Read>(
     }
     ws.finish()?;
 
-    // Flush the pipeline latencies (normalize tail -> split tails -> LF tail).
-    let mut norm = norm.unwrap();
-    let mut split_s = split_s.unwrap();
-    let mut split_hf = split_hf.take();
-    let mut shift_hf = shift_hf.take();
-    let mut tf_rs = tf_rs.take();
-    let mut lf_rs = lf_rs.unwrap();
-    let mut lf_wr = lf_wr.unwrap();
-    let mut mid_wr = mid_wr.take();
-    let mut hf_wr = hf_wr.unwrap();
-    let playable = norm.output_frames_total();
-    st.begin();
-    let n48_tail = norm.finish(ch);
-    end_tick(&mut st.t, &mut st.norm);
-    st.begin();
-    let (low_a, high_a) = split_s.push(&n48_tail, ch);
-    let (low_b, high_b) = split_s.finish(ch);
-    end_tick(&mut st.t, &mut st.split);
-    {
-        let low_p: Vec<f64> = low_a
-            .iter()
-            .chain(low_b.iter())
-            .map(|v| v * PRE_GAIN)
-            .collect();
-        st.begin();
-        let lf16 = lf_rs.push(&low_p, ch);
-        end_tick(&mut st.t, &mut st.lf);
-        lf_wr.push(&lf16)?;
-        st.begin();
-        let lf16b = lf_rs.finish(ch);
-        end_tick(&mut st.t, &mut st.lf);
-        lf_wr.push(&lf16b)?;
-        let high_in: Vec<f64> = high_a.iter().chain(high_b.iter()).cloned().collect();
-        if let Some(split_hf) = split_hf.as_mut() {
-            // Three-track tail: split the high band at 12000 Hz, tilt and
-            // pad the mid band; shift the top band to baseband, resample
-            // to 16 kHz and pad.
-            st.begin();
-            let (mid_a, top_a) = split_hf.push(&high_in, ch);
-            let (mid_b, top_b) = split_hf.finish(ch);
-            let shift = shift_hf.as_mut().unwrap();
-            let tf_rs = tf_rs.as_mut().unwrap();
-            let top_s = {
-                let mut v = shift.push(&top_a, ch);
-                v.extend(shift.push(&top_b, ch));
-                v.extend(shift.finish(ch));
-                v
-            };
-            let top16 = {
-                let mut v = tf_rs.push(&top_s, ch);
-                v.extend(tf_rs.finish(ch));
-                v
-            };
-            end_tick(&mut st.t, &mut st.split);
-            let mid_in: Vec<f64> = mid_a.iter().chain(mid_b.iter()).cloned().collect();
-            let mid_f = if let Some(t) = tilt.as_mut() {
-                let mut v = t.push(&mid_in, ch);
-                v.extend(t.finish(ch));
-                v
-            } else {
-                mid_in
-            };
-            let mid_p: Vec<f64> = mid_f.iter().map(|v| v * PRE_GAIN).collect();
-            let top_p: Vec<f64> = top16.iter().map(|v| v * PRE_GAIN).collect();
-            st.begin();
-            if let Some(rs) = mid44_rs.as_mut() {
-                // xfi mid: flush the 44.1k resampler tail, then zero-pad
-                // until (a) the FhG finalize floor (one 0.4 s BS.1770
-                // gating block) and (b) full playable coverage after the
-                // 1024-sample warmup trim + AU quantization are both met
-                // (the streaming finish tail alone was 7.6 ms short of the
-                // playable end on the golden clip).
-                let m = rs.push(&mid_p, ch);
-                mid_wr.as_mut().unwrap().push(&m)?;
-                // + 4 warmup frames of slack: the coverage gate needs
-                // playable + warmup + AU quantization, and a seek into the
-                // tail additionally needs the decode-side resampler guard
-                // (a 2-AU pad left the tail 5.5 ms short on tail seeks).
-                let min_frames = (sena_core::XFI_MID_RATE as usize * 2 / 5).max(
-                    playable * sena_core::XFI_MID_RATE as usize / SAMPLE_RATE as usize
-                        + 4 * sena_core::XHE_WARMUP_CORE,
-                );
-                let mut pad_iters = 0;
-                while rs.output_frames_total() < min_frames {
-                    pad_iters += 1;
-                    if pad_iters > 16 {
-                        return Err(Error::Format(
-                            "mid 44.1k resampler produced no output while padding".into(),
-                        ));
-                    }
-                    let m = rs.push(&vec![0.0f64; 4800 * ch], ch);
-                    mid_wr.as_mut().unwrap().push(&m)?;
-                }
-                let m = rs.finish(ch);
-                mid_wr.as_mut().unwrap().push(&m)?;
-            } else {
-                mid_wr.as_mut().unwrap().push(&mid_p)?;
-            }
-            hf_wr.push(&top_p)?;
-            end_tick(&mut st.t, &mut st.write);
-        } else {
-            let high_f = if let Some(t) = tilt.as_mut() {
-                let mut v = t.push(&high_in, ch);
-                v.extend(t.finish(ch));
-                v
-            } else {
-                high_in
-            };
-            let high_p: Vec<f64> = high_f.iter().map(|v| v * PRE_GAIN).collect();
-            st.begin();
-            hf_wr.push(&high_p)?;
-            end_tick(&mut st.t, &mut st.write);
-        }
-    }
-    // The LF spool may have been relocated mid-pass; exhale is built with
-    // the final path, and the fallback dir joins the cleanup set.
-    if let RailSink::Spool(sp) = &lf_wr {
-        if let Some(d) = &sp.spilled_to {
-            spill_dir = Some(d.clone());
-        }
-    }
-    let lf_wav = match &lf_wr {
-        RailSink::Spool(sp) => sp.w.path().to_path_buf(),
-        _ => unreachable!("LF rail is always the spool sink"),
-    };
+    let mut pipe = pipe.expect("the loop cannot exit before the pipeline is built");
+    let playable = pipe.flush_tail(ch, &mut st)?;
+
+    // Finish the sinks in rail order (LF spool, mid, top), then reap the
+    // piped encoders. The LF spool may have been relocated mid-pass; exhale
+    // is built with the final path, and the fallback dir joins the cleanup
+    // set.
+    let Pipeline { piped, lf_wr, mid_wr, hf_wr, wd, dump_rails, .. } = pipe;
+    let spill_dir = lf_wr.spilled_to.clone();
+    let lf_wav = lf_wr.w.path().to_path_buf();
     lf_wr.finish()?;
     if let Some(mw) = mid_wr {
         mw.finish()?;
     }
     hf_wr.finish()?;
-    let wd = wd.expect("workdir chosen at pipeline init");
     let outcome = EncodeOutcome { workdir: wd.clone(), spill_dir };
     if dump_rails {
         // DSP-only mode (SENAENC_DUMP_RAILS): rails are workdir files,
@@ -963,184 +870,19 @@ pub fn encode_stream<R: std::io::Read>(
     result.map(|_| outcome)
 }
 
-/// Env-gated stage timing for pipeline analysis (SENAENC_TIME=1 prints the
-/// per-stage CPU/wall breakdown at the end of an encode).
-#[derive(Default)]
-pub struct StageTimes {
-    on: bool,
-    t: Option<std::time::Instant>,
-    pub norm: f64,   // input rate -> 48k normalization
-    pub split: f64,  // crossover split
-    pub lf: f64,     // LF downsample 48k -> lf rate
-    pub write: f64,  // band WAV IO (16/32-bit conversion + file write)
-    pub check: f64,  // tool version checks
-    pub exhale: f64, // xHE-AAC encode
-    pub opus: f64,   // Opus encode (mid track; three-track layouts attribute
-    // the shared codec wall time to both opus accumulators)
-    pub opus_hf: f64, // Opus encode (A_OPUSHF top track, three-track only)
-    pub mux: f64,     // packet extraction + container mux
-}
-
-impl StageTimes {
-    pub fn new() -> Self {
-        Self {
-            on: std::env::var_os("SENAENC_TIME").is_some(),
-            ..Default::default()
-        }
-    }
-
-    pub fn begin(&mut self) {
-        if self.on {
-            self.t = Some(std::time::Instant::now());
-        }
-    }
-
-    pub fn consume_tick(&mut self) {
-        self.t = None;
-    }
-
-    pub fn tick(&self) -> &Option<std::time::Instant> {
-        &self.t
-    }
-
-    pub fn report(&self, playable: usize) {
-        if !self.on {
-            return;
-        }
-        let total = self.norm
-            + self.split
-            + self.lf
-            + self.write
-            + self.check
-            + self.exhale
-            + self.opus
-            + self.opus_hf
-            + self.mux;
-        eprintln!(
-            "SENAENC_TIME: playable={playable} frames\n\
-             \x20 normalize {:.3}s  split {:.3}s  lf-down {:.3}s  write {:.3}s\n\
-             \x20 check {:.3}s  exhale {:.3}s  opus {:.3}s  opus-hf {:.3}s  mux {:.3}s\n\
-             \x20 summed {:.3}s",
-            self.norm,
-            self.split,
-            self.lf,
-            self.write,
-            self.check,
-            self.exhale,
-            self.opus,
-            self.opus_hf,
-            self.mux,
-            total
-        );
-    }
-}
-
-/// Fold a pending begin() tick into an accumulator. Takes the two disjoint
-/// fields separately so call sites can borrow them without aliasing.
-fn end_tick(tick: &mut Option<std::time::Instant>, acc: &mut f64) {
-    if let Some(t) = tick.take() {
-        *acc += t.elapsed().as_secs_f64();
-    }
-}
-
-/// One chunk through normalize -> split -> pad -> LF downsample -> writers.
-/// In the three-track layout the LF branch (downsample + LF write) and the
-/// HF branch (12000 Hz split + tilt + mid write + top-band shift/downsample/
-/// write) are independent and run concurrently; their stage timers overlap,
-/// so the SENAENC_TIME sum can exceed the wall time.
-#[allow(clippy::too_many_arguments)]
-fn push_chunk(
-    x: &[f64],
-    ch: usize,
-    norm: &mut sena_dsp::StreamResampler,
-    split_s: &mut sena_dsp::CrossoverStream,
-    split_hf: Option<&mut sena_dsp::CrossoverStream>,
-    shift_hf: Option<&mut sena_dsp::ShiftStream>,
-    tf_rs: Option<&mut sena_dsp::StreamResampler>,
-    lf_rs: &mut sena_dsp::StreamResampler,
-    lf_wr: &mut RailSink,
-    mut mid_wr: Option<&mut RailSink>,
-    hf_wr: &mut RailSink,
-    mut mid44_rs: Option<&mut sena_dsp::StreamResampler>,
-    tilt: &mut Option<sena_dsp::FirStream>,
-    st: &mut StageTimes,
-) -> Result<(), Error> {
-    st.begin();
-    let n48 = norm.push(x, ch);
-    end_tick(&mut st.t, &mut st.norm);
-    st.begin();
-    let (low, high) = split_s.push(&n48, ch);
-    end_tick(&mut st.t, &mut st.split);
-    if let Some(split_hf) = split_hf {
-        // Three-track: the two band branches are independent; run them
-        // concurrently so the p600 LF downsample overlaps the second
-        // crossover and the mid/top writes.
-        let mut a_time = (0.0f64, 0.0f64); // (lf, write)
-        let mut b_time = (0.0f64, 0.0f64); // (split, write)
-        let (ra, rb) = std::thread::scope(|s| {
-            let ha = s.spawn(|| lf_branch(&low, ch, lf_rs, lf_wr, &mut a_time));
-            let hb = s.spawn(|| {
-                hf_branch3(
-                    &high,
-                    ch,
-                    split_hf,
-                    shift_hf.unwrap(),
-                    tf_rs.unwrap(),
-                    tilt,
-                    mid_wr.as_mut().unwrap(),
-                    mid44_rs.as_deref_mut(),
-                    hf_wr,
-                    &mut b_time,
-                )
-            });
-            (
-                ha.join().unwrap_or_else(|e| std::panic::resume_unwind(e)),
-                hb.join().unwrap_or_else(|e| std::panic::resume_unwind(e)),
-            )
-        });
-        st.lf += a_time.0;
-        st.write += a_time.1 + b_time.1;
-        st.split += b_time.0;
-        ra?;
-        rb?;
-        return Ok(());
-    }
-    if !low.is_empty() {
-        let low_p: Vec<f64> = low.iter().map(|v| v * PRE_GAIN).collect();
-        st.begin();
-        let lf16 = lf_rs.push(&low_p, ch);
-        end_tick(&mut st.t, &mut st.lf);
-        st.begin();
-        lf_wr.push(&lf16)?;
-        end_tick(&mut st.t, &mut st.write);
-    }
-    let high = if let Some(t) = tilt.as_mut() {
-        t.push(&high, ch)
-    } else {
-        high
-    };
-    if !high.is_empty() {
-        let high_p: Vec<f64> = high.iter().map(|v| v * PRE_GAIN).collect();
-        st.begin();
-        hf_wr.push(&high_p)?;
-        end_tick(&mut st.t, &mut st.write);
-    }
-    Ok(())
-}
-
 /// LF branch: PRE_GAIN -> LF downsample -> s16 WAV write. Returns its
 /// (lf, write) elapsed times through `t`.
 fn lf_branch(
     low: &[f64],
     ch: usize,
     lf_rs: &mut sena_dsp::StreamResampler,
-    lf_wr: &mut RailSink,
+    lf_wr: &mut SpoolWriter,
     t: &mut (f64, f64),
 ) -> Result<(), Error> {
     if low.is_empty() {
         return Ok(());
     }
-    let low_p: Vec<f64> = low.iter().map(|v| v * PRE_GAIN).collect();
+    let low_p: Vec<f64> = pre_gained(low);
     let t0 = std::time::Instant::now();
     let lf16 = lf_rs.push(&low_p, ch);
     t.0 += t0.elapsed().as_secs_f64();
@@ -1160,7 +902,7 @@ fn hf_branch3(
     ch: usize,
     split_hf: &mut sena_dsp::CrossoverStream,
     shift_hf: &mut sena_dsp::ShiftStream,
-    tf_rs: &mut sena_dsp::StreamResampler,
+    top_rs: &mut sena_dsp::StreamResampler,
     tilt: &mut Option<sena_dsp::FirStream>,
     mid_wr: &mut RailSink,
     mut mid44_rs: Option<&mut sena_dsp::StreamResampler>,
@@ -1173,7 +915,7 @@ fn hf_branch3(
         top
     } else {
         let shifted = shift_hf.push(&top, ch);
-        tf_rs.push(&shifted, ch)
+        top_rs.push(&shifted, ch)
     };
     t.0 += t0.elapsed().as_secs_f64();
     let mut err: Option<Error> = None;
@@ -1183,7 +925,7 @@ fn hf_branch3(
         } else {
             mid
         };
-        let mid_p: Vec<f64> = mid.iter().map(|v| v * PRE_GAIN).collect();
+        let mid_p: Vec<f64> = pre_gained(&mid);
         let t1 = std::time::Instant::now();
         // xfi mid: resample 48k -> 44.1k inline (the sink clamps to [-1,1]
         // for the FhG finalize contract); opus mid: f32 as-is.
@@ -1197,7 +939,7 @@ fn hf_branch3(
         t.1 += t1.elapsed().as_secs_f64();
     }
     if err.is_none() && !top16.is_empty() {
-        let top_p: Vec<f64> = top16.iter().map(|v| v * PRE_GAIN).collect();
+        let top_p: Vec<f64> = pre_gained(&top16);
         let t2 = std::time::Instant::now();
         if let Err(e) = hf_wr.push(&top_p) {
             err = Some(e);
@@ -1257,14 +999,7 @@ fn build_codec_commands(
         (mid, 0)
     };
     let mut pipes: Vec<(RailRole, &'static str, Command)> = Vec::new();
-    let mut op = Command::new(cfg.opusenc);
-    op.arg("--quiet")
-        .arg("--bitrate")
-        .arg(mid_kbps.to_string())
-        .arg("--vbr");
-    if cfg.use_senav {
-        apply_senav_env(&mut op, cfg.topband_kbps);
-    }
+    let mut opus_mid = opus_cmd(cfg, mid_kbps, cfg.topband_kbps);
     if cfg.three_track {
         if xhe_mid {
             let ezcd_path = cfg.ezcd_cli.ok_or_else(|| {
@@ -1289,29 +1024,233 @@ fn build_codec_commands(
                 .arg("-");
             pipes.push((RailRole::MidXhe44, "ezcd-cli(mid)", c));
         } else {
-            op.arg("-").arg(&mid_ogg);
-            pipes.push((RailRole::Mid, "opusenc(mid)", op));
+            opus_mid.arg("-").arg(&mid_ogg);
+            pipes.push((RailRole::Mid, "opusenc(mid)", opus_mid));
         }
     } else {
-        op.arg("-").arg(&hf_ogg);
-        pipes.push((RailRole::Hf, "opusenc(mid)", op));
+        // Two-track layout: the Hf-role rail carries the sole Opus track
+        // (the 300/600 Hz-high band), written to hf.opus.
+        opus_mid.arg("-").arg(&hf_ogg);
+        pipes.push((RailRole::Hf, "opusenc(mid)", opus_mid));
     }
     // Three-track top-band encode (A_OPUSHF): the tiered hf nominal
     // (96k/128k); the topband-stereo knob is never armed for it.
     if cfg.three_track {
-        let mut op2 = Command::new(cfg.opusenc);
-        op2.arg("--quiet")
-            .arg("--bitrate")
-            .arg(rail_kbps.to_string())
-            .arg("--vbr")
-            .arg("-")
-            .arg(&hf_ogg);
-        if cfg.use_senav {
-            apply_senav_env(&mut op2, None);
-        }
-        pipes.push((RailRole::Hf, "opusenc(hf)", op2));
+        let mut opus_hf = opus_cmd(cfg, rail_kbps, None);
+        opus_hf.arg("-").arg(&hf_ogg);
+        pipes.push((RailRole::Hf, "opusenc(hf)", opus_hf));
     }
     Ok(pipes)
+}
+
+/// opusenc invocation shared by the mid and top-band encodes.
+fn opus_cmd(cfg: &EncoderConfig, kbps: u32, topband_kbps: Option<u32>) -> Command {
+    let mut c = Command::new(cfg.opusenc);
+    c.arg("--quiet")
+        .arg("--bitrate")
+        .arg(kbps.to_string())
+        .arg("--vbr");
+    if cfg.use_senav {
+        apply_senav_env(&mut c, topband_kbps);
+    }
+    c
+}
+
+/// Per-layer codec streams extracted from the encoder outputs.
+struct Extracted {
+    mid_head: Vec<u8>,
+    mid_stream: MidStream,
+    top_head: Vec<u8>,
+    top_preskip: u16,
+    top_packets: Vec<Vec<u8>>,
+    lf_asc: Vec<u8>,
+    lf_aus: Vec<Vec<u8>>,
+    lf_stream_rate: u32,
+}
+
+/// Read the encoder outputs and split them into per-layer streams.
+fn extract_streams(cfg: &EncoderConfig, wd: &Path) -> Result<Extracted, Error> {
+    let hf_ogg = wd.join("hf.opus");
+    let mid_ogg = wd.join("mid.opus");
+    let mid_m4a = wd.join("mid.m4a");
+    let lf_m4a = wd.join("lf.m4a");
+    let xhe_mid = cfg.mid_codec == sena_core::MidCodec::Xhe;
+    let (mid_head, mid_stream, top_head, top_preskip, top_packets) = if cfg.three_track {
+        let top_bytes = std::fs::read(&hf_ogg)?;
+        let (top_head, top_preskip, top_packets) = ogg::extract_opus(&top_bytes)?;
+        if xhe_mid {
+            let (asc, aus) = extract_m4a(&mid_m4a)?;
+            let rate = m4a_stream_rate(&mid_m4a)?;
+            if rate != sena_core::XFI_MID_RATE {
+                return Err(Error::Format(format!(
+                    "ezcd-cli mid stream rate {rate}, expected {}",
+                    sena_core::XFI_MID_RATE
+                )));
+            }
+            (asc, MidStream::Xhe(aus), top_head, top_preskip, top_packets)
+        } else {
+            let mid_bytes = std::fs::read(&mid_ogg)?;
+            let (mid_head, _mid_preskip, mid_packets) = ogg::extract_opus(&mid_bytes)?;
+            (
+                mid_head,
+                MidStream::Opus(mid_packets),
+                top_head,
+                top_preskip,
+                top_packets,
+            )
+        }
+    } else {
+        // Two-track: the Hf-role rail carries the sole Opus track.
+        let ogg_bytes = std::fs::read(&hf_ogg)?;
+        let (head, _preskip, packets) = ogg::extract_opus(&ogg_bytes)?;
+        (head, MidStream::Opus(packets), Vec::new(), 0, Vec::new())
+    };
+    let (lf_asc, lf_aus) = extract_m4a(&lf_m4a)?;
+    let lf_stream_rate = m4a_stream_rate(&lf_m4a)?;
+    Ok(Extracted {
+        mid_head,
+        mid_stream,
+        top_head,
+        top_preskip,
+        top_packets,
+        lf_asc,
+        lf_aus,
+        lf_stream_rate,
+    })
+}
+
+/// Assemble the composite ES blocks on the 20 ms grid, hash the audio
+/// content (v3: the zeroed-hash SENA-INIT blob plus the block payloads)
+/// and write the container.
+fn mux_container(
+    cfg: &EncoderConfig,
+    x: &Extracted,
+    playable: usize,
+    output: &Path,
+) -> Result<(), Error> {
+    // Grid length: the Opus mid packet count (Opus mid) or the block count
+    // covering pre-skip + playable (xHE mid, whose AUs do not align to the
+    // 20 ms grid and are placed by playable end like LF).
+    let n_blocks = match &x.mid_stream {
+        MidStream::Opus(packets) => packets.len() as u64,
+        MidStream::Xhe(_) => es::block_count(playable as u64, x.top_preskip as u32),
+    };
+
+    // LF AU k lands in the block containing its last playable sample
+    // (by-end placement, clamped to the final block at EOS).
+    let mut lf_by_block: std::collections::BTreeMap<u64, Vec<(u32, &[u8])>> =
+        Default::default();
+    for (k, au) in x.lf_aus.iter().enumerate() {
+        lf_by_block
+            .entry(es::lf_block(k as u64, x.lf_stream_rate, n_blocks))
+            .or_default()
+            .push((k as u32, au));
+    }
+    // xHE mid AUs land by the same by-end rule at 44.1 kHz.
+    let mut mid_by_block: std::collections::BTreeMap<u64, Vec<(u32, &[u8])>> =
+        Default::default();
+    if let MidStream::Xhe(aus) = &x.mid_stream {
+        // Hard coverage gate: after the 1024-sample warmup trim the AUs
+        // must still reach the end of the playable range (the inline
+        // resampler tail plus the 0.4 s floor exist to guarantee this).
+        let n = aus.len() as u64;
+        let covered = es::xhe_au_end48(n, sena_core::XFI_MID_RATE).saturating_sub(
+            sena_core::XHE_WARMUP_CORE as u64 * sena_core::SAMPLE_RATE as u64
+                / sena_core::XFI_MID_RATE as u64,
+        );
+        if covered < playable as u64 {
+            return Err(Error::Format(format!(
+                "xHE mid covers {covered} of {playable} playable frames ({} AUs)",
+                aus.len()
+            )));
+        }
+        for (k, au) in aus.iter().enumerate() {
+            mid_by_block
+                .entry(es::xhe_block(k as u64, sena_core::XFI_MID_RATE, n_blocks))
+                .or_default()
+                .push((k as u32, au));
+        }
+    }
+    // Top-layer packet j lands in block j (clamped to the final block).
+    let mut top_by_block: std::collections::BTreeMap<u64, Vec<&[u8]>> = Default::default();
+    if cfg.three_track {
+        for (j, p) in x.top_packets.iter().enumerate() {
+            top_by_block
+                .entry(es::hf_block(j as u64, n_blocks))
+                .or_default()
+                .push(p);
+        }
+    }
+
+    let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(n_blocks as usize);
+    for i in 0..n_blocks {
+        let lf = match lf_by_block.remove(&i) {
+            Some(v) => {
+                let au_index = v[0].0;
+                let aus: Vec<&[u8]> = v.iter().map(|e| e.1).collect();
+                (au_index, aus)
+            }
+            None => (0, Vec::new()),
+        };
+        let top: Vec<&[u8]> = top_by_block.remove(&i).unwrap_or_default();
+        let mid = match &x.mid_stream {
+            MidStream::Opus(packets) => es::MidSection::Opus(&packets[i as usize]),
+            MidStream::Xhe(_) => match mid_by_block.remove(&i) {
+                Some(v) => es::MidSection::Xhe {
+                    au_index: v[0].0,
+                    aus: v.iter().map(|e| e.1).collect(),
+                },
+                None => es::MidSection::Xhe {
+                    au_index: 0,
+                    aus: Vec::new(),
+                },
+            },
+        };
+        payloads.push(es::encode_block(&es::BlockParts {
+            mid,
+            lf: (lf.0, &lf.1),
+            hf: &top,
+        }));
+    }
+    if !lf_by_block.is_empty() || !top_by_block.is_empty() || !mid_by_block.is_empty() {
+        return Err(Error::Format("layer packet outside the mid grid".into()));
+    }
+
+    let mut init = es::Init {
+        profile: cfg.profile,
+        three_track: cfg.three_track,
+        mid_codec: cfg.mid_codec,
+        lf_rate: x.lf_stream_rate,
+        playable_samples: playable as u64,
+        audio_sha256: [0; 32],
+        lf_asc: x.lf_asc.clone(),
+        mid_head: x.mid_head.clone(),
+        hf_head: cfg.three_track.then(|| x.top_head.clone()),
+    };
+    init.audio_sha256 = encoded_audio_sha256_es(&init.encode(), &payloads);
+
+    let total_bytes: u64 = payloads.iter().map(|p| p.len() as u64).sum();
+    let playable_ns = (playable as u64) * 1_000_000_000 / SAMPLE_RATE as u64;
+    let avg_bps = ((total_bytes as u128 * 1_000_000_000).div_ceil(playable_ns as u128)) as u32;
+    let codec_private = es::build_codec_private(&init, avg_bps);
+
+    let blocks: Vec<SenaBlock> = payloads
+        .into_iter()
+        .enumerate()
+        .map(|(i, data)| SenaBlock {
+            t_ns: i as u64 * es::BLOCK_NS,
+            data,
+        })
+        .collect();
+    let mka_bytes = mka::write_sena(
+        &codec_private,
+        &blocks,
+        &es::codec_name(cfg.profile, cfg.three_track, cfg.mid_codec),
+        MKA_CLUSTER_MS,
+        playable_ns,
+    );
+    std::fs::write(output, mka_bytes)?;
+    Ok(())
 }
 
 /// Run exhale on the spooled LF WAV, extract all streams and mux the
@@ -1332,10 +1271,6 @@ fn finish_codecs(
     ex.arg(cfg.profile.xhe_preset().to_string())
         .arg(lf_wav)
         .arg(&lf_m4a);
-    let hf_ogg = wd.join("hf.opus");
-    let mid_ogg = wd.join("mid.opus");
-    let mid_m4a = wd.join("mid.m4a");
-    let xhe_mid = cfg.mid_codec == sena_core::MidCodec::Xhe;
     let t0 = std::time::Instant::now();
     let mut cmds: Vec<(&str, &mut Command)> = vec![("exhale", &mut ex)];
     let codec_err = run_parallel(&mut cmds);
@@ -1351,194 +1286,12 @@ fn finish_codecs(
         return Err(e);
     }
 
-    // --- extract packets ---
+    // --- extract packets (timed as the mux stage; the block assembly tail
+    // after it is tiny and rides the same accumulator) ---
     st.begin();
-    let extracted: Result<_, Error> = (|| {
-        let (mid_head, mid_aus, hf2_head, hf2_preskip, hf2_packets) = if cfg.three_track {
-            let top_bytes = std::fs::read(&hf_ogg)?;
-            let (top_head, top_preskip, top_packets) = ogg::extract_opus(&top_bytes)?;
-            if xhe_mid {
-                let (asc, aus) = extract_m4a(&mid_m4a)?;
-                let rate = m4a_stream_rate(&mid_m4a)?;
-                if rate != sena_core::XFI_MID_RATE {
-                    return Err(Error::Format(format!(
-                        "ezcd-cli mid stream rate {rate}, expected {}",
-                        sena_core::XFI_MID_RATE
-                    )));
-                }
-                (asc, MidStream::Xhe(aus), top_head, top_preskip, top_packets)
-            } else {
-                let mid_bytes = std::fs::read(&mid_ogg)?;
-                let (mid_head, _mid_preskip, mid_packets) = ogg::extract_opus(&mid_bytes)?;
-                (
-                    mid_head,
-                    MidStream::Opus(mid_packets),
-                    top_head,
-                    top_preskip,
-                    top_packets,
-                )
-            }
-        } else {
-            let ogg_bytes = std::fs::read(&hf_ogg)?;
-            let (head, _preskip, packets) = ogg::extract_opus(&ogg_bytes)?;
-            (head, MidStream::Opus(packets), Vec::new(), 0, Vec::new())
-        };
-        let (lf_asc, lf_aus) = extract_m4a(&lf_m4a)?;
-        let lf_stream_rate = m4a_stream_rate(&lf_m4a)?;
-        Ok((
-            mid_head,
-            mid_aus,
-            hf2_head,
-            hf2_preskip,
-            hf2_packets,
-            lf_asc,
-            lf_aus,
-            lf_stream_rate,
-        ))
-    })();
+    let extracted = extract_streams(cfg, wd);
     end_tick(&mut st.t, &mut st.mux);
-    let (
-        mid_head,
-        mid_stream,
-        hf2_head,
-        hf2_preskip,
-        hf2_packets,
-        lf_asc,
-        lf_aus,
-        lf_stream_rate,
-    ) = extracted?;
-
-    // --- assemble composite ES blocks on the 20 ms grid; the audio
-    // hash (v3) covers the zeroed-hash SENA-INIT blob plus the block
-    // payloads. The remaining tail is tiny and measured with the
-    // extraction stage (st.mux). ---
-    let muxed = (|| {
-        // Grid length: the Opus mid packet count (Opus mid) or the block
-        // count covering pre-skip + playable (xHE mid, whose AUs do not
-        // align to the 20 ms grid and are placed by playable end like LF).
-        let n_blocks = match &mid_stream {
-            MidStream::Opus(packets) => packets.len() as u64,
-            MidStream::Xhe(_) => es::block_count(playable as u64, hf2_preskip as u32),
-        };
-
-        // LF AU k lands in the block containing its last playable sample
-        // (by-end placement, clamped to the final block at EOS).
-        let mut lf_by_block: std::collections::BTreeMap<u64, Vec<(u32, &[u8])>> =
-            Default::default();
-        for (k, au) in lf_aus.iter().enumerate() {
-            lf_by_block
-                .entry(es::lf_block(k as u64, lf_stream_rate, n_blocks))
-                .or_default()
-                .push((k as u32, au));
-        }
-        // xHE mid AUs land by the same by-end rule at 44.1 kHz.
-        let mut mid_by_block: std::collections::BTreeMap<u64, Vec<(u32, &[u8])>> =
-            Default::default();
-        if let MidStream::Xhe(aus) = &mid_stream {
-            // Hard coverage gate: after the 1024-sample warmup trim the AUs
-            // must still reach the end of the playable range (the inline
-            // resampler tail plus the 0.4 s floor exist to guarantee this).
-            let n = aus.len() as u64;
-            let covered = es::xhe_au_end48(n, sena_core::XFI_MID_RATE).saturating_sub(
-                sena_core::XHE_WARMUP_CORE as u64 * sena_core::SAMPLE_RATE as u64
-                    / sena_core::XFI_MID_RATE as u64,
-            );
-            if covered < playable as u64 {
-                return Err(Error::Format(format!(
-                    "xHE mid covers {covered} of {playable} playable frames ({} AUs)",
-                    aus.len()
-                )));
-            }
-            for (k, au) in aus.iter().enumerate() {
-                mid_by_block
-                    .entry(es::xhe_block(k as u64, sena_core::XFI_MID_RATE, n_blocks))
-                    .or_default()
-                    .push((k as u32, au));
-            }
-        }
-        // Top-layer packet j lands in block j (clamped to the final block).
-        let mut hf2_by_block: std::collections::BTreeMap<u64, Vec<&[u8]>> = Default::default();
-        if cfg.three_track {
-            for (j, p) in hf2_packets.iter().enumerate() {
-                hf2_by_block.entry(es::hf_block(j as u64, n_blocks)).or_default().push(p);
-            }
-        }
-
-        let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(n_blocks as usize);
-        for i in 0..n_blocks {
-            let lf = match lf_by_block.remove(&i) {
-                Some(v) => {
-                    let au_index = v[0].0;
-                    let aus: Vec<&[u8]> = v.iter().map(|e| e.1).collect();
-                    (au_index, aus)
-                }
-                None => (0, Vec::new()),
-            };
-            let hf: Vec<&[u8]> = hf2_by_block.remove(&i).unwrap_or_default();
-            let mid = match &mid_stream {
-                MidStream::Opus(packets) => es::MidSection::Opus(&packets[i as usize]),
-                MidStream::Xhe(_) => match mid_by_block.remove(&i) {
-                    Some(v) => es::MidSection::Xhe {
-                        au_index: v[0].0,
-                        aus: v.iter().map(|e| e.1).collect(),
-                    },
-                    None => es::MidSection::Xhe {
-                        au_index: 0,
-                        aus: Vec::new(),
-                    },
-                },
-            };
-            payloads.push(es::encode_block(&es::BlockParts {
-                mid,
-                lf: (lf.0, &lf.1),
-                hf: &hf,
-            }));
-        }
-        if !lf_by_block.is_empty() || !hf2_by_block.is_empty() || !mid_by_block.is_empty() {
-            return Err(Error::Format("layer packet outside the mid grid".into()));
-        }
-
-        let mut init = es::Init {
-            profile: cfg.profile,
-            three_track: cfg.three_track,
-            mid_codec: cfg.mid_codec,
-            lf_rate: lf_stream_rate,
-            playable_samples: playable as u64,
-            audio_sha256: [0; 32],
-            lf_asc: lf_asc.clone(),
-            mid_head: mid_head.to_vec(),
-            hf_head: if cfg.three_track {
-                Some(hf2_head.clone())
-            } else {
-                None
-            },
-        };
-        init.audio_sha256 = encoded_audio_sha256_es(&init.encode(), &payloads);
-
-        let total_bytes: u64 = payloads.iter().map(|p| p.len() as u64).sum();
-        let playable_ns = (playable as u64) * 1_000_000_000 / SAMPLE_RATE as u64;
-        let avg_bps = ((total_bytes as u128 * 1_000_000_000).div_ceil(playable_ns as u128)) as u32;
-        let codec_private = es::build_codec_private(&init, avg_bps);
-
-        let blocks: Vec<SenaBlock> = payloads
-            .into_iter()
-            .enumerate()
-            .map(|(i, data)| SenaBlock {
-                t_ns: i as u64 * es::BLOCK_NS,
-                data,
-            })
-            .collect();
-        let mka_bytes = mka::write_sena(
-            &codec_private,
-            &blocks,
-            &es::codec_name(cfg.profile, cfg.three_track, cfg.mid_codec),
-            1000,
-            playable_ns,
-        );
-        std::fs::write(output, mka_bytes)?;
-        Ok::<(), Error>(())
-    })();
-    muxed
+    mux_container(cfg, &extracted?, playable, output)
 }
 
 /// Extracted mid-layer stream: Opus packets (the block grid) or xHE-AAC
@@ -1548,299 +1301,9 @@ enum MidStream {
     Xhe(Vec<Vec<u8>>),
 }
 
-/// SenaV tuning knobs shared by every opusenc-senav invocation; the
-/// topband-stereo floor is armed only for the mid track when requested.
-fn apply_senav_env(op: &mut Command, topband_kbps: Option<u32>) {
-    for (k, v) in [
-        ("AUDIFF_ADAPT_INTENSITY", "1000"),
-        ("AUDIFF_VBR_TBOOST", "40"),
-        ("AUDIFF_TBOOST_SUSTAIN_GATE", "1"),
-        ("AUDIFF_TBOOST_SUSTAIN_RATIO", "80"),
-        ("AUDIFF_VBR_TDECAY", "0"),
-    ] {
-        op.env(k, v);
-    }
-    if let Some(kbps) = topband_kbps {
-        op.env("AUDIFF_TOPBAND_STEREO", kbps.to_string());
-    }
-}
-
-/// Read the stream's actual sample rate from mdhd timescale.
-pub fn m4a_stream_rate(path: &Path) -> Result<u32, Error> {
-    let f = std::fs::read(path)?;
-    for (tag, s, e) in boxes(&f, 0, f.len()) {
-        if tag != b"moov" {
-            continue;
-        }
-        for (tag2, s2, e2) in boxes(&f, s, e) {
-            if tag2 != b"trak" {
-                continue;
-            }
-            for (tag3, s3, e3) in boxes(&f, s2, e2) {
-                if tag3 == b"mdia" {
-                    for (tag4, s4, _e4) in boxes(&f, s3, e3) {
-                        if tag4 == b"mdhd" {
-                            let ver = f[s4];
-                            let off = if ver == 1 { 16 } else { 12 };
-                            return Ok(u32::from_be_bytes([
-                                f[s4 + off],
-                                f[s4 + off + 1],
-                                f[s4 + off + 2],
-                                f[s4 + off + 3],
-                            ]));
-                        }
-                    }
-                }
-            }
-        }
-    }
-    Err(Error::Format("mdhd not found".into()))
-}
-
-/// Extract ASC (esds desc 0x05) and raw AUs (mdat, stsz order) from an exhale m4a.
-pub fn extract_m4a(path: &Path) -> Result<(Vec<u8>, Vec<Vec<u8>>), Error> {
-    let f = std::fs::read(path)?;
-    let asc = find_asc(&f)?;
-    let aus = find_aus(&f)?;
-    Ok((asc, aus))
-}
-
-fn boxes<'a>(f: &'a [u8], start: usize, end: usize) -> Vec<(&'a [u8], usize, usize)> {
-    let mut out = vec![];
-    let mut p = start;
-    while p + 8 <= end {
-        let sz = u32::from_be_bytes([f[p], f[p + 1], f[p + 2], f[p + 3]]) as usize;
-        let tag = &f[p + 4..p + 8];
-        if sz < 8 || p + sz > end {
-            break;
-        }
-        out.push((tag, p + 8, p + sz));
-        p += sz;
-    }
-    out
-}
-
-fn find_asc(f: &[u8]) -> Result<Vec<u8>, Error> {
-    // walk: moov > trak > mdia > minf > stbl > stsd > mp4a > esds > desc 0x05
-    for (tag, s, e) in boxes(f, 0, f.len()) {
-        if tag != b"moov" {
-            continue;
-        }
-        for (tag2, s2, e2) in boxes(f, s, e) {
-            if tag2 != b"trak" {
-                continue;
-            }
-            for (tag3, s3, e3) in boxes(f, s2, e2) {
-                if tag3 != b"mdia" {
-                    continue;
-                }
-                for (tag4, s4, e4) in boxes(f, s3, e3) {
-                    if tag4 != b"minf" {
-                        continue;
-                    }
-                    for (tag5, s5, e5) in boxes(f, s4, e4) {
-                        if tag5 != b"stbl" {
-                            continue;
-                        }
-                        for (tag6, s6, e6) in boxes(f, s5, e5) {
-                            if tag6 != b"stsd" {
-                                continue;
-                            }
-                            // entry at s6+4 (version/flags) + 4 (count)
-                            let (_, es, ee) = boxes(f, s6 + 8, e6)[0];
-                            // mp4a entry: 8 + 28 audio header
-                            for (tag7, s7, e7) in boxes(f, es + 28, ee) {
-                                if tag7 == b"esds" {
-                                    if let Some(asc) = walk_descs(f, s7 + 4, e7) {
-                                        return Ok(asc);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    Err(Error::Format("ASC not found in m4a".into()))
-}
-
-/// Recursive MPEG-4 descriptor walker: find the 0x05 DecSpecificInfo payload.
-fn walk_descs(f: &[u8], start: usize, end: usize) -> Option<Vec<u8>> {
-    let mut p = start;
-    while p + 2 <= end {
-        let t = f[p];
-        p += 1;
-        let mut len = 0u32;
-        for _ in 0..4 {
-            if p >= end {
-                return None;
-            }
-            let b = f[p];
-            p += 1;
-            len = (len << 7) | (b & 0x7F) as u32;
-            if b & 0x80 == 0 {
-                break;
-            }
-        }
-        let c_end = p + len as usize;
-        if c_end > end {
-            return None;
-        }
-        match t {
-            0x05 => return Some(f[p..c_end].to_vec()),
-            0x03 => {
-                // ES_ID(2) + flags(1), then children
-                if let Some(v) = walk_descs(f, p + 3, c_end) {
-                    return Some(v);
-                }
-            }
-            0x04 => {
-                // objectType(1) streamType(1) bufferSize(3) maxRate(4) avgRate(4)
-                if let Some(v) = walk_descs(f, p + 13, c_end) {
-                    return Some(v);
-                }
-            }
-            _ => {}
-        }
-        p = c_end;
-    }
-    None
-}
-
-fn find_aus(f: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
-    let mut sizes: Option<Vec<u32>> = None;
-    let mut mdat_start = None;
-    let mut first_chunk_offset = None;
-    for (tag, s, e) in boxes(f, 0, f.len()) {
-        if tag == b"mdat" {
-            mdat_start = Some(s);
-        }
-        if tag == b"moov" {
-            for (t2, s2, e2) in boxes(f, s, e) {
-                if t2 != b"trak" {
-                    continue;
-                }
-                for (t3, s3, e3) in boxes(f, s2, e2) {
-                    if t3 != b"mdia" {
-                        continue;
-                    }
-                    for (t4, s4, e4) in boxes(f, s3, e3) {
-                        if t4 != b"minf" {
-                            continue;
-                        }
-                        for (t5, s5, e5) in boxes(f, s4, e4) {
-                            if t5 != b"stbl" {
-                                continue;
-                            }
-                            for (t6, s6, _e6) in boxes(f, s5, e5) {
-                                if t6 == b"stsz" {
-                                    let count = u32::from_be_bytes([
-                                        f[s6 + 8],
-                                        f[s6 + 9],
-                                        f[s6 + 10],
-                                        f[s6 + 11],
-                                    ]) as usize;
-                                    let mut v = Vec::with_capacity(count);
-                                    for i in 0..count {
-                                        v.push(u32::from_be_bytes([
-                                            f[s6 + 12 + 4 * i],
-                                            f[s6 + 13 + 4 * i],
-                                            f[s6 + 14 + 4 * i],
-                                            f[s6 + 15 + 4 * i],
-                                        ]));
-                                    }
-                                    sizes = Some(v);
-                                }
-                                if t6 == b"stco" {
-                                    // stco payload: version/flags(4) + count(4)
-                                    // + chunk offsets; the first offset is the
-                                    // authoritative start of AU #0. exhale's
-                                    // mdat preamble length can vary, so the
-                                    // old hard-coded `mdat + 2` is unreliable.
-                                    let count = u32::from_be_bytes([
-                                        f[s6 + 4],
-                                        f[s6 + 5],
-                                        f[s6 + 6],
-                                        f[s6 + 7],
-                                    ]) as usize;
-                                    if count > 0 {
-                                        first_chunk_offset = Some(u32::from_be_bytes([
-                                            f[s6 + 8],
-                                            f[s6 + 9],
-                                            f[s6 + 10],
-                                            f[s6 + 11],
-                                        ])
-                                            as usize);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    let sizes = sizes.ok_or_else(|| Error::Format("stsz not found".into()))?;
-    let start = mdat_start.ok_or_else(|| Error::Format("mdat not found".into()))?;
-    // exhale writes "unused but informative" bytes at the start of the mdat
-    // payload before the first AU. Their length can vary, so trust the MP4
-    // stco chunk table; fall back to the historical two-byte preamble only
-    // when stco is absent.
-    let mut off = first_chunk_offset.unwrap_or(start + 2);
-    let mut aus = vec![];
-    for sz in sizes {
-        let sz = sz as usize;
-        if off + sz > f.len() {
-            return Err(Error::Format("AU out of range".into()));
-        }
-        aus.push(f[off..off + sz].to_vec());
-        off += sz;
-    }
-    Ok(aus)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn exhale_version_parsing() {
-        // -V output (exit 0)
-        assert_eq!(
-            parse_exhale_version("exhale 1.2.2 (x64, Unicode, Mar 03 2025)"),
-            Some("1.2.2".into())
-        );
-        // argument-less banner
-        assert_eq!(
-            parse_exhale_version(
-                " | version 1.2.3 (x64, built on Mar 03 2025) - written by C.R.Helmrich |"
-            ),
-            Some("1.2.3".into())
-        );
-        // release-candidate suffix
-        assert_eq!(
-            parse_exhale_version("exhale 1.2.2RC (x64)"),
-            Some("1.2.2".into())
-        );
-        // colored banner (colors stripped, still parseable)
-        assert_eq!(
-            parse_exhale_version("\x1b[31mexhale\x1b[0m - ecodis ... version 1.2.4 (x64)"),
-            Some("1.2.4".into())
-        );
-        assert_eq!(parse_exhale_version("no version here"), None);
-    }
-
-    #[test]
-    fn version_comparison() {
-        assert!(version_ge("1.2.2", "1.2.2"));
-        assert!(version_ge("1.2.3", "1.2.2"));
-        assert!(version_ge("2.0", "1.9.9"));
-        assert!(version_ge("1.10", "1.9"));
-        assert!(!version_ge("1.2.1", "1.2.2"));
-        assert!(!version_ge("1.1.9", "1.2.2"));
-        assert!(!version_ge("1.2RC", "1.2.2"));
-    }
 
     #[test]
     fn encoded_audio_sha256_es_known_vector_and_determinism() {
@@ -1961,6 +1424,26 @@ mod tests {
         );
     }
 
+    /// Config shared by the DSP-mode streaming tests: nonexistent codec
+    /// paths (SENAENC_DUMP_RAILS keeps them from ever being spawned).
+    fn test_cfg(wd: &Path, total_kbps: u32, three_track: bool, hf_tilt_pct: Option<f64>) -> EncoderConfig<'_> {
+        EncoderConfig {
+            profile: Profile::At300,
+            total_kbps,
+            use_senav: false,
+            three_track,
+            mid_codec: sena_core::MidCodec::Opus,
+            topband_kbps: None,
+            exhale: "/nonexistent/exhale",
+            opusenc: "/nonexistent/opusenc",
+            ezcd_cli: None,
+            workdir: wd,
+            workdir_fallback: None,
+            cleanup: None,
+            hf_tilt_pct,
+        }
+    }
+
     #[test]
     fn stream_dsp_matches_batch_dsp() {
         // Drive encode_stream far enough to write the temp band WAVs (the
@@ -1970,21 +1453,7 @@ mod tests {
         let wd = std::env::temp_dir().join(format!("sena-enc-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&wd);
         std::fs::create_dir_all(&wd).unwrap();
-        let cfg = EncoderConfig {
-            profile: Profile::At300,
-            total_kbps: 160,
-            use_senav: false,
-            three_track: false,
-            mid_codec: sena_core::MidCodec::Opus,
-            topband_kbps: None,
-            exhale: "/nonexistent/exhale",
-            opusenc: "/nonexistent/opusenc",
-            ezcd_cli: None,
-            workdir: &wd,
-            workdir_fallback: None,
-            cleanup: None,
-            hf_tilt_pct: None,
-        };
+        let cfg = test_cfg(&wd, 160, false, None);
         // DSP-only mode: rails land as workdir files, no encoders spawned.
         unsafe { std::env::set_var("SENAENC_DUMP_RAILS", "1") };
         let mut bytes = &src[..];
@@ -2025,7 +1494,6 @@ mod tests {
         assert!(ml <= 1.0 / 32768.0 + 1e-9, "LF max diff {ml}");
         assert!(mh < 1e-6, "HF max diff {mh}");
         let _ = std::fs::remove_dir_all(&wd);
-        std::fs::create_dir_all(&wd).unwrap();
     }
 
     #[test]
@@ -2036,21 +1504,7 @@ mod tests {
         let wd = std::env::temp_dir().join(format!("sena-enc-tilt-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&wd);
         std::fs::create_dir_all(&wd).unwrap();
-        let cfg = EncoderConfig {
-            profile: Profile::At300,
-            total_kbps: 160,
-            use_senav: false,
-            three_track: false,
-            mid_codec: sena_core::MidCodec::Opus,
-            topband_kbps: None,
-            exhale: "/nonexistent/exhale",
-            opusenc: "/nonexistent/opusenc",
-            ezcd_cli: None,
-            workdir: &wd,
-            workdir_fallback: None,
-            cleanup: None,
-            hf_tilt_pct: Some(100.0),
-        };
+        let cfg = test_cfg(&wd, 160, false, Some(100.0));
         unsafe { std::env::set_var("SENAENC_DUMP_RAILS", "1") };
         let mut bytes = &src[..];
         let out = wd.join("out.sena");
@@ -2090,191 +1544,6 @@ mod tests {
             .fold(0.0, f64::max);
         assert!(mh < 1e-6, "HF max diff {mh}");
         let _ = std::fs::remove_dir_all(&wd);
-        std::fs::create_dir_all(&wd).unwrap();
-    }
-
-    /// Build a minimal m4a: moov(trak(mdia(mdhd, minf(stbl(stsd(mp4a(esds)),
-    /// stsz, stco))))), mdat. Returns (bytes, asc, aus).
-    fn synth_m4a(asc: &[u8], aus: &[&[u8]], rate: u32, preamble: &[u8]) -> Vec<u8> {
-        fn bx(tag: &[u8; 4], payload: &[u8]) -> Vec<u8> {
-            let mut out = Vec::new();
-            out.extend_from_slice(&((8 + payload.len()) as u32).to_be_bytes());
-            out.extend_from_slice(tag);
-            out.extend_from_slice(payload);
-            out
-        }
-        // MPEG-4 descriptors: ES (0x03) -> DecoderConfig (0x04) -> DecSpecific (0x05).
-        let mut desc = vec![0x05, asc.len() as u8];
-        desc.extend_from_slice(asc);
-        let mut dcfg = vec![0x04, (13 + desc.len()) as u8];
-        dcfg.extend_from_slice(&[0x40, 0x15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]); // 13 fixed
-        dcfg.extend_from_slice(&desc);
-        let mut es = vec![0x03, 3 + dcfg.len() as u8];
-        es.extend_from_slice(&[0, 1, 0]); // ES_ID + flags
-        es.extend_from_slice(&dcfg);
-        let mut esds_payload = vec![0u8; 4]; // version/flags
-        esds_payload.extend_from_slice(&es);
-        let esds = bx(b"esds", &esds_payload);
-
-        let mut mp4a_entry = Vec::new();
-        mp4a_entry.extend_from_slice(&[0u8; 6]); // reserved
-        mp4a_entry.extend_from_slice(&1u16.to_be_bytes()); // data reference index
-        mp4a_entry.extend_from_slice(&[0u8; 8]); // reserved
-        mp4a_entry.extend_from_slice(&2u16.to_be_bytes()); // channels
-        mp4a_entry.extend_from_slice(&16u16.to_be_bytes()); // sample size
-        mp4a_entry.extend_from_slice(&[0u8; 4]); // pre-defined + reserved
-        mp4a_entry.extend_from_slice(&(rate << 16).to_be_bytes()); // sample rate 16.16
-        let mut mp4a_full_payload = mp4a_entry.clone();
-        mp4a_full_payload.extend_from_slice(&esds);
-        let mp4a = bx(b"mp4a", &mp4a_full_payload);
-
-        let mut stsd_payload = vec![0u8; 4]; // version/flags
-        stsd_payload.extend_from_slice(&1u32.to_be_bytes()); // entry count
-        stsd_payload.extend_from_slice(&mp4a);
-        let stsd = bx(b"stsd", &stsd_payload);
-
-        let mut stsz_payload = vec![0u8; 4];
-        stsz_payload.extend_from_slice(&0u32.to_be_bytes()); // sample_size (variable)
-        stsz_payload.extend_from_slice(&(aus.len() as u32).to_be_bytes());
-        for au in aus {
-            stsz_payload.extend_from_slice(&(au.len() as u32).to_be_bytes());
-        }
-        let stsz = bx(b"stsz", &stsz_payload);
-
-        // stco is patched below once the mdat offset is known; reserve a
-        // placeholder chunk offset, then fix it up after assembling the file.
-        let stco_offset_pos;
-        let stco = {
-            let mut p = vec![0u8; 4];
-            p.extend_from_slice(&1u32.to_be_bytes()); // entry count
-            stco_offset_pos = 8 + 4 + 4; // header + verflags + count
-            p.extend_from_slice(&0u32.to_be_bytes());
-            bx(b"stco", &p)
-        };
-
-        let mut mdhd_payload = vec![0u8; 4]; // version 0 + flags
-        mdhd_payload.extend_from_slice(&[0u8; 8]); // creation + modification
-        mdhd_payload.extend_from_slice(&rate.to_be_bytes()); // timescale
-        mdhd_payload.extend_from_slice(&0u32.to_be_bytes()); // duration
-        mdhd_payload.extend_from_slice(&[0u8; 4]); // language + quality
-        let mdhd = bx(b"mdhd", &mdhd_payload);
-
-        let mut stbl = Vec::new();
-        stbl.extend_from_slice(&stsd);
-        stbl.extend_from_slice(&stsz);
-        stbl.extend_from_slice(&stco);
-        let minf = bx(b"minf", &bx(b"stbl", &stbl));
-        let mut mdia = Vec::new();
-        mdia.extend_from_slice(&mdhd);
-        mdia.extend_from_slice(&minf);
-        let trak = bx(b"trak", &bx(b"mdia", &mdia));
-        let moov = bx(b"moov", &trak);
-
-        let mut mdat_payload = preamble.to_vec();
-        let au0_file_offset = moov.len() + 8 + preamble.len();
-        for au in aus {
-            mdat_payload.extend_from_slice(au);
-        }
-        let mdat = bx(b"mdat", &mdat_payload);
-
-        let mut file = moov;
-        file.extend_from_slice(&mdat);
-        // Locate the stco tag anywhere in the file and patch its first entry.
-        let tag = b"stco";
-        for pos in 0..file.len().saturating_sub(4) {
-            if &file[pos..pos + 4] == tag {
-                let entry_pos = pos - 4 + stco_offset_pos;
-                file[entry_pos..entry_pos + 4]
-                    .copy_from_slice(&(au0_file_offset as u32).to_be_bytes());
-                break;
-            }
-        }
-        file
-    }
-
-    #[test]
-    fn m4a_extract_asc_and_aus() {
-        let asc = vec![0x2B, 0x92, 0x08];
-        let au0 = vec![1u8, 2, 3];
-        let au1 = vec![4u8, 5];
-        let bytes = synth_m4a(&asc, &[&au0, &au1], 16_000, &[0, 0]);
-        let dir = std::env::temp_dir().join(format!("sena-m4a-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("t.m4a");
-        std::fs::write(&path, &bytes).unwrap();
-        let (got_asc, got_aus) = extract_m4a(&path).unwrap();
-        assert_eq!(got_asc, asc);
-        assert_eq!(got_aus, vec![au0, au1]);
-        assert_eq!(m4a_stream_rate(&path).unwrap(), 16_000);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn m4a_extract_falls_back_to_mdat_preamble_without_stco() {
-        // Same file, but strip the stco box: extraction must fall back to the
-        // historical "two-byte preamble after the mdat header" assumption.
-        let asc = vec![0x2B];
-        let au = vec![9u8, 9, 9, 9];
-        let bytes = synth_m4a(&asc, &[&au], 16_000, &[0, 0]);
-        // Zero out the stco tag (leave the box in place but unrecognized).
-        let mut bytes = bytes;
-        let mut pos = 0usize;
-        while pos + 8 <= bytes.len() {
-            if &bytes[pos + 4..pos + 8] == b"stco" {
-                bytes[pos + 4..pos + 8].copy_from_slice(b"free");
-            }
-            let sz = u32::from_be_bytes([
-                bytes[pos],
-                bytes[pos + 1],
-                bytes[pos + 2],
-                bytes[pos + 3],
-            ]) as usize;
-            pos += sz.max(8);
-        }
-        let dir = std::env::temp_dir().join(format!("sena-m4a-test2-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("t.m4a");
-        std::fs::write(&path, &bytes).unwrap();
-        let (got_asc, got_aus) = extract_m4a(&path).unwrap();
-        assert_eq!(got_asc, asc);
-        assert_eq!(got_aus, vec![au]);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn m4a_boxes_iterator_bounds() {
-        // A truncated box (size larger than the buffer) must terminate the walk.
-        let mut f = Vec::new();
-        f.extend_from_slice(&100u32.to_be_bytes());
-        f.extend_from_slice(b"moov");
-        f.extend_from_slice(&[0u8; 4]); // short
-        let out = boxes(&f, 0, f.len());
-        assert!(out.is_empty());
-        // A zero/too-small size must terminate the walk (no infinite loop).
-        let mut f = Vec::new();
-        f.extend_from_slice(&4u32.to_be_bytes());
-        f.extend_from_slice(b"moov");
-        let out = boxes(&f, 0, f.len());
-        assert!(out.is_empty());
-    }
-
-    #[test]
-    fn m4a_walk_descs_finds_specific_info() {
-        // 0x03 (ES) wrapping 0x04 (DecoderConfig) wrapping 0x05 (DecSpecific).
-        let payload = [0xAA, 0xBB];
-        let mut d = vec![0x05, payload.len() as u8];
-        d.extend_from_slice(&payload);
-        let mut dcfg = vec![0x04, 13 + d.len() as u8];
-        dcfg.extend_from_slice(&[0u8; 13]);
-        dcfg.extend_from_slice(&d);
-        let mut es = vec![0x03, 3 + dcfg.len() as u8];
-        es.extend_from_slice(&[0, 1, 0]);
-        es.extend_from_slice(&dcfg);
-        assert_eq!(walk_descs(&es, 0, es.len()), Some(payload.to_vec()));
-        // Truncated length must not over-read.
-        let mut short = vec![0x05, 10u8, 1];
-        assert_eq!(walk_descs(&short, 0, short.len()), None);
-        short.clear();
     }
 
     /// Three-track streaming DSP: mid.wav must equal the batch reference
@@ -2288,21 +1557,7 @@ mod tests {
         let wd = std::env::temp_dir().join(format!("sena-enc-3t-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&wd);
         std::fs::create_dir_all(&wd).unwrap();
-        let cfg = EncoderConfig {
-            profile: Profile::At300,
-            total_kbps: 256,
-            use_senav: false,
-            three_track: true,
-            mid_codec: sena_core::MidCodec::Opus,
-            topband_kbps: None,
-            exhale: "/nonexistent/exhale",
-            opusenc: "/nonexistent/opusenc",
-            ezcd_cli: None,
-            workdir: &wd,
-            workdir_fallback: None,
-            cleanup: None,
-            hf_tilt_pct: None,
-        };
+        let cfg = test_cfg(&wd, 256, true, None);
         unsafe { std::env::set_var("SENAENC_DUMP_RAILS", "1") };
         let mut bytes = &src[..];
         let out = wd.join("out.sena");
@@ -2362,6 +1617,5 @@ mod tests {
             assert!((sum_r - high[i * 2 + 1]).abs() < 1e-4, "frame {i} R");
         }
         let _ = std::fs::remove_dir_all(&wd);
-        std::fs::create_dir_all(&wd).unwrap();
     }
 }

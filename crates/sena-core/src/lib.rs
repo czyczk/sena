@@ -59,6 +59,21 @@ impl Profile {
             _ => None,
         }
     }
+
+    /// INIT wire byte for the profile (the ES header form).
+    pub fn to_byte(self) -> u8 {
+        match self {
+            Profile::At300 => 0,
+            Profile::At600 => 1,
+        }
+    }
+    pub fn from_byte(b: u8) -> Option<Self> {
+        match b {
+            0 => Some(Profile::At300),
+            1 => Some(Profile::At600),
+            _ => None,
+        }
+    }
 }
 
 /// Lowest listenable Opus allocation; each profile's hard minimum total is
@@ -76,7 +91,7 @@ pub const XHE_WARMUP_CORE: usize = 1024;
 
 /// warmup trim in samples at the 48 kHz output rate, for a stream at lf_rate
 pub fn xhe_delay_48k_at(lf_rate: u32) -> usize {
-    XHE_WARMUP_CORE * 48000 / lf_rate as usize
+    XHE_WARMUP_CORE * SAMPLE_RATE as usize / lf_rate as usize
 }
 
 /// Bitrate accounting (rule B). Returns (xhe_kbps, opus_kbps).
@@ -101,11 +116,20 @@ pub fn account(total_kbps: u32, profile: Profile) -> Option<(u32, u32)> {
 pub const HF_SPLIT_HZ: f64 = 12000.0;
 
 /// Nominal rate of the A_OPUSHF (top band) opus track as a function of the
-/// nominal total: 96 kbit/s for three-track totals below 320 kbit/s, 128
-/// kbit/s at and above.
+/// nominal total: [`HF_KBPS_TIER1`] for three-track totals below
+/// [`HF_TIER2_MIN_TOTAL_KBPS`], [`HF_KBPS_TIER2`] at and above.
 pub fn hf_track_kbps(total_kbps: u32) -> u32 {
-    if total_kbps >= 320 { 128 } else { 96 }
+    if total_kbps >= HF_TIER2_MIN_TOTAL_KBPS {
+        HF_KBPS_TIER2
+    } else {
+        HF_KBPS_TIER1
+    }
 }
+
+/// A_OPUSHF nominal rate tiers: 96 kbit/s, and 128 kbit/s at totals >= 320k.
+pub const HF_KBPS_TIER1: u32 = 96;
+pub const HF_KBPS_TIER2: u32 = 128;
+pub const HF_TIER2_MIN_TOTAL_KBPS: u32 = 320;
 
 /// Stream rate of the A_OPUSHF track: the top band (12000 Hz..20 kHz) is
 /// shifted down to baseband (0..8 kHz) and carried at 16 kHz.

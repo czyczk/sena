@@ -4,10 +4,17 @@
 
 use super::Error;
 
+/// mkdir-collision retries before giving up on a unique workdir name.
+const MKDIR_RETRIES: u32 = 8;
+
+/// Stale-workdir sweep age: one hour.
+const STALE_AGE_SECS: u64 = 3600;
+
 /// Create `base/senaenc-<pid>-<rand>` atomically (create_dir fails on
 /// collision -> retry with a fresh suffix; safe for concurrent instances).
 pub fn create_unique_dir(base: &std::path::Path) -> Result<std::path::PathBuf, Error> {
-    for _ in 0..8 {
+
+    for _ in 0..MKDIR_RETRIES {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.subsec_nanos())
@@ -49,7 +56,7 @@ pub fn estimate_bytes(
 /// following, never touches non-senaenc entries.
 pub fn sweep_stale(base: &std::path::Path) {
     let cutoff = match std::time::SystemTime::now()
-        .checked_sub(std::time::Duration::from_secs(3600))
+        .checked_sub(std::time::Duration::from_secs(STALE_AGE_SECS))
     {
         Some(t) => t,
         None => return,

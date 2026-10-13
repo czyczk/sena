@@ -1,5 +1,5 @@
 // replicate cold_start_ramp's push feeding with LFAU dump
-use sena_dec::es::{EsDecoder, BlockStore};
+use sena_dec::es::EsDecoder;
 fn main() {
     let path = std::env::args().nth(1).unwrap();
     let bytes = std::fs::read(&path).unwrap();

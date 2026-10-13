@@ -56,7 +56,7 @@ impl StreamingDecoder {
         &self.inner.warnings
     }
 
-    pub fn info(&self) -> DecodedInfo {
+    pub fn info(&self) -> &DecodedInfo {
         self.inner.info()
     }
 
