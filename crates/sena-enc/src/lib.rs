@@ -187,7 +187,7 @@ pub fn encode_bytes(cfg: &EncoderConfig, input: &[u8], output: &Path) -> Result<
 /// Audio SHA-256 of the encoded audio elementary streams carried by the
 /// container: the Opus stream (OpusHead + Opus audio packets) and the
 /// xHE-AAC stream (ASC + raw AUs), in Sena track order. The streams are the
-/// Audio content hash (domain v3): SHA-256 over the zeroed-hash SENA-INIT
+/// Audio content hash (domain v4): SHA-256 over the zeroed-hash SENA-INIT
 /// blob and all composite block payloads in decode order. The hash is
 /// length-prefixed and domain-separated so it is deterministic and
 /// independent of container layout, timestamps and tags. It intentionally
@@ -1457,7 +1457,7 @@ mod tests {
         let hex: String = h.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             hex,
-            "9f0c506f8220b88d8d5a243a0a62fdf9a8a881161d706cae7dafc0f9f5749475"
+            "05fb6d14146f77d0fb665251a63689890f958155e541e9dd7586efea9153e77d"
         );
         assert_eq!(encoded_audio_sha256_es(init, &blocks), h, "must be deterministic");
 
@@ -1575,6 +1575,7 @@ mod tests {
             use_senav: false,
             three_track,
             mid_codec: sena_core::MidCodec::Opus,
+            hf_codec: sena_core::HfCodec::Opus,
             topband_kbps: None,
             exhale: "/nonexistent/exhale",
             opusenc: "/nonexistent/opusenc",

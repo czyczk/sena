@@ -8,7 +8,7 @@ fn main() {
     let rate = d.init.lf_rate as u64;
     let mut aus: Vec<&[u8]> = Vec::new();
     for b in &d.blocks {
-        if let Ok(blk) = sena_core::es::decode_block(&b.data, d.init.mid_codec) {
+        if let Ok(blk) = sena_core::es::decode_block(&b.data, d.init.mid_codec, d.init.hf_codec) {
             aus.extend(blk.lf);
         }
     }

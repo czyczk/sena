@@ -8,7 +8,7 @@ fn main() {
     let asc = rxaac_dec_lib::asc::AudioSpecificConfig::parse(&demux.init.lf_asc).unwrap();
     let mut aus: Vec<&[u8]> = Vec::new();
     for b in &demux.blocks {
-        let block = sena_core::es::decode_block(&b.data, sena_core::MidCodec::Opus).unwrap();
+        let block = sena_core::es::decode_block(&b.data, sena_core::MidCodec::Opus, sena_core::HfCodec::Opus).unwrap();
         aus.extend(block.lf);
     }
     let mut dec = rxaac_dec_lib::usac::UsacDecoder::new(&asc).unwrap();

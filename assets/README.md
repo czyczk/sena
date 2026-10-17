@@ -4,10 +4,14 @@ Self-contained encode/decode fixtures for end-to-end verification of
 senaenc/senadec: 3 source tracks × 2 profiles × 20 s clips, plus the
 reference decode of each `.sena` in 16-bit and 32-bit float.
 
-Format note: the `.sena` files are **v2 single-track** (one `A_MS/ACM`
-composite track, wFormatTag 0x534E). They were remuxed from the v1
+Format note: the `.sena` files are **v2+ single-track** (one `A_MS/ACM`
+composite track, wFormatTag 0x534E). The oldest were remuxed from the v1
 two/three-track encodes with identical layer elementary streams, so the
-reference decodes (`ref16`/`ref32`) remain bit-valid for them.
+reference decodes (`ref16`/`ref32`) remain bit-valid for them. The
+`p<profile>xfi__hf<n>` files are xfi-family encodes (FhG-IIS xHE mid);
+`__hf128x` marks the 288k-nominal variant whose top band is also FhG-IIS
+xHE (ES v4) — those decode natively at **44.1 kHz** (882000 playable
+frames for the same 20 s clip), unlike every earlier asset at 48 kHz.
 
 ## Layout
 

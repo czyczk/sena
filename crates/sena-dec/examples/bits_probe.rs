@@ -5,7 +5,7 @@ fn main() {
     let d = Demuxed::parse(bytes).unwrap();
     let mut lf = 0usize; let mut mid_xhe = 0usize; let mut mid_opus = 0usize; let mut top: usize = 0;
     for b in &d.blocks {
-        let blk = sena_core::es::decode_block(&b.data, d.init.mid_codec).unwrap();
+        let blk = sena_core::es::decode_block(&b.data, d.init.mid_codec, d.init.hf_codec).unwrap();
         lf += blk.lf.iter().map(|a| a.len()).sum::<usize>();
         match blk.mid {
             sena_core::es::MidSection::Opus(p) => mid_opus += p.len(),

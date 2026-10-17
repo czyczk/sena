@@ -581,6 +581,12 @@ pub struct BlockRef {
     pub mx_count: u8,
     /// First payload byte of each mid AU (independency flags).
     pub mx_first: [u8; 8],
+    /// xHE top band (v4): absolute AU index of the first top AU.
+    pub hf_au_index: Option<u32>,
+    /// Number of top-band AUs in the block (0..=2 at 44.1 kHz).
+    pub hf_count: u8,
+    /// First payload byte of each top-band AU (independency flags).
+    pub hf_first: [u8; 8],
 }
 
 /// Container metadata + block index produced by [`index_container`].
@@ -700,6 +706,7 @@ fn es_block_meta<R: FnMut(u64, usize) -> Result<Vec<u8>, String>>(
     offset: u64,
     len: u64,
     xhe_mid: bool,
+    xhe_hf: bool,
 ) -> Result<BlockMeta, String> {
     let head = get(offset, len.min(3) as usize)?;
     if head.len() < 3 {
@@ -722,13 +729,56 @@ fn es_block_meta<R: FnMut(u64, usize) -> Result<Vec<u8>, String>>(
         return Err("malformed container: LF count truncated".into());
     }
     let lf_count = head1[0];
-    let (au_index, _, first, _) = if lf_count == 0 {
+    let (au_index, _, first, lf_rel) = if lf_count == 0 {
         (None, 0, [0; 8], 1u64)
     } else {
         let (ai, c, f, rel) = au_list_meta(get, lf_off, avail, 4, "LF")?;
         (ai, c, f, rel)
     };
-    let _ = lf_count;
+    // v4 xHE top band: count(1) au_index(3) [len(2) + payload]*, after the
+    // LF section. Only the AU index and the independency flags are needed.
+    let (hf_au_index, hf_count, hf_first) = if xhe_hf {
+        let hf_off = lf_off + lf_rel;
+        let hf_avail = len.saturating_sub(hf_off - offset);
+        let head2 = get(hf_off, hf_avail.min(1) as usize)?;
+        if head2.is_empty() {
+            return Err("malformed container: top-band count truncated".into());
+        }
+        let count = head2[0];
+        if count == 0 {
+            (None, 0, [0; 8])
+        } else {
+            if count > 8 {
+                // Same bound as the xHE mid: the EOS clamp packs the
+                // encoder's tail-coverage AUs into the final block.
+                return Err("malformed container: top-band AU count exceeds sanity bound".into());
+            }
+            let idx = get(hf_off + 1, 3)?;
+            if idx.len() < 3 {
+                return Err("malformed container: top-band au_index truncated".into());
+            }
+            let mut i3 = [0u8; 4];
+            i3[..3].copy_from_slice(&idx);
+            let hf_au_index = u32::from_le_bytes(i3);
+            let mut first = [0u8; 8];
+            let mut rel = 4u64;
+            for i in 0..count as usize {
+                let h = get(hf_off + rel, 3u64.min(hf_avail.saturating_sub(rel)) as usize)?;
+                if h.len() < 3 {
+                    return Err("malformed container: top-band AU header truncated".into());
+                }
+                let au_len = u16::from_le_bytes(h[..2].try_into().unwrap()) as u64;
+                first[i] = h[2];
+                rel += 2 + au_len;
+                if rel > hf_avail {
+                    return Err("malformed container: top-band AU overruns its block".into());
+                }
+            }
+            (Some(hf_au_index), count, first)
+        }
+    } else {
+        (None, 0, [0; 8])
+    };
     Ok(BlockMeta {
         lf_au_index: au_index,
         lf_count,
@@ -736,6 +786,9 @@ fn es_block_meta<R: FnMut(u64, usize) -> Result<Vec<u8>, String>>(
         mx_au_index,
         mx_count,
         mx_first,
+        hf_au_index,
+        hf_count,
+        hf_first,
     })
 }
 
@@ -747,6 +800,9 @@ struct BlockMeta {
     mx_au_index: Option<u32>,
     mx_count: u8,
     mx_first: [u8; 8],
+    hf_au_index: Option<u32>,
+    hf_count: u8,
+    hf_first: [u8; 8],
 }
 
 /// Parse a counted AU list section: count(1) au_index(3) [len(3) +
@@ -801,6 +857,7 @@ fn walk_cluster_w<R: FnMut(u64, usize) -> Result<Vec<u8>, String>>(
     cluster: &RawElem,
     blocks: &mut Vec<BlockRef>,
     xhe_mid: bool,
+    xhe_hf: bool,
 ) -> Result<(), String> {
     let mut cluster_t = 0u64;
     let mut p = cluster.data_start;
@@ -836,8 +893,13 @@ fn walk_cluster_w<R: FnMut(u64, usize) -> Result<Vec<u8>, String>>(
                 ));
             }
             let payload_off = e.data_start + header_len as u64;
-            let meta =
-                es_block_meta(&mut |pos, len| w.get(pos, len), payload_off, body_len, xhe_mid)?;
+            let meta = es_block_meta(
+                &mut |pos, len| w.get(pos, len),
+                payload_off,
+                body_len,
+                xhe_mid,
+                xhe_hf,
+            )?;
             // Sign-extending cast (see parse_simple_block).
             let rel = rel as u64;
             let t_ns = cluster_t
@@ -853,6 +915,9 @@ fn walk_cluster_w<R: FnMut(u64, usize) -> Result<Vec<u8>, String>>(
                 mx_au_index: meta.mx_au_index,
                 mx_count: meta.mx_count,
                 mx_first: meta.mx_first,
+                hf_au_index: meta.hf_au_index,
+                hf_count: meta.hf_count,
+                hf_first: meta.hf_first,
             });
             if blocks.len() > MAX_INDEX_FRAMES {
                 return Err(format!(
@@ -902,9 +967,11 @@ pub fn index_container<R: FnMut(u64, usize) -> Result<Vec<u8>, String>>(
     let mut blocks = Vec::new();
     let mut tracks_end = 0u64;
     let mut audio_span_bytes = 0u64;
-    // xHE mid (ES v3) flips the block header layout; known once Tracks has
-    // been parsed (Tracks always precedes Clusters in our writer).
+    // xHE mid (ES v3) / xHE top (ES v4) flip the block header layout;
+    // known once Tracks has been parsed (Tracks precede Clusters in our
+    // writer).
     let mut xhe_mid = false;
+    let mut xhe_hf = false;
     let mut p = segment.data_start;
     while p < segment.data_end {
         let e = read_elem_w(&mut w, p)?;
@@ -952,8 +1019,9 @@ pub fn index_container<R: FnMut(u64, usize) -> Result<Vec<u8>, String>>(
                 if !tracks.is_empty() && !xhe_mid {
                     let (init, _, _) = sena_track_init(&tracks).map_err(|e| e.to_string())?;
                     xhe_mid = init.mid_codec == sena_core::MidCodec::Xhe;
+                    xhe_hf = init.hf_codec == sena_core::HfCodec::Xhe;
                 }
-                walk_cluster_w(&mut w, &e, &mut blocks, xhe_mid)?;
+                walk_cluster_w(&mut w, &e, &mut blocks, xhe_mid, xhe_hf)?;
             }
         } else if e.id == ATTACHMENTS_ID {
             attachment_ranges.push((e.start, e.data_start, e.data_end));

@@ -96,6 +96,11 @@ pub struct SenaDecInfo {
     /// Mid-layer codec: 0 = Opus, 1 = xHE-AAC (the encoder identity behind
     /// an xHE mid is an encode-side detail and not exposed).
     pub mid_codec: u32,
+    /// Top-band codec: 0 = Opus, 1 = xHE-AAC (three-track only; the xfi
+    /// 288k variant, whose output runs at 44.1 kHz). ABI 3 field; hosts
+    /// compiled against ABI 1/2 headers must be rebuilt (struct size
+    /// changed).
+    pub hf_codec: u32,
 }
 
 #[repr(C)]
@@ -144,6 +149,7 @@ pub(crate) fn to_c_info(i: &crate::pipeline::DecodedInfo) -> SenaDecInfo {
         audio_span_bytes: i.audio_span_bytes,
         three_track: i.three_track as u32,
         mid_codec: i.mid_codec as u32,
+        hf_codec: i.hf_codec as u32,
     }
 }
 

@@ -10,7 +10,7 @@ fn main() {
     let asc = d.init.mid_head.clone();
     let mut aus: Vec<&[u8]> = Vec::new();
     for b in &d.blocks {
-        if let Ok(blk) = sena_core::es::decode_block(&b.data, d.init.mid_codec) {
+        if let Ok(blk) = sena_core::es::decode_block(&b.data, d.init.mid_codec, d.init.hf_codec) {
             if let sena_core::es::MidSection::Xhe { aus: a, .. } = blk.mid {
                 aus.extend(a);
             }

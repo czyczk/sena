@@ -100,6 +100,7 @@ fn abi_open_read_seek_and_dynamic_info() {
         audio_span_bytes: 0,
         three_track: 0,
         mid_codec: 0,
+    hf_codec: 0,
     };
     assert_eq!(unsafe { sena_dec_get_info(handle, &mut info) }, SENA_DEC_OK);
     assert_eq!(
@@ -248,6 +249,7 @@ fn abi_probe_info_head_scan() {
         audio_span_bytes: 0,
         three_track: 0,
         mid_codec: 0,
+    hf_codec: 0,
     };
     let mut err = [0u8; 256];
     assert_eq!(
@@ -303,6 +305,7 @@ fn abi_audio_span_excludes_cover_and_tags() {
             audio_span_bytes: 0,
             three_track: 0,
             mid_codec: 0,
+        hf_codec: 0,
         };
         let mut err = [0u8; 256];
         assert_eq!(
@@ -377,6 +380,7 @@ fn abi_audio_span_excludes_cover_and_tags() {
         audio_span_bytes: 0,
         three_track: 0,
         mid_codec: 0,
+    hf_codec: 0,
     };
     assert_eq!(unsafe { sena_dec_get_info(handle, &mut info) }, SENA_DEC_OK);
     unsafe { sena_dec_close(handle) };
