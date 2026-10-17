@@ -147,6 +147,7 @@ fn run() -> Result<(), String> {
                     .expect("profile number"),
                 info.three_track,
                 info.mid_codec,
+                info.hf_codec,
             ),
             info.sena_version,
             info.sample_rate,
@@ -171,6 +172,7 @@ fn run() -> Result<(), String> {
             sena_core::Profile::from_crossover(info.profile as f64).expect("profile number"),
             info.three_track,
             info.mid_codec,
+            info.hf_codec,
         ),
         info.sena_version,
         info.sample_rate,
@@ -183,14 +185,14 @@ fn run() -> Result<(), String> {
         let lf_name = prefix.with_extension("lf.wav");
         let mid_name = prefix.with_extension("mid.wav");
         let top_name = prefix.with_extension("top.wav");
-        let lf = output::encode_wav(decoded.lf_track_pcm(), SampleFormat::F32, Dither::None)
+        let lf = output::encode_wav(decoded.lf_track_pcm(), SampleFormat::F32, Dither::None, info.sample_rate)
             .map_err(|e| e.to_string())?;
-        let mid = output::encode_wav(decoded.mid_track_pcm(), SampleFormat::F32, Dither::None)
+        let mid = output::encode_wav(decoded.mid_track_pcm(), SampleFormat::F32, Dither::None, info.sample_rate)
             .map_err(|e| e.to_string())?;
         std::fs::write(&lf_name, lf).map_err(|e| format!("{}: {e}", lf_name.display()))?;
         std::fs::write(&mid_name, mid).map_err(|e| format!("{}: {e}", mid_name.display()))?;
         if info.three_track {
-            let top = output::encode_wav(decoded.top_track_pcm(), SampleFormat::F32, Dither::None)
+            let top = output::encode_wav(decoded.top_track_pcm(), SampleFormat::F32, Dither::None, info.sample_rate)
                 .map_err(|e| e.to_string())?;
             std::fs::write(&top_name, top).map_err(|e| format!("{}: {e}", top_name.display()))?;
             eprintln!(
@@ -224,7 +226,7 @@ fn run() -> Result<(), String> {
                 Format::WavS24 => (SampleFormat::S24, 24),
                 _ => (SampleFormat::S16, 16),
             };
-            let data = output::encode_wav(pcm, fmt, args.dither).map_err(|e| e.to_string())?;
+            let data = output::encode_wav(pcm, fmt, args.dither, info.sample_rate).map_err(|e| e.to_string())?;
             write_all(&mut std::io::stdout(), &data, out_path).map_err(|e| e.to_string())?;
             eprintln!(
                 "wrote {} {bits}-bit WAV ({} bytes)",

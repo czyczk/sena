@@ -435,21 +435,31 @@ fn main() {
             std::process::exit(1);
         }
     }
+    // xfi family: the 288k nominal switches the top band to FhG-IIS xHE
+    // (44.1 kHz native output); 256-287k keeps the Opus top band.
+    let hf_codec = if mid_codec == sena_core::MidCodec::Xhe {
+        sena_core::xfi_hf_codec(kbps)
+    } else {
+        sena_core::HfCodec::Opus
+    };
     if three_track {
         if xfi {
+            let top_desc = match hf_codec {
+                sena_core::HfCodec::Xhe => "FhG-IIS xHE top".to_string(),
+                sena_core::HfCodec::Opus => format!(
+                    "Opus top ({})",
+                    if use_senav { "opusenc-senav" } else { "opusenc (original)" }
+                ),
+            };
             eprintln!(
-                "senaenc: profile @{}  total {}k -> xHE-AAC {}k (deducted) + FhG-IIS xHE mid {}k CBR@44.1kHz (600 Hz..12 kHz) + Opus top {}k (12 kHz+, {}) [{}]",
+                "senaenc: profile @{}  total {}k -> xHE-AAC {}k (deducted) + FhG-IIS xHE mid {}k CBR@44.1kHz (600 Hz..12 kHz) + {} {}k (12 kHz+) [{}]",
                 profile.crossover_hz(),
                 kbps,
                 xhe_k,
                 mid_k,
+                top_desc,
                 xfi_hf_kbps(kbps),
-                if use_senav {
-                    "opusenc-senav"
-                } else {
-                    "opusenc (original)"
-                },
-                three_track_tag(profile, mid_codec),
+                three_track_tag(profile, mid_codec, hf_codec),
             );
         } else {
             eprintln!(
@@ -464,7 +474,7 @@ fn main() {
                 } else {
                     "opusenc (original)"
                 },
-                three_track_tag(profile, mid_codec),
+                three_track_tag(profile, mid_codec, hf_codec),
                 if let Some(t) = topband_kbps {
                     format!("  topband-stereo={t}")
                 } else {
@@ -590,6 +600,7 @@ fn main() {
         use_senav,
         three_track,
         mid_codec,
+        hf_codec,
         topband_kbps,
         exhale: &exhale,
         opusenc: &opusenc,

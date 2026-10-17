@@ -193,17 +193,64 @@ impl MidCodec {
     }
 }
 
+/// Decode-relevant identity of the top-band codec, carried in the ES
+/// header (v4+; earlier files imply Opus). Same encoder-identity rule as
+/// [`MidCodec`]: the recipe is not stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HfCodec {
+    Opus,
+    Xhe,
+}
+
+impl HfCodec {
+    pub fn to_byte(self) -> u8 {
+        match self {
+            HfCodec::Opus => 0,
+            HfCodec::Xhe => 1,
+        }
+    }
+    pub fn from_byte(b: u8) -> Option<Self> {
+        match b {
+            0 => Some(HfCodec::Opus),
+            1 => Some(HfCodec::Xhe),
+            _ => None,
+        }
+    }
+    /// Short tag letter appended after the HF split in the three-track tag
+    /// when not the Opus default ("600x@12000x").
+    pub fn tag_letter(self) -> &'static str {
+        match self {
+            HfCodec::Opus => "",
+            HfCodec::Xhe => "x",
+        }
+    }
+}
+
 /// The "xfi" recipe family: exhale LF (unchanged) + mid Fraunhofer-IIS
-/// xHE-AAC CBR 128 kbit/s at 44.1 kHz + Opus top band (shifted, as in the
-/// Opus-mid three-track layout). Always three-track; nominal totals are a
-/// continuous range, with everything above the minimum feeding the top
-/// band: hf = 96k at 256k .. 128k at 288k (the LF deduction is independent
-/// of the hf allotment; any slack stays unallocated).
+/// xHE-AAC CBR 128 kbit/s at 44.1 kHz + top band (shifted, 12 kHz split).
+/// The top band is Opus at 96-127k for nominal totals 256-287k; at 288k it
+/// switches to Fraunhofer-IIS xHE-AAC CBR 128k at 44.1 kHz and the whole
+/// stream's output rate becomes 44.1 kHz (no lane exceeds that rate, so no
+/// upsampling). Always three-track; nominal totals are continuous, with
+/// everything above the minimum feeding the top band (the LF deduction is
+/// independent of the hf allotment; any slack stays unallocated).
 pub const XFI_MIN_TOTAL_KBPS: u32 = 256;
 pub const XFI_MAX_TOTAL_KBPS: u32 = 288;
 pub const XFI_MID_KBPS: u32 = 128;
-/// Stream rate of the xHE-AAC mid layer (encoder-enforced, CBR).
+/// Stream rate of the xHE-AAC mid layer (encoder-enforced, CBR), and of
+/// the xHE-AAC top band (and therefore of the whole decoded output) at the
+/// 288k nominal.
 pub const XFI_MID_RATE: u32 = 44100;
+
+/// xfi-family top-band codec selection: FhG-IIS xHE-AAC at the 288k
+/// nominal (where the hf allotment reaches 128k), Opus below it.
+pub fn xfi_hf_codec(total_kbps: u32) -> HfCodec {
+    if total_kbps >= XFI_MAX_TOTAL_KBPS {
+        HfCodec::Xhe
+    } else {
+        HfCodec::Opus
+    }
+}
 
 /// The xfi mid band carries at most the 12 kHz-split content, so the
 /// 44.1 kHz <-> 48 kHz resamples only need a 13 kHz passband (stopband at
@@ -232,21 +279,24 @@ pub fn profile_tag(profile: Profile, mid: MidCodec) -> String {
 }
 
 /// `SENA_PROFILE` tag value for the three-track layout ("600o@12000",
-/// "600x@12000").
-pub fn three_track_tag(profile: Profile, mid: MidCodec) -> String {
+/// "600x@12000"; a trailing xHE top-band letter marks the xfi 288k
+/// variant: "600x@12000x").
+pub fn three_track_tag(profile: Profile, mid: MidCodec, hf: HfCodec) -> String {
     format!(
-        "{}{}@{}",
+        "{}{}@{}{}",
         profile.crossover_hz() as u32,
         mid.tag_letter(),
-        HF_SPLIT_HZ as u64
+        HF_SPLIT_HZ as u64,
+        hf.tag_letter()
     )
 }
 
 /// Parse a `SENA_PROFILE` tag: `300o`/`600o`/`300x`/`600x` (two-track) or
-/// with `@12000` (three-track). Bare `300`/`600` read as the Opus default.
-/// Returns the LF profile, the mid codec and, for the three-track layout,
-/// the HF split point (only 12000 is defined).
-pub fn parse_profile_tag(tag: &str) -> Option<(Profile, MidCodec, Option<f64>)> {
+/// with `@12000` (three-track; a trailing `x` after the split marks the
+/// xHE top band). Bare `300`/`600` read as the Opus default. Returns the
+/// LF profile, the mid codec and, for the three-track layout, the HF
+/// split point and top-band codec (only 12000 is defined).
+pub fn parse_profile_tag(tag: &str) -> Option<(Profile, MidCodec, Option<(f64, HfCodec)>)> {
     let (lf, hf) = match tag.split_once('@') {
         None => (tag, None),
         Some((lf, hf)) => (lf, Some(hf)),
@@ -260,9 +310,13 @@ pub fn parse_profile_tag(tag: &str) -> Option<(Profile, MidCodec, Option<f64>)> 
     match hf {
         None => Some((profile, mid, None)),
         Some(hf) => {
+            let (hf, codec) = match hf.strip_suffix('x') {
+                Some(h) => (h, HfCodec::Xhe),
+                None => (hf, HfCodec::Opus),
+            };
             let hf_hz: f64 = hf.parse().ok()?;
             if (hf_hz - HF_SPLIT_HZ).abs() < 0.5 {
-                Some((profile, mid, Some(hf_hz)))
+                Some((profile, mid, Some((hf_hz, codec))))
             } else {
                 None
             }
@@ -310,8 +364,18 @@ mod tests {
     #[test]
     fn profile_tags() {
         assert_eq!(profile_tag(Profile::At600, MidCodec::Opus), "600o");
-        assert_eq!(three_track_tag(Profile::At300, MidCodec::Opus), "300o@12000");
-        assert_eq!(three_track_tag(Profile::At600, MidCodec::Xhe), "600x@12000");
+        assert_eq!(
+            three_track_tag(Profile::At300, MidCodec::Opus, HfCodec::Opus),
+            "300o@12000"
+        );
+        assert_eq!(
+            three_track_tag(Profile::At600, MidCodec::Xhe, HfCodec::Opus),
+            "600x@12000"
+        );
+        assert_eq!(
+            three_track_tag(Profile::At600, MidCodec::Xhe, HfCodec::Xhe),
+            "600x@12000x"
+        );
         assert_eq!(
             parse_profile_tag("600"),
             Some((Profile::At600, MidCodec::Opus, None))
@@ -326,11 +390,15 @@ mod tests {
         );
         assert_eq!(
             parse_profile_tag("300o@12000"),
-            Some((Profile::At300, MidCodec::Opus, Some(HF_SPLIT_HZ)))
+            Some((Profile::At300, MidCodec::Opus, Some((HF_SPLIT_HZ, HfCodec::Opus))))
+        );
+        assert_eq!(
+            parse_profile_tag("600x@12000x"),
+            Some((Profile::At600, MidCodec::Xhe, Some((HF_SPLIT_HZ, HfCodec::Xhe))))
         );
         assert_eq!(
             parse_profile_tag("600x@12000"),
-            Some((Profile::At600, MidCodec::Xhe, Some(HF_SPLIT_HZ)))
+            Some((Profile::At600, MidCodec::Xhe, Some((HF_SPLIT_HZ, HfCodec::Opus))))
         );
         assert_eq!(parse_profile_tag("600@15600"), None);
         assert_eq!(parse_profile_tag("1200"), None);

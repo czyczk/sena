@@ -66,6 +66,8 @@ pub struct DecodedInfo {
     /// Mid-layer codec (Opus or xHE-AAC; the xHE encoder identity is an
     /// encode-side detail and not stored).
     pub mid_codec: sena_core::MidCodec,
+    /// Top-band codec (Opus or xHE-AAC; three-track only).
+    pub hf_codec: sena_core::HfCodec,
     /// ES format version (SENA-INIT version field).
     pub sena_version: u32,
     /// SENA-INIT audio_sha256 (hash of the INIT blob plus composite block
@@ -331,13 +333,14 @@ fn build_bit_accounting(
     pre_skip: usize,
     top_infos: &[OpusPacketInfo],
     top_skip: usize,
+    out_rate: u32,
 ) -> (Vec<f64>, Vec<f64>) {
     let n = playable as usize;
     let mut delta = vec![0.0f64; n + 1];
     for info in lf_infos {
         let start_core = info.start_core - XHE_TRIM_CORE_SAMPLES as i128;
-        let start48 = start_core * 48_000 / lf_rate as i128;
-        let end48 = (start_core + info.samples_core) * 48_000 / lf_rate as i128;
+        let start48 = start_core * out_rate as i128 / lf_rate as i128;
+        let end48 = (start_core + info.samples_core) * out_rate as i128 / lf_rate as i128;
         add_bits_interval(&mut delta, n as i128, start48, end48, info.bits as f64);
     }
     for (infos, skip) in [(opus_infos, pre_skip), (top_infos, top_skip)] {
@@ -378,7 +381,10 @@ pub fn decode(demux: &Demuxed) -> Result<Decoded, DecodeError> {
     let init = &demux.init;
     let params = crate::es::parse_params(init.clone())?;
     let mut warnings = params.warnings.clone();
-    let playable = init.playable_samples;
+    // playable_samples rides the 48 kHz source timeline in the header; the
+    // produced output length is in output-rate units.
+    let out_rate = init.output_rate();
+    let playable = init.playable_samples * out_rate as u64 / SAMPLE_RATE as u64;
     let profile_num = init.profile.crossover_hz() as u32;
     let three_track = init.three_track;
     let lf_rate = init.lf_rate;
@@ -392,7 +398,7 @@ pub fn decode(demux: &Demuxed) -> Result<Decoded, DecodeError> {
     let mut mid_frames: Vec<LaneFrame> = Vec::new();
     let mut tf_frames: Vec<LaneFrame> = Vec::new();
     for b in &demux.blocks {
-        let block = es::decode_block(&b.data, init.mid_codec)
+        let block = es::decode_block(&b.data, init.mid_codec, init.hf_codec)
             .map_err(|e| DecodeError::Format(format!("composite block: {e}")))?;
         match block.mid {
             es::MidSection::Opus(pkt) => mid_frames.push(LaneFrame {
@@ -440,7 +446,16 @@ pub fn decode(demux: &Demuxed) -> Result<Decoded, DecodeError> {
                 .iter()
                 .map(|&s| f64::from(s))
                 .collect();
-            let lf48 = Resampler::new(core_rate as u32, SAMPLE_RATE).process(&lf_after, 2);
+            // 44.1 kHz-output streams: the LF content ends at the 300/600
+            // Hz crossover, so a 1 kHz-passband kernel replaces the
+            // full-Nyquist one (the 441/160 / 441/320 lcms would otherwise
+            // force absurd tap counts for zero in-band gain).
+            let lf48 = if out_rate == sena_core::XFI_MID_RATE {
+                Resampler::new_with_passband(core_rate as u32, out_rate, 1_000.0)
+                    .process(&lf_after, 2)
+            } else {
+                Resampler::new(core_rate as u32, out_rate).process(&lf_after, 2)
+            };
             Ok((lf48, lf_infos, core_rate, lf_errors))
         });
         let hmid =
@@ -456,15 +471,18 @@ pub fn decode(demux: &Demuxed) -> Result<Decoded, DecodeError> {
                     let trim = XHE_TRIM_CORE_SAMPLES;
                     require_covered(&raw, trim)?;
                     let after: Vec<f64> = raw[trim * 2..].iter().map(|&s| f64::from(s)).collect();
-                    let up = if rate == sena_core::XFI_MID_RATE {
+                    let up = if out_rate == rate {
+                        // 44.1 kHz-output stream: the mid lane is native.
+                        after
+                    } else if rate == sena_core::XFI_MID_RATE {
                         Resampler::new_with_passband(
                             rate,
-                            SAMPLE_RATE,
+                            out_rate,
                             sena_core::XFI_MID_RESAMPLE_PASS_HZ,
                         )
                         .process(&after, 2)
                     } else {
-                        Resampler::new(rate, SAMPLE_RATE).process(&after, 2)
+                        Resampler::new(rate, out_rate).process(&after, 2)
                     };
                     // Reuse the Opus-info accounting slot; playable mapping
                     // is the constant warmup shift (raw_core - 1024) as in
@@ -473,9 +491,9 @@ pub fn decode(demux: &Demuxed) -> Result<Decoded, DecodeError> {
                         .iter()
                         .map(|i| OpusPacketInfo {
                             start_48k: (i.start_core - XHE_TRIM_CORE_SAMPLES as i128)
-                                * SAMPLE_RATE as i128
+                                * out_rate as i128
                                 / rate as i128,
-                            samples_48k: i.samples_core * SAMPLE_RATE as i128 / rate as i128,
+                            samples_48k: i.samples_core * out_rate as i128 / rate as i128,
                             bits: i.bits,
                         })
                         .collect();
@@ -492,6 +510,35 @@ pub fn decode(demux: &Demuxed) -> Result<Decoded, DecodeError> {
             });
         let htop = s.spawn(
             || -> Result<(Vec<f64>, Vec<OpusPacketInfo>), DecodeError> {
+                if let Some(top_asc) = params.tf_xhe_asc.as_ref() {
+                    // xHE top band (the 44.1 kHz-output variant): USAC at
+                    // 44.1 kHz, same warmup model as the mid lane; the lane
+                    // rate IS the output rate, so after the warmup trim the
+                    // baseband is shifted straight back up (content origin
+                    // at sample 0 -> shift offset 0).
+                    let rate = sena_core::XFI_MID_RATE;
+                    let (raw, infos, _core, errs) = decode_lf(rate, &tf_frames, top_asc)?;
+                    if errs != 0 {
+                        eprintln!("warning: {errs} top AU decode errors replaced by silence");
+                    }
+                    let trim = XHE_TRIM_CORE_SAMPLES;
+                    require_covered(&raw, trim)?;
+                    let after: Vec<f64> =
+                        raw[trim * 2..].iter().map(|&s| f64::from(s)).collect();
+                    let shifted =
+                        sena_dsp::shift_up_offset(&after, 2, sena_core::HF_SPLIT_HZ, rate, 0);
+                    let oinfos = infos
+                        .iter()
+                        .map(|i| OpusPacketInfo {
+                            start_48k: (i.start_core - XHE_TRIM_CORE_SAMPLES as i128)
+                                * out_rate as i128
+                                / rate as i128,
+                            samples_48k: i.samples_core * out_rate as i128 / rate as i128,
+                            bits: i.bits,
+                        })
+                        .collect();
+                    return Ok((shifted, oinfos));
+                }
                 match &tf_head {
                     Some(head) => {
                         let (raw16, infos) =
@@ -571,16 +618,18 @@ pub fn decode(demux: &Demuxed) -> Result<Decoded, DecodeError> {
         opus_head.pre_skip as usize,
         &top_infos,
         tf_head.as_ref().map_or(0, |h| h.pre_skip) as usize,
+        out_rate,
     );
 
     Ok(Decoded {
         info: DecodedInfo {
-            sample_rate: SAMPLE_RATE,
+            sample_rate: params.init.output_rate(),
             channels: 2,
             playable_frames: playable,
             profile: profile_num,
             three_track,
             mid_codec: params.init.mid_codec,
+            hf_codec: params.init.hf_codec,
             sena_version: es::ES_VERSION as u32,
             audio_sha256: params.info.audio_sha256.clone(),
             audio_span_bytes: demux.audio_span_bytes,
@@ -714,7 +763,7 @@ mod tests {
         mka::write_sena(
             &cp,
             &blocks,
-            &core_es::codec_name(init.profile, init.three_track, init.mid_codec),
+            &core_es::codec_name(init.profile, init.three_track, init.mid_codec, init.hf_codec),
             1000,
             playable * 1_000_000_000 / SAMPLE_RATE as u64,
         )

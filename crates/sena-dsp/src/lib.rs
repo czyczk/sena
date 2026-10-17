@@ -739,6 +739,49 @@ mod src_quality {
         }
     }
 
+    /// LF-lane kernels for the 44.1 kHz-output streams: 16k/32k -> 44.1k
+    /// (441/160, 441/320). The LF content ends at the 300/600 Hz crossover,
+    /// so a 1 kHz passband spec shrinks the 7.056/14.112 MHz-lcm kernels to
+    /// ~25 taps/phase while the stopband still floors the imaging.
+    #[test]
+    fn lf_to_44k1_quality() {
+        fn tone_at(freq: f64, rate: u32, secs: usize) -> Vec<f64> {
+            (0..secs * rate as usize)
+                .map(|i| (2.0 * PI * freq * i as f64 / rate as f64).sin())
+                .collect()
+        }
+        fn gain_at(y: &[f64], f: f64, rate: u32) -> f64 {
+            let edge = (rate as usize) / 10;
+            let x = &y[edge..y.len() - edge];
+            let (mut re, mut im) = (0.0, 0.0);
+            for (i, &v) in x.iter().enumerate() {
+                let ph = 2.0 * PI * f * i as f64 / rate as f64;
+                re += v * ph.cos();
+                im += v * ph.sin();
+            }
+            2.0 * (re * re + im * im).sqrt() / x.len() as f64
+        }
+        for in_rate in [16_000u32, 32_000] {
+            let up = Resampler::new_with_passband(in_rate, 44100, 1_000.0);
+            // passband flat to 700 Hz (covers both crossovers with margin)
+            for f in [100.0, 300.0, 500.0, 700.0] {
+                let y = up.process(&tone_at(f, in_rate, 4), 1);
+                let g = gain_at(&y, f, 44100);
+                assert!((g - 1.0).abs() < 1e-3, "{in_rate}->44.1k gain at {f} Hz: {g}");
+            }
+            // imaging of a 500 Hz tone: residues at 16k/32k multiples +- f
+            // must sit at the stopband floor.
+            let y = up.process(&tone_at(500.0, in_rate, 4), 1);
+            let img = in_rate as f64;
+            for fimg in [img - 500.0, img + 500.0] {
+                if fimg < 22_050.0 {
+                    let g = gain_at(&y, fimg, 44100);
+                    assert!(g < 1e-5, "{in_rate}->44.1k image at {fimg} Hz: {g}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn passband_flat_and_alias_floor() {
         let n = 48000 * 5;

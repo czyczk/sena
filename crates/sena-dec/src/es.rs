@@ -410,7 +410,7 @@ impl EsDecoder {
             }
         }
         // integrity check so host bugs surface loudly
-        es::decode_block(data, self.params.init.mid_codec)
+        es::decode_block(data, self.params.init.mid_codec, self.params.init.hf_codec)
             .map_err(|e| DecodeError::Format(format!("push: {e}")))?;
         self.queue.push_back((t_ns, data.to_vec()));
         Ok(())
@@ -487,7 +487,7 @@ impl EsDecoder {
 impl EsDecoder {
     /// Decode the lanes of one composite block.
     fn decode_block(&mut self, t_ns: u64, payload: &[u8]) -> Result<(), DecodeError> {
-        let block = es::decode_block(payload, self.params.init.mid_codec)
+        let block = es::decode_block(payload, self.params.init.mid_codec, self.params.init.hf_codec)
             .map_err(|e| DecodeError::Format(e.to_string()))?;
         let st = self.state.as_mut().unwrap();
         st.blocks_decoded += 1;

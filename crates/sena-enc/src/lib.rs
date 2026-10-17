@@ -69,6 +69,10 @@ pub struct EncoderConfig<'a> {
     /// CBR 128k at 44.1 kHz via ezcd-cli, [`sena_core::XFI_MID_KBPS`]);
     /// always three-track.
     pub mid_codec: sena_core::MidCodec,
+    /// Top-band codec (three-track only): `Xhe` = Fraunhofer IIS xHE-AAC
+    /// CBR 128k at 44.1 kHz via ezcd-cli (the xfi 288k variant; the stream
+    /// then decodes natively at 44.1 kHz). Requires `mid_codec == Xhe`.
+    pub hf_codec: sena_core::HfCodec,
     /// Value passed through to the opusenc-senav mid encode as
     /// `AUDIFF_TOPBAND_STEREO` (kbps, unmodified). None = knob off.
     pub topband_kbps: Option<u32>,
@@ -190,7 +194,7 @@ pub fn encode_bytes(cfg: &EncoderConfig, input: &[u8], output: &Path) -> Result<
 /// does NOT hash the input PCM or the decoded output.
 pub fn encoded_audio_sha256_es(init_zeroed_blob: &[u8], blocks: &[Vec<u8>]) -> [u8; 32] {
     let mut h = Sha256::new();
-    h.update(es::SHA256_DOMAIN_V3);
+    h.update(es::SHA256_DOMAIN_V4);
     h.update((init_zeroed_blob.len() as u32).to_le_bytes());
     h.update(init_zeroed_blob);
     h.update((blocks.len() as u64).to_le_bytes());
@@ -261,6 +265,7 @@ enum RailRole {
     Mid,
     MidXhe44,
     Hf,
+    HfXhe44,
 }
 
 /// ENOSPC (unix) / ERROR_DISK_FULL / ERROR_HANDLE_DISK_FULL (Windows).
@@ -440,6 +445,7 @@ struct Pipeline {
     mid44_rs: Option<sena_dsp::StreamResampler>,
     mid_wr: Option<RailSink>,
     hf_wr: RailSink,
+    hf_codec: sena_core::HfCodec,
     /// LF is always the spooled s16 file: exhale's WAV reader lseeks, so
     /// no pipe.
     lf_wr: SpoolWriter,
@@ -457,12 +463,22 @@ impl Pipeline {
         let norm = sena_dsp::StreamResampler::new(ws.rate().unwrap(), SAMPLE_RATE);
         let split_main = sena_dsp::CrossoverStream::new(cfg.profile.crossover_hz());
         // Three-track layout: split the 600 Hz-high band again at 12000 Hz
-        // and carry the top band as A_OPUSHF, SSB-shifted down to baseband
-        // and resampled to 16 kHz.
+        // and carry the top band SSB-shifted down to baseband, resampled to
+        // its stream rate: 16 kHz (Opus top) or 44.1 kHz (xHE top — the
+        // 13 kHz-passband kernel covers the 0-8 kHz shifted band).
         let top = cfg.three_track.then(|| TopChain {
             split: sena_dsp::CrossoverStream::new(sena_core::HF_SPLIT_HZ),
             shift: sena_dsp::ShiftStream::down(sena_core::HF_SPLIT_HZ, SAMPLE_RATE),
-            rs: sena_dsp::StreamResampler::new(SAMPLE_RATE, sena_core::HF_TRACK_RATE),
+            rs: match cfg.hf_codec {
+                sena_core::HfCodec::Xhe => sena_dsp::StreamResampler::new_with_passband(
+                    SAMPLE_RATE,
+                    sena_core::XFI_MID_RATE,
+                    sena_core::XFI_MID_RESAMPLE_PASS_HZ,
+                ),
+                sena_core::HfCodec::Opus => {
+                    sena_dsp::StreamResampler::new(SAMPLE_RATE, sena_core::HF_TRACK_RATE)
+                }
+            },
         });
         let lf_rs = sena_dsp::StreamResampler::new(SAMPLE_RATE, lf_rate);
         let tilt = cfg
@@ -528,6 +544,12 @@ impl Pipeline {
                             wav::PipeWavWriter::new(stdin, hf_rate, 2, false)?,
                         ));
                     }
+                    RailRole::HfXhe44 => {
+                        hf_wr = Some(RailSink::Pipe(
+                            name,
+                            wav::PipeWavWriter::new(stdin, sena_core::XFI_MID_RATE, 2, true)?,
+                        ));
+                    }
                 }
             }
         } else {
@@ -564,6 +586,14 @@ impl Pipeline {
                             2,
                         )?));
                     }
+                    RailRole::HfXhe44 => {
+                        hf_wr = Some(RailSink::File(wav::WavWriter::create(
+                            &wd_path.join("hf44.wav"),
+                            sena_core::XFI_MID_RATE,
+                            32,
+                            2,
+                        )?));
+                    }
                 }
             }
         }
@@ -590,6 +620,7 @@ impl Pipeline {
             mid44_rs,
             mid_wr,
             hf_wr,
+            hf_codec: cfg.hf_codec,
             lf_wr,
             wd,
             dump_rails,
@@ -706,8 +737,28 @@ impl Pipeline {
                 v.extend(top.shift.finish(ch));
                 v
             };
+            // xHE top: same delivery contract as the xfi mid rail — pad
+            // zeros until the FhG finalize floor (0.4 s) and full playable
+            // coverage (post warmup trim + AU quantization + seek guard)
+            // are met, before the resampler tail is flushed.
             let top16 = {
                 let mut v = top.rs.push(&top_s, ch);
+                if self.hf_codec == sena_core::HfCodec::Xhe {
+                    let min_frames = (sena_core::XFI_MID_RATE as usize * 2 / 5).max(
+                        playable * sena_core::XFI_MID_RATE as usize / SAMPLE_RATE as usize
+                            + 4 * sena_core::XHE_WARMUP_CORE,
+                    );
+                    let mut pad_iters = 0;
+                    while top.rs.output_frames_total() < min_frames {
+                        pad_iters += 1;
+                        if pad_iters > MAX_PAD_ITERS {
+                            return Err(Error::Format(
+                                "top 44.1k resampler produced no output while padding".into(),
+                            ));
+                        }
+                        v.extend(top.rs.push(&vec![0.0f64; PAD_QUANTUM_FRAMES * ch], ch));
+                    }
+                }
                 v.extend(top.rs.finish(ch));
                 v
             };
@@ -1033,12 +1084,42 @@ fn build_codec_commands(
         opus_mid.arg("-").arg(&hf_ogg);
         pipes.push((RailRole::Hf, "opusenc(mid)", opus_mid));
     }
-    // Three-track top-band encode (A_OPUSHF): the tiered hf nominal
-    // (96k/128k); the topband-stereo knob is never armed for it.
+    // Three-track top-band encode: Opus pipe (tiered hf nominal 96-127k;
+    // the topband-stereo knob is never armed for it) or, at the xfi 288k
+    // point, the FhG-IIS CBR 128k @44.1 kHz pipe (same invocation shape as
+    // the xfi mid).
     if cfg.three_track {
-        let mut opus_hf = opus_cmd(cfg, rail_kbps, None);
-        opus_hf.arg("-").arg(&hf_ogg);
-        pipes.push((RailRole::Hf, "opusenc(hf)", opus_hf));
+        match cfg.hf_codec {
+            sena_core::HfCodec::Opus => {
+                let mut opus_hf = opus_cmd(cfg, rail_kbps, None);
+                opus_hf.arg("-").arg(&hf_ogg);
+                pipes.push((RailRole::Hf, "opusenc(hf)", opus_hf));
+            }
+            sena_core::HfCodec::Xhe => {
+                let ezcd_path = cfg.ezcd_cli.ok_or_else(|| {
+                    Error::Format("xHE top band requires ezcd-cli".into())
+                })?;
+                let win_host = needs_windows_paths(ezcd_path);
+                let hf_m4a = wd.join("hf.m4a");
+                let hf_m4a_arg = cli_path(&hf_m4a, win_host)?;
+                let mut c = Command::new(ezcd_path);
+                c.arg("encode")
+                    .arg("--encoder")
+                    .arg("xhe-aac-fhg-iis")
+                    .arg("--mode")
+                    .arg("cbr")
+                    .arg("--bitrate")
+                    .arg(rail_kbps.to_string())
+                    .arg("--sample-rate")
+                    .arg(sena_core::XFI_MID_RATE.to_string())
+                    .arg("--resample")
+                    .arg("off")
+                    .arg("-o")
+                    .arg(&hf_m4a_arg)
+                    .arg("-");
+                pipes.push((RailRole::HfXhe44, "ezcd-cli(hf)", c));
+            }
+        }
     }
     Ok(pipes)
 }
@@ -1056,13 +1137,18 @@ fn opus_cmd(cfg: &EncoderConfig, kbps: u32, topband_kbps: Option<u32>) -> Comman
     c
 }
 
+/// Top-band stream: Opus packets (with OpusHead and pre-skip) or xHE-AAC
+/// AUs (with AudioSpecificConfig).
+enum TopStream {
+    Opus { head: Vec<u8>, preskip: u16, packets: Vec<Vec<u8>> },
+    Xhe { asc: Vec<u8>, aus: Vec<Vec<u8>> },
+}
+
 /// Per-layer codec streams extracted from the encoder outputs.
 struct Extracted {
     mid_head: Vec<u8>,
     mid_stream: MidStream,
-    top_head: Vec<u8>,
-    top_preskip: u16,
-    top_packets: Vec<Vec<u8>>,
+    top_stream: TopStream,
     lf_asc: Vec<u8>,
     lf_aus: Vec<Vec<u8>>,
     lf_stream_rate: u32,
@@ -1075,9 +1161,24 @@ fn extract_streams(cfg: &EncoderConfig, wd: &Path) -> Result<Extracted, Error> {
     let mid_m4a = wd.join("mid.m4a");
     let lf_m4a = wd.join("lf.m4a");
     let xhe_mid = cfg.mid_codec == sena_core::MidCodec::Xhe;
-    let (mid_head, mid_stream, top_head, top_preskip, top_packets) = if cfg.three_track {
-        let top_bytes = std::fs::read(&hf_ogg)?;
-        let (top_head, top_preskip, top_packets) = ogg::extract_opus(&top_bytes)?;
+    let xhe_hf = cfg.hf_codec == sena_core::HfCodec::Xhe;
+    let (mid_head, mid_stream, top_stream) = if cfg.three_track {
+        let top_stream = if xhe_hf {
+            let hf_m4a = wd.join("hf.m4a");
+            let (asc, aus) = extract_m4a(&hf_m4a)?;
+            let rate = m4a_stream_rate(&hf_m4a)?;
+            if rate != sena_core::XFI_MID_RATE {
+                return Err(Error::Format(format!(
+                    "ezcd-cli top stream rate {rate}, expected {}",
+                    sena_core::XFI_MID_RATE
+                )));
+            }
+            TopStream::Xhe { asc, aus }
+        } else {
+            let top_bytes = std::fs::read(&hf_ogg)?;
+            let (head, preskip, packets) = ogg::extract_opus(&top_bytes)?;
+            TopStream::Opus { head, preskip, packets }
+        };
         if xhe_mid {
             let (asc, aus) = extract_m4a(&mid_m4a)?;
             let rate = m4a_stream_rate(&mid_m4a)?;
@@ -1087,32 +1188,24 @@ fn extract_streams(cfg: &EncoderConfig, wd: &Path) -> Result<Extracted, Error> {
                     sena_core::XFI_MID_RATE
                 )));
             }
-            (asc, MidStream::Xhe(aus), top_head, top_preskip, top_packets)
+            (asc, MidStream::Xhe(aus), top_stream)
         } else {
             let mid_bytes = std::fs::read(&mid_ogg)?;
             let (mid_head, _mid_preskip, mid_packets) = ogg::extract_opus(&mid_bytes)?;
-            (
-                mid_head,
-                MidStream::Opus(mid_packets),
-                top_head,
-                top_preskip,
-                top_packets,
-            )
+            (mid_head, MidStream::Opus(mid_packets), top_stream)
         }
     } else {
         // Two-track: the Hf-role rail carries the sole Opus track.
         let ogg_bytes = std::fs::read(&hf_ogg)?;
         let (head, _preskip, packets) = ogg::extract_opus(&ogg_bytes)?;
-        (head, MidStream::Opus(packets), Vec::new(), 0, Vec::new())
+        (head, MidStream::Opus(packets), TopStream::Opus { head: Vec::new(), preskip: 0, packets: Vec::new() })
     };
     let (lf_asc, lf_aus) = extract_m4a(&lf_m4a)?;
     let lf_stream_rate = m4a_stream_rate(&lf_m4a)?;
     Ok(Extracted {
         mid_head,
         mid_stream,
-        top_head,
-        top_preskip,
-        top_packets,
+        top_stream,
         lf_asc,
         lf_aus,
         lf_stream_rate,
@@ -1133,7 +1226,7 @@ fn mux_container(
     // 20 ms grid and are placed by playable end like LF).
     let n_blocks = match &x.mid_stream {
         MidStream::Opus(packets) => packets.len() as u64,
-        MidStream::Xhe(_) => es::block_count(playable as u64, x.top_preskip as u32),
+        MidStream::Xhe(_) => es::block_count(playable as u64, x.top_stream.top_preskip() as u32),
     };
 
     // LF AU k lands in the block containing its last playable sample
@@ -1171,14 +1264,38 @@ fn mux_container(
                 .push((k as u32, au));
         }
     }
-    // Top-layer packet j lands in block j (clamped to the final block).
-    let mut top_by_block: std::collections::BTreeMap<u64, Vec<&[u8]>> = Default::default();
-    if cfg.three_track {
-        for (j, p) in x.top_packets.iter().enumerate() {
-            top_by_block
-                .entry(es::hf_block(j as u64, n_blocks))
-                .or_default()
-                .push(p);
+    // Top layer placement: Opus packet j lands in block j (clamped); xHE
+    // AUs (23.22 ms at 44.1 kHz) follow the by-end rule with absolute AU
+    // indices, plus the same hard coverage gate as the xHE mid.
+    let mut top_by_block: std::collections::BTreeMap<u64, Vec<(u32, &[u8])>> =
+        Default::default();
+    match &x.top_stream {
+        TopStream::Opus { packets, .. } => {
+            for (j, p) in packets.iter().enumerate() {
+                top_by_block
+                    .entry(es::hf_block(j as u64, n_blocks))
+                    .or_default()
+                    .push((0, p));
+            }
+        }
+        TopStream::Xhe { aus, .. } => {
+            let n = aus.len() as u64;
+            let covered = es::xhe_au_end48(n, sena_core::XFI_MID_RATE).saturating_sub(
+                sena_core::XHE_WARMUP_CORE as u64 * sena_core::SAMPLE_RATE as u64
+                    / sena_core::XFI_MID_RATE as u64,
+            );
+            if covered < playable as u64 {
+                return Err(Error::Format(format!(
+                    "xHE top covers {covered} of {playable} playable frames ({} AUs)",
+                    aus.len()
+                )));
+            }
+            for (k, au) in aus.iter().enumerate() {
+                top_by_block
+                    .entry(es::xhe_block(k as u64, sena_core::XFI_MID_RATE, n_blocks))
+                    .or_default()
+                    .push((k as u32, au));
+            }
         }
     }
 
@@ -1192,7 +1309,11 @@ fn mux_container(
             }
             None => (0, Vec::new()),
         };
-        let top: Vec<&[u8]> = top_by_block.remove(&i).unwrap_or_default();
+        let top = top_by_block.remove(&i).unwrap_or_default();
+        let top: (u32, Vec<&[u8]>) = (
+            top.first().map_or(0, |e| e.0),
+            top.iter().map(|e| e.1).collect(),
+        );
         let mid = match &x.mid_stream {
             MidStream::Opus(packets) => es::MidSection::Opus(&packets[i as usize]),
             MidStream::Xhe(_) => match mid_by_block.remove(&i) {
@@ -1206,11 +1327,14 @@ fn mux_container(
                 },
             },
         };
-        payloads.push(es::encode_block(&es::BlockParts {
-            mid,
-            lf: (lf.0, &lf.1),
-            hf: &top,
-        }));
+        payloads.push(es::encode_block(
+            &es::BlockParts {
+                mid,
+                lf: (lf.0, &lf.1),
+                hf: (top.0, &top.1),
+            },
+            cfg.hf_codec,
+        ));
     }
     if !lf_by_block.is_empty() || !top_by_block.is_empty() || !mid_by_block.is_empty() {
         return Err(Error::Format("layer packet outside the mid grid".into()));
@@ -1220,12 +1344,20 @@ fn mux_container(
         profile: cfg.profile,
         three_track: cfg.three_track,
         mid_codec: cfg.mid_codec,
+        hf_codec: if cfg.three_track { cfg.hf_codec } else { sena_core::HfCodec::Opus },
         lf_rate: x.lf_stream_rate,
         playable_samples: playable as u64,
         audio_sha256: [0; 32],
         lf_asc: x.lf_asc.clone(),
         mid_head: x.mid_head.clone(),
-        hf_head: cfg.three_track.then(|| x.top_head.clone()),
+        hf_head: if cfg.three_track {
+            Some(match &x.top_stream {
+                TopStream::Opus { head, .. } => head.clone(),
+                TopStream::Xhe { asc, .. } => asc.clone(),
+            })
+        } else {
+            None
+        },
     };
     init.audio_sha256 = encoded_audio_sha256_es(&init.encode(), &payloads);
 
@@ -1245,7 +1377,7 @@ fn mux_container(
     let mka_bytes = mka::write_sena(
         &codec_private,
         &blocks,
-        &es::codec_name(cfg.profile, cfg.three_track, cfg.mid_codec),
+        &es::codec_name(cfg.profile, cfg.three_track, cfg.mid_codec, cfg.hf_codec),
         MKA_CLUSTER_MS,
         playable_ns,
     );
@@ -1299,6 +1431,16 @@ fn finish_codecs(
 enum MidStream {
     Opus(Vec<Vec<u8>>),
     Xhe(Vec<Vec<u8>>),
+}
+
+impl TopStream {
+    /// Opus pre-skip of the top stream (0 for xHE, which has no pre-skip).
+    fn top_preskip(&self) -> u16 {
+        match self {
+            TopStream::Opus { preskip, .. } => *preskip,
+            TopStream::Xhe { .. } => 0,
+        }
+    }
 }
 
 #[cfg(test)]

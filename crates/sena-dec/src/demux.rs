@@ -1130,7 +1130,7 @@ mod tests {
             let start = br.offset as usize;
             assert_eq!(&bytes[start..start + br.len as usize], b.data.as_slice());
             // The ES header metadata matches the parsed block.
-            let parsed = es::decode_block(&b.data, sena_core::MidCodec::Opus).unwrap();
+            let parsed = es::decode_block(&b.data, sena_core::MidCodec::Opus, sena_core::HfCodec::Opus).unwrap();
             match (br.au_index, parsed.lf_au_index) {
                 (Some(ai), Some(p_ai)) => {
                     assert_eq!(ai, p_ai);

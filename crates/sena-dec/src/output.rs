@@ -79,7 +79,12 @@ fn encode_body(pcm: &[f64], format: SampleFormat, dither: Dither) -> Result<Vec<
     })
 }
 
-pub fn encode_wav(pcm: &[f64], format: SampleFormat, dither: Dither) -> Result<Vec<u8>, String> {
+pub fn encode_wav(
+    pcm: &[f64],
+    format: SampleFormat,
+    dither: Dither,
+    sample_rate: u32,
+) -> Result<Vec<u8>, String> {
     let mut body = encode_body(pcm, format, dither)?;
     let data_len = u32::try_from(body.len()).map_err(|_| "audio too large for RIFF".to_string())?;
     let (format_tag, bits) = match format {
@@ -93,9 +98,9 @@ pub fn encode_wav(pcm: &[f64], format: SampleFormat, dither: Dither) -> Result<V
     out.extend_from_slice(&16u32.to_le_bytes());
     out.extend_from_slice(&format_tag.to_le_bytes());
     out.extend_from_slice(&2u16.to_le_bytes());
-    out.extend_from_slice(&48_000u32.to_le_bytes());
+    out.extend_from_slice(&sample_rate.to_le_bytes());
     let bytes_per = bits / 8;
-    out.extend_from_slice(&(48_000u32 * u32::from(bytes_per) * 2).to_le_bytes());
+    out.extend_from_slice(&(sample_rate * u32::from(bytes_per) * 2).to_le_bytes());
     out.extend_from_slice(&(2u16 * bytes_per).to_le_bytes());
     out.extend_from_slice(&bits.to_le_bytes());
     out.extend_from_slice(b"data");
@@ -134,7 +139,7 @@ mod tests {
 
     #[test]
     fn wav_header_smoke() {
-        let w = encode_wav(&[0.0, 0.0], SampleFormat::S16, Dither::None).unwrap();
+        let w = encode_wav(&[0.0, 0.0], SampleFormat::S16, Dither::None, 48_000).unwrap();
         assert_eq!(&w[0..4], b"RIFF");
         assert_eq!(w.len(), 48);
     }
