@@ -48,6 +48,9 @@ private:
 
     service_ptr_t<file> m_file;
     SenaDec *m_dec = nullptr;
+    // Output rate of the currently open decoder (set by open_decoder);
+    // 48 kHz streams everywhere except the 44.1 kHz xfi 288k variant.
+    unsigned m_sample_rate = 48000;
     SenaDecInfo m_probe_info{};
     bool m_has_probe = false;
     abort_callback *m_abort = nullptr;

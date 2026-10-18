@@ -4,7 +4,9 @@
 namespace {
 
 constexpr unsigned kChannels = 2;
-constexpr unsigned kSampleRate = 48000;
+// Fallback before the decoder's stream info is known; live files override
+// this with the per-stream rate (the xfi 288k variant outputs 44.1 kHz).
+constexpr unsigned kDefaultSampleRate = 48000;
 constexpr uint64_t kFramesPerChunk = 4096;
 
 void throw_sena_error(int code) {
@@ -148,14 +150,14 @@ bool input_sena::decode_run(audio_chunk &chunk, abort_callback &abort) {
         return false;
     }
     audio_chunk::spec_t spec;
-    spec.sampleRate = kSampleRate;
+    spec.sampleRate = m_sample_rate;
     spec.chanCount = kChannels;
     spec.chanMask = audio_chunk::channel_config_stereo;
     chunk.set_data_32(m_pcm.get_ptr(), (t_size)got, spec);
 
     SenaDecReadInfo ri{};
     if (sena_dec_get_read_info(m_dec, &ri) == SENA_DEC_OK) {
-        m_bitrate.on_frame((double)ri.frames / (double)kSampleRate, (t_size)ri.payload_bits);
+        m_bitrate.on_frame((double)ri.frames / (double)m_sample_rate, (t_size)ri.payload_bits);
     }
     return true;
 }
@@ -166,7 +168,7 @@ void input_sena::decode_seek(double seconds, abort_callback &abort) {
     if (!m_can_seek) {
         m_file->ensure_seekable();
     }
-    uint64_t target = audio_math::time_to_samples(seconds, kSampleRate);
+    uint64_t target = audio_math::time_to_samples(seconds, m_sample_rate);
     SenaDecInfo di{};
     if (sena_dec_get_info(m_dec, &di) != SENA_DEC_OK) {
         throw exception_io_data();
@@ -299,6 +301,13 @@ void input_sena::open_decoder(abort_callback &abort) {
     if (rc != SENA_DEC_OK) {
         throw_sena_error(rc);
     }
+    // The stream's output rate drives the chunk spec and the seek frame
+    // conversion; it varies per file (48 kHz everywhere except the xfi
+    // 288k variant, which outputs 44.1 kHz).
+    SenaDecInfo di{};
+    m_sample_rate = (sena_dec_get_info(m_dec, &di) == SENA_DEC_OK && di.sample_rate != 0)
+                        ? di.sample_rate
+                        : kDefaultSampleRate;
 }
 
 void input_sena::close_decoder() {
