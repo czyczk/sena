@@ -205,6 +205,13 @@ impl Resampler {
 
     /// Resample a whole interleaved buffer (offline; block-wise internally).
     pub fn process(&self, x: &[f64], ch: usize) -> Vec<f64> {
+        // Identity fast path (the unit kernel): the generic direct/FFT
+        // machinery would convolve pointlessly (measured: the 44.1
+        // kHz-output streams' two identity lanes dominated streaming
+        // decode time).
+        if self.n == 1 && self.m == 1 && self.kernel.len() == 1 {
+            return x.to_vec();
+        }
         let n_in = x.len() / ch;
         let n_out = self.output_frames(n_in);
         let mut out = vec![0.0; n_out * ch];
@@ -226,6 +233,9 @@ impl Resampler {
     /// evaluation in the input domain: every output sample is independent
     /// (exactly partition-independent, trivially parallel).
     pub fn process_mono(&self, x: &[f64], n_out: usize) -> Vec<f64> {
+        if self.n == 1 && self.m == 1 && self.kernel.len() == 1 {
+            return x[..n_out].to_vec();
+        }
         if self.n > 8 {
             self.process_mono_direct(x, n_out)
         } else {

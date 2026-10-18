@@ -5,9 +5,8 @@
 //! so the empty low bands keep their share and the actual content starves.
 //! Shifting the band to baseband puts every bit on the content.
 
-use rustfft::FftPlanner;
 
-use crate::conv::{FftConvolver, fftconvolve_mono};
+use crate::conv::{FftConvolver, fftconvolve_mono_cached};
 use crate::window::kaiser_window;
 use crate::{PAR_MIN_FRAMES, worker_threads};
 
@@ -62,8 +61,10 @@ fn ssb_shift(x: &[f64], ch: usize, fc: f64, fs: u32, origin: i64, up: bool) -> V
         dst.clear();
         dst.reserve(n);
         let mono: Vec<f64> = x.iter().skip(c).step_by(ch).copied().collect();
-        let mut planner = FftPlanner::<f64>::new();
-        let conv = fftconvolve_mono(&mono, h, &mut planner);
+        // Shared plan + cached constant-kernel spectrum: per-chunk callers
+        // (the streaming decoder's top band) otherwise re-plan and
+        // re-transform the 8001-tap Hilbert kernel on every call.
+        let conv = fftconvolve_mono_cached(&mono, h);
         for i in 0..n {
             let ph = w0 * (origin + i as i64) as f64;
             let (s, co) = ph.sin_cos();

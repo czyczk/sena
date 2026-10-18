@@ -3,6 +3,74 @@
 
 use rustfft::FftPlanner;
 use rustfft::num_complex::Complex64;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
+/// Process-global plan + kernel-spectrum cache for repeated one-shot
+/// convolutions with a constant kernel (the SSB shift's Hilbert taps on the
+/// streaming decode path). Bit-exact with the per-call form: same planner,
+/// same plan per size, same math.
+struct SharedFft {
+    planner: FftPlanner<f64>,
+    /// Kernel spectra keyed by (kernel ptr, fft_len).
+    spectra: HashMap<(usize, usize), Vec<Complex64>>,
+}
+
+static SHARED_FFT: OnceLock<Mutex<SharedFft>> = OnceLock::new();
+
+/// [`fftconvolve_mono`] with the planner and the kernel's forward spectrum
+/// cached process-globally (identical output; the per-call planner +
+/// kernel transform were the bulk of a per-chunk caller's cost).
+pub(crate) fn fftconvolve_mono_cached(x: &[f64], h: &[f64]) -> Vec<f64> {
+    let cache = SHARED_FFT.get_or_init(|| {
+        Mutex::new(SharedFft {
+            planner: FftPlanner::new(),
+            spectra: HashMap::new(),
+        })
+    });
+    let fft_len = (x.len() + h.len() - 1).next_power_of_two();
+    // Hold the lock only to fetch/create the plan Arcs and the kernel
+    // spectrum; the transforms run lock-free (the two channels keep their
+    // parallelism).
+    let (fwd, inv, hs) = {
+        let mut g = cache.lock().unwrap();
+        let SharedFft { planner, spectra } = &mut *g;
+        let key = (h.as_ptr() as usize, fft_len);
+        let hs = spectra
+            .entry(key)
+            .or_insert_with(|| {
+                let fwd = planner.plan_fft_forward(fft_len);
+                let mut hs = vec![Complex64::default(); fft_len];
+                for (i, &v) in h.iter().enumerate() {
+                    hs[i] = Complex64::new(v, 0.0);
+                }
+                fwd.process(&mut hs);
+                hs
+            })
+            .clone();
+        (
+            planner.plan_fft_forward(fft_len),
+            planner.plan_fft_inverse(fft_len),
+            hs,
+        )
+    };
+    let mut buf = vec![Complex64::default(); fft_len];
+    for (i, &v) in x.iter().enumerate() {
+        buf[i] = Complex64::new(v, 0.0);
+    }
+    fwd.process(&mut buf);
+    for i in 0..fft_len {
+        buf[i] = buf[i] * hs[i];
+    }
+    inv.process(&mut buf);
+    let scale = 1.0 / fft_len as f64;
+    let out_len = x.len() + h.len() - 1;
+    let mut out = vec![0.0; out_len];
+    for (i, v) in buf.iter().take(out_len).enumerate() {
+        out[i] = v.re * scale;
+    }
+    out
+}
 
 /// 'full' convolution of interleaved multi-channel input with a mono kernel.
 pub(crate) fn fftconvolve_interleaved(x: &[f64], h: &[f64], ch: usize, n: usize) -> Vec<f64> {

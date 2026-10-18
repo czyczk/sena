@@ -1602,10 +1602,29 @@ impl EsDecoder {
                             }
                         }
                     };
-                    let tf_ready = tf_emittable(st).max(0) as u64;
+                    let tf_ready = match st.tx.as_ref() {
+                        // xHE top (identity lane): same readiness shape as
+                        // the xHE mid, plus the shift's Hilbert right
+                        // support. Gating it here keeps the tx queue fed
+                        // well past the Hilbert half-length, so production
+                        // chunks stay quantum-sized instead of ~2 blocks
+                        // (the shift cost is per-chunk — this was a 4x
+                        // slowdown when the tx lane rode along ungated).
+                        Some(tx) => {
+                            if tx.muted || !tx.anchored {
+                                u64::MAX
+                            } else {
+                                let trim = if tx.trim_pending { tx.trim as i128 } else { 0 };
+                                let reserve = tx.ctx as i128
+                                    + if st.finished { 0 } else { HILBERT_DELAY as i128 };
+                                ((tx.raw.len() / 2) as i128 - trim - reserve).max(0) as u64
+                            }
+                        }
+                        None => tf_emittable(st).max(0) as u64,
+                    };
                     let ready = lf_ready.min(hf_ready);
                     (
-                        if st.top.is_some() {
+                        if st.top.is_some() || st.tx.is_some() {
                             ready.min(tf_ready)
                         } else {
                             ready
@@ -2171,13 +2190,17 @@ fn mx_window(
     // history alone does NOT guarantee this after a seek (a clamped drain
     // can leave the base one AU = 1024 samples off, a 5/147-sample phase
     // error that permanently decorrelates the band); correct it here by
-    // shifting the window front by the residue. The emit content mapping
-    // is preserved (front_core is unchanged), and with pc = 0 on the
-    // whole-file trajectory this is a no-op there.
+    // advancing the window front to the next grid point. The emit content
+    // mapping is preserved (front_core is unchanged), and with pc = 0 on
+    // the whole-file trajectory this is a no-op there. (Correction
+    // direction is quality-inert — a 24-position seek sweep A/B produced
+    // identical PCM either way; the load-bearing invariant is the
+    // take/drain quantization. The advance form is the algebraically
+    // correct one, shared with the LF lane's 44.1 kHz-output lock.)
     let grid = mx.resampler.decimation() as i64;
     let base_content =
         mx.total_appended as i64 - (mx.raw.len() / 2) as i64 + raw_drop as i64 + mx.content_shift;
-    let pc = base_content.rem_euclid(grid) as usize;
+    let pc = (grid - base_content.rem_euclid(grid)).rem_euclid(grid) as usize;
     let (raw_drop, window_front_core) = if pc > 0 && window_front_core >= pc {
         (raw_drop + pc, window_front_core - pc)
     } else {
